@@ -74,6 +74,37 @@ jobs:
         shell: pwsh
         run: python tools/build_scripts/check_build_environment.py --products "${{ inputs.products }}" --cli-arches "${{ inputs.cli_arches }}" --github-runner
 
+      # hook/build.dart 与 windows/runner/CMakeLists.txt 的 sync_operit_plugins
+      # 都硬编码 .venv/Scripts/python.exe，CI runner 没有现成 venv，先补齐。
+      - name: Prepare Python virtualenv
+        shell: pwsh
+        run: |
+          $repoRoot = (Resolve-Path '.').Path
+          $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
+          New-Item -ItemType Directory -Force -Path (Split-Path $venvPython) | Out-Null
+          $python = (Get-Command python).Source
+          Copy-Item $python $venvPython -Force
+          & $venvPython --version
+          Write-Host "Prepared .venv Python at $venvPython"
+      # sync_plugin_packages.py 需要 .ci-tools 下的 tsc 和 corepack pnpm。
+      - name: Prepare TypeScript and pnpm dependencies
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          if ($LASTEXITCODE -ne 0) { throw "npm install typescript failed" }
+          corepack enable pnpm
+          if ($LASTEXITCODE -ne 0) { throw "corepack enable pnpm failed" }
+          corepack prepare pnpm@10.7.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw "corepack prepare pnpm failed" }
+          Push-Location plugins/packages/buildin/workflow
+          try {
+            corepack pnpm install --frozen-lockfile
+            if ($LASTEXITCODE -ne 0) { throw "corepack pnpm install failed" }
+          } finally {
+            Pop-Location
+          }
+          Write-Host "TypeScript and pnpm dependencies prepared"
+
       - name: Build and package Windows app
         if: inputs.products != 'cli'
         shell: pwsh
