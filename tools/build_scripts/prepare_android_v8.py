@@ -81,6 +81,10 @@ ARTIFACTS = ("librusty_v8.a", "src_binding.rs", "args.gn")
 def run(command, **kwargs):
     print("+ " + shlex.join(map(str, command)), file=sys.stderr, flush=True)
     kwargs.setdefault("check", True)
+    # Windows runners default to a legacy ANSI codepage; tool output can contain
+    # UTF-8 bytes that crash the text-mode reader thread (stdout becomes None).
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
     return subprocess.run(list(map(str, command)), **kwargs)
 
 
@@ -343,7 +347,8 @@ def brew_prefix(formula):
         (str(p) for p in (Path("/opt/homebrew/bin/brew"), Path("/usr/local/bin/brew")) if p.is_file()), None)
     if not brew:
         return None
-    result = subprocess.run([brew, "--prefix", formula], capture_output=True, text=True)
+    result = subprocess.run([brew, "--prefix", formula], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
     return Path(result.stdout.strip()) if result.returncode == 0 else None
 
 
