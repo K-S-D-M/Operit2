@@ -584,6 +584,17 @@ provide implicitly:
    `~/Android/ndk`) plus libclang 21.1+ for the bindings generation — the same
    `libclang.dll` as item 5 works. See `tools/build_scripts/README.md`.
 
+   The source build itself only runs on Linux: V8's vendored Chromium config
+   asserts `host_os == "linux"` for Android targets, so `gn gen` fails on
+   Windows. `Android Flutter Build` therefore builds V8 in the separate
+   `build-android-v8` (`ubuntu-24.04`) job and the `build-android`
+   (`windows-2025`) job only reuses the verified artifacts
+   (`Using verified V8 cache`). A local Windows build works only when that cache
+   is already populated — copy
+   `tools/release/work/android-v8/<v8-version>/aarch64-linux-android/` from a
+   Linux host or from the `operit2-android-v8-<sha>` CI artifact. Root cause,
+   pins and troubleshooting: `docs/android-v8-linux-host-build.md`.
+
 With the prerequisites in place:
 
 ```powershell
