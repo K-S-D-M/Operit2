@@ -152,7 +152,8 @@ jobs:
           )
           mkdir -p v8-artifact
           cp -R "tools/release/work/android-v8/$version/aarch64-linux-android" v8-artifact/
-          printf '%s\n' "$version" > v8-artifact/.version
+          # 文件名不能以 "." 开头：upload-artifact v4 默认跳过隐藏文件。
+          printf '%s\n' "$version" > v8-artifact/v8-version.txt
           du -sh v8-artifact
 
       - name: Upload V8 artifacts
@@ -283,7 +284,7 @@ jobs:
             & $sdkmanager --install "ndk;27.3.13750724"
             if ($LASTEXITCODE -ne 0) { throw "Failed to install Android NDK 27.3.13750724" }
           }
-          $version = (Get-Content .v8-artifact/.version -Raw).Trim()
+          $version = (Get-Content .v8-artifact/v8-version.txt -Raw).Trim()
           $destination = "tools/release/work/android-v8/$version/aarch64-linux-android"
           New-Item -ItemType Directory -Force -Path $destination | Out-Null
           Copy-Item -Path ".v8-artifact/aarch64-linux-android/*" -Destination $destination -Recurse -Force
