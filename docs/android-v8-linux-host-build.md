@@ -86,6 +86,7 @@ Android builds are only supported on Linux.
 | 症状 | 可能原因 | 处理 |
 | --- | --- | --- |
 | Windows 端仍出现 `gn gen` / `BUILDCONFIG.gn` 断言 | 未下载到 artifact，或 manifest 配置不匹配 | 检查 `Download prebuilt Android V8` 是否执行、两侧 NDK 目录名是否一致 |
+| `Cannot find path ...\.v8-artifact\.version` | `upload-artifact` v4 默认跳过隐藏文件 | 版本文件命名为 `v8-version.txt`，不要用 `.version` |
 | `V8 configuration mismatch: android_ndk_version=...` | 两侧 NDK 版本不同 | 把 `OPERIT_ANDROID_V8_NDK` 对齐到同一版本 |
 | Linux 端 `V8 source bindings require LLVM/libclang 21.1 or newer` | 只有 libclang-21.so.1，脚本按 libclang.so.<major> 探测 | 建立 `libclang.so.21` 符号链接 |
 | `No usable Android NDK found` | NDK 未安装或缺少 API 24 的 clang++ | 用 sdkmanager 安装对应 NDK |
