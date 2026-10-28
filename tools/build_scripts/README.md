@@ -206,6 +206,16 @@ python3 tools/build_scripts/prepare_android_v8.py \
   --env-file tools/release/work/android-v8/aarch64-linux-android.env
 ```
 
+The source build only works on a Linux host. V8's vendored Chromium config
+asserts `host_os == "linux"` for Android targets
+(`build/config/BUILDCONFIG.gn`), because the Android build compiles and runs
+host tools such as mksnapshot. `Android Flutter Build` therefore builds V8 in a
+separate `ubuntu-24.04` job (`build-android-v8`) and hands the verified
+artifacts to the `windows-2025` packaging job, which only rewrites the env file
+(`Using verified V8 cache`). Do not try to patch the assertion or rebuild V8 on
+Windows; see `docs/android-v8-linux-host-build.md` for the failure signature,
+the NDK/libclang pins both jobs must share, and the troubleshooting table.
+
 ## Local CLI development and macOS Keychain authorization
 
 Use the local runner to build and restore the CLI's configured signing identity

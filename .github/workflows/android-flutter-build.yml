@@ -65,14 +65,115 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # V8 只允许在 Linux 主机上交叉编译 Android 目标：
+  # v8 crate 内置的 Chromium 构建配置在 build/config/BUILDCONFIG.gn 中断言
+  # host_os == "linux"（"Android builds are only supported on Linux."），
+  # 因此在 windows-2025 上执行 V8 源码构建必然在 `gn gen` 阶段失败。
+  # 这里用 Linux 先构建并验证 librusty_v8.a / src_binding.rs，再交给
+  # build-android（Windows）打包 APK；详细说明见
+  # docs/android-v8-linux-host-build.md。
+  build-android-v8:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      RUST_TOOLCHAIN_VERSION: 1.95.0
+      # 必须与 build-android 的同名变量一致：V8 缓存清单会记录该 NDK 版本，
+      # 两侧不一致会让 Windows 端判定缓存失效并重新发起源码构建。
+      OPERIT_ANDROID_V8_NDK: /usr/local/lib/android/sdk/ndk/27.3.13750724
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/system-images \
+            /opt/ghc /usr/local/share/boost
+          docker image prune -af || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install Android NDK
+        run: |
+          if [ ! -d "$OPERIT_ANDROID_V8_NDK" ]; then
+            yes | "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools/latest/bin/sdkmanager" \
+              --install "ndk;27.3.13750724" > /dev/null
+          fi
+          test -x "$OPERIT_ANDROID_V8_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: aarch64-linux-android
+
+      # prepare_android_v8.py 用 bindgen 生成 Rust 绑定（要求 libclang 21.1+），
+      # Chromium 的主机工具链还会使用 ld.lld。
+      - name: Install LLVM 21 for bindgen and the host linker
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/apt.llvm.org.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-21-dev lld-21
+          # Debian 的 libclang 实际文件名是 libclang-21.so.1，而脚本按
+          # libclang.so.<major> 探测版本号；补一条指向开发用符号链接的别名。
+          if [ ! -e /usr/lib/llvm-21/lib/libclang.so.21 ]; then
+            sudo ln -sfn /usr/lib/llvm-21/lib/libclang.so /usr/lib/llvm-21/lib/libclang.so.21
+          fi
+
+      - name: Cache source-built Android V8
+        uses: actions/cache@v4
+        with:
+          path: tools/release/work/android-v8
+          key: android-v8-linux-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+
+      - name: Build V8 for Android
+        run: |
+          python3 tools/build_scripts/prepare_android_v8.py \
+            --target aarch64-linux-android \
+            --env-file "$RUNNER_TEMP/android-v8.env"
+
+      - name: Stage V8 artifacts
+        run: |
+          version=$(python3 - <<'PY'
+          import pathlib, tomllib
+          lock = pathlib.Path("apps/flutter/native/operit-flutter-bridge/Cargo.lock")
+          packages = tomllib.loads(lock.read_text())["package"]
+          print(next(p["version"] for p in packages if p["name"] == "v8"))
+          PY
+          )
+          mkdir -p v8-artifact
+          cp -R "tools/release/work/android-v8/$version/aarch64-linux-android" v8-artifact/
+          # 文件名不能以 "." 开头：upload-artifact v4 默认跳过隐藏文件。
+          printf '%s\n' "$version" > v8-artifact/v8-version.txt
+          du -sh v8-artifact
+
+      - name: Upload V8 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-v8-${{ github.sha }}
+          path: v8-artifact
+          if-no-files-found: error
+          retention-days: 1
+
   build-android:
-    needs: build-android-runtime
+    needs: [build-android-runtime, build-android-v8]
     runs-on: windows-2025
     timeout-minutes: 90
     env:
       RUSTFLAGS: -Awarnings
       RUST_TOOLCHAIN_VERSION: 1.95.0
       FVM_VERSION: 4.3.0
+      # 与 build-android-v8 保持一致，保证 V8 缓存清单校验通过。
+      OPERIT_ANDROID_V8_NDK: C:\Program Files (x86)\Android\android-sdk\ndk\27.3.13750724
 
     steps:
       - name: Checkout
@@ -162,11 +263,32 @@ jobs:
           RELEASE_KEY_PASSWORD=$env:ANDROID_RELEASE_KEY_PASSWORD
           "@ | Set-Content -Path (Join-Path $secretsDir "android-signing.properties") -Encoding utf8
 
-      - name: Cache source-built Android V8
-        uses: actions/cache@v4
+      - name: Download prebuilt Android V8
+        uses: actions/download-artifact@v4
         with:
-          path: tools/release/work/android-v8
-          key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+          name: operit2-android-v8-${{ github.sha }}
+          path: .v8-artifact
+
+      # 把 Linux 构建出的 V8 产物写入 prepare_android_v8.py 的缓存目录：
+      # manifest.json 的配置与 SHA-256 校验通过后，Gradle 的
+      # prepareOperitAndroidV8* 任务只会重写 env 文件，不再在 Windows 上
+      # 触发 V8 源码构建（那会撞上 BUILDCONFIG.gn 的 Linux 主机断言）。
+      - name: Install prebuilt Android V8 into the source-build cache
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath $env:OPERIT_ANDROID_V8_NDK)) {
+            $sdkmanager = (Get-Command sdkmanager -ErrorAction SilentlyContinue).Source
+            if (-not $sdkmanager) {
+              $sdkmanager = Join-Path $env:ANDROID_HOME "cmdline-tools/latest/bin/sdkmanager.bat"
+            }
+            & $sdkmanager --install "ndk;27.3.13750724"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install Android NDK 27.3.13750724" }
+          }
+          $version = (Get-Content .v8-artifact/v8-version.txt -Raw).Trim()
+          $destination = "tools/release/work/android-v8/$version/aarch64-linux-android"
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          Copy-Item -Path ".v8-artifact/aarch64-linux-android/*" -Destination $destination -Recurse -Force
+          Get-ChildItem $destination | Select-Object Name, Length
 
       - name: Check build environment
         shell: pwsh
