@@ -1800,6 +1800,13 @@ pub struct RuntimeStorageEntry {
 }
 
 pub trait RuntimeStorageHost: Send + Sync {
+    /// Whether parsed preferences should remain cached. Constrained hosts may
+    /// reload node-local durable bytes on reads and release idle store state.
+    /// Concurrent handles still share a transaction; returned snapshots are immutable.
+    fn retainPreferencesCache(&self) -> bool { true }
+    /// Explicit terminal Space-application retention for bounded endpoint storage.
+    /// Cache eviction alone never authorizes deleting durable application history.
+    fn nodeLocalApplicationHistoryLimit(&self) -> Option<usize> { None }
     /// Returns the physical root used for runtime storage entries.
     fn runtimeRootDir(&self) -> Option<PathBuf>;
     /// Returns the physical root used for workspace storage entries.
@@ -2075,8 +2082,16 @@ impl PartialEq<Value> for HostJavaScriptValue {
 pub type HostJavaScriptCallback =
     Arc<dyn Fn(Vec<HostJavaScriptValue>) -> HostResult<Value> + Send + Sync + 'static>;
 
+/// Returns one binary payload with small structured metadata, without Base64 or byte arrays in JSON.
+pub type HostJavaScriptBinaryCallback = Arc<dyn Fn(Vec<Value>) -> HostResult<(Value, Vec<u8>)> + Send + Sync + 'static>;
+
 /// Owns one concrete JavaScript runtime created by the active platform host.
 pub trait HostJavaScriptRuntime {
+    /// Installs a synchronous binary resource reader returning { metadata, bytes: Uint8Array }.
+    fn registerHostJavaScriptBinaryFunction(&mut self, _name: &str, _callback: HostJavaScriptBinaryCallback) -> HostResult<()> {
+        Err(HostError::new("JavaScript binary resource bindings are unavailable"))
+    }
+
     /// Executes shared trusted bootstrap bytecode in this runtime's independent global scope.
     fn evaluateHostJavaScriptBootstrap(&mut self, source: &'static str) -> HostResult<()>;
 

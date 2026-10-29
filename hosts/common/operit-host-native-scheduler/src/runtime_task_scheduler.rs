@@ -192,71 +192,79 @@ pub(crate) fn spawnTaskPoolWithOptions(
         let (ready, started) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name(format!("{prefix}-{index}"))
-            .stack_size(stackSize)
+            .stack_size(if cfg!(feature = "esp32-compat") { 2 * 1024 * 1024 } else { stackSize })
             .spawn(move || {
-                HOST_RUNTIME_WORKER.set(stackSize >= 16 * 1024 * 1024);
-                let mut builder = tokio::runtime::Builder::new_current_thread();
-                // Tokio uses this name for its lazily spawned blocking helper;
-                // the affine dispatcher keeps the outer Rust thread's name.
-                builder
-                    .thread_name(format!("{prefix}-{index}-b"))
-                    .max_blocking_threads(1)
-                    .enable_time();
-                if enableIo {
-                    builder.enable_io();
-                }
-                let runtime = match builder.build() {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        let _ = ready.send(Err(error.to_string()));
-                        return;
+                let mut execute = || {
+                    HOST_RUNTIME_WORKER.set(stackSize >= 16 * 1024 * 1024);
+                    let mut builder = tokio::runtime::Builder::new_current_thread();
+                    // Tokio uses this name for its lazily spawned blocking helper;
+                    // the affine dispatcher keeps the outer Rust thread's name.
+                    builder
+                        .thread_name(format!("{prefix}-{index}-b"))
+                        .max_blocking_threads(1)
+                        .enable_time();
+                    if enableIo {
+                        builder.enable_io();
+                        #[cfg(feature = "esp32-compat")]
+                        builder.max_io_events_per_tick(16);
                     }
-                };
-                let _ = ready.send(Ok(()));
-                // The runtime outlives every request and keeps its I/O and
-                // spawned children alive without additional runtime threads.
-                let local = tokio::task::LocalSet::new();
-                local.block_on(&runtime, async {
-                    loop {
-                        // Never hold the queue lock across an await: a local
-                        // future may resume and block this thread while the
-                        // dispatcher waits, stranding the entire shared queue.
-                        let task = {
-                            let mut state =
-                                pending.lock().expect("runtime task queue mutex poisoned");
-                            let selected = state.selectedWorker();
-                            if selected == Some(index) {
-                                let task = state.pending.pop_front();
-                                if task.is_some() {
-                                    state.active[index] += 1;
-                                    state.cursor = (index + 1) % count;
-                                }
-                                task
-                            } else {
-                                None
-                            }
-                        };
-                        let Some(task) = task else {
-                            if updates.changed().await.is_err() {
-                                break;
-                            }
-                            continue;
-                        };
-                        // Both factory and future stay inside the LocalSet panic boundary.
-                        local.spawn_local(TrackedTask {
-                            future: Box::pin(async move { task().await }),
-                            state: pending.clone(),
-                            changed: changed.clone(),
-                            worker: index,
-                        });
-                        if let Some(changed) = changed.upgrade() {
-                            changed.wakeNext(&pending);
+                    let runtime = match builder.build() {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = ready.send(Err(error.to_string()));
+                            return;
                         }
-                        // Let the LocalSet start the task and keep the receive
-                        // handoff fair when many tasks arrive in one burst.
-                        tokio::task::yield_now().await;
-                    }
-                });
+                    };
+                    let _ = ready.send(Ok(()));
+                    // The runtime outlives every request and keeps its I/O and
+                    // spawned children alive without additional runtime threads.
+                    let local = tokio::task::LocalSet::new();
+                    local.block_on(&runtime, async {
+                        loop {
+                            // Never hold the queue lock across an await: a local
+                            // future may resume and block this thread while the
+                            // dispatcher waits, stranding the entire shared queue.
+                            let task = {
+                                let mut state =
+                                    pending.lock().expect("runtime task queue mutex poisoned");
+                                let selected = state.selectedWorker();
+                                if selected == Some(index) {
+                                    let task = state.pending.pop_front();
+                                    if task.is_some() {
+                                        state.active[index] += 1;
+                                        state.cursor = (index + 1) % count;
+                                    }
+                                    task
+                                } else {
+                                    None
+                                }
+                            };
+                            let Some(task) = task else {
+                                if updates.changed().await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            };
+                            // Both factory and future stay inside the LocalSet panic boundary.
+                            local.spawn_local(TrackedTask {
+                                future: Box::pin(async move { task().await }),
+                                state: pending.clone(),
+                                changed: changed.clone(),
+                                worker: index,
+                            });
+                            if let Some(changed) = changed.upgrade() {
+                                changed.wakeNext(&pending);
+                            }
+                            // Let the LocalSet start the task and keep the receive
+                            // handoff fair when many tasks arrive in one burst.
+                            tokio::task::yield_now().await;
+                        }
+                    });
+                };
+                #[cfg(feature = "esp32-compat")]
+                crate::withStackBudget(stackSize, execute).expect("Host worker stack allocation failed");
+                #[cfg(not(feature = "esp32-compat"))]
+                execute();
             })
             .map_err(|e| e.to_string())?;
         started.recv().map_err(|e| e.to_string())??;
@@ -531,6 +539,13 @@ impl NativeHostRuntimeTaskSchedulerHost {
         name: &str,
         task: HostRuntimeAsyncTask,
     ) -> HostResult<()> {
+        #[cfg(feature = "esp32-compat")]
+        {
+            use operit_host_api::HostRuntimeTaskSchedulerHost;
+            crate::LocalHostRuntimeTaskSchedulerHost::new()?.scheduleHostRuntimeAsyncTask(name, task)
+        }
+        #[cfg(not(feature = "esp32-compat"))]
+        {
         static NETWORK: OnceLock<Result<RuntimeTaskQueue, String>> = OnceLock::new();
         let queue = NETWORK
             .get_or_init(|| spawnTaskPool("operit-net", NETWORK_WORKER_COUNT))
@@ -539,6 +554,7 @@ impl NativeHostRuntimeTaskSchedulerHost {
         queue
             .send(task)
             .map_err(|_| HostError::new(format!("network task queue is closed or full: {name}")))
+        }
     }
 
     /// Isolates Java owner callbacks from Rust callers synchronously waiting for their reply.
@@ -603,7 +619,12 @@ impl NativeHostRuntimeTaskSchedulerHost {
                 .map_err(|_| HostError::new(format!("Host service capacity exhausted: {name}")))?,
         );
         let queue = SERVICES
-            .get_or_init(|| spawnTaskPool("operit-svc", SERVICE_WORKER_COUNT))
+            .get_or_init(|| {
+                #[cfg(feature = "esp32-compat")]
+                { spawnTaskPoolWithOptions("operit-svc", SERVICE_WORKER_COUNT, 128 * 1024, false) }
+                #[cfg(not(feature = "esp32-compat"))]
+                { spawnTaskPool("operit-svc", SERVICE_WORKER_COUNT) }
+            })
             .as_ref()
             .map_err(|error| HostError::new(format!("create service task pool failed: {error}")))?;
         let admitted = tasks
@@ -934,12 +955,52 @@ mod pool_tests {
     /// Serializes tests that deliberately occupy the shared blocking pool.
     static BLOCKING_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Returns the worker name so tests can prove which pool ran a task.
-    fn threadName() -> String {
-        std::thread::current()
-            .name()
-            .unwrap_or_default()
-            .to_string()
+    /// Identifies the actual thread, including replacements that reuse its name.
+    fn workerIdentity() -> (std::thread::ThreadId, String) {
+        let thread = std::thread::current();
+        (thread.id(), thread.name().unwrap_or_default().to_string())
+    }
+
+    /// Occupies every worker before releasing any, so coverage does not depend on
+    /// short tasks happening to visit every dispatcher under load balancing.
+    fn allPoolWorkers() -> HashSet<(&'static str, (std::thread::ThreadId, String))> {
+        let scheduler = NativeHostRuntimeTaskSchedulerHost::new();
+        let (entered, started) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let mut releases = Vec::new();
+        for (role, count) in [
+            ("coordination", RUNTIME_WORKER_COUNT),
+            ("blocking", BLOCKING_WORKER_COUNT),
+        ] {
+            for _ in 0..count {
+                let (release, wait) = mpsc::channel();
+                releases.push(release);
+                let entered = entered.clone();
+                let done = done.clone();
+                let task: HostRuntimeAsyncTask = Box::new(move || Box::pin(async move {
+                    entered.send((role, workerIdentity())).unwrap();
+                    wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                    done.send(()).unwrap();
+                }));
+                if role == "coordination" {
+                    scheduler.scheduleHostRuntimeAsyncTask("identify-pool", task)
+                } else {
+                    scheduler.scheduleHostRuntimeBlockingAsyncTask("identify-pool", task)
+                }.unwrap();
+            }
+        }
+        let count = RUNTIME_WORKER_COUNT + BLOCKING_WORKER_COUNT;
+        let workers = (0..count)
+            .map(|_| started.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect::<HashSet<_>>();
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for _ in 0..count {
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(workers.len(), count);
+        workers
     }
 
     /// Verifies task kinds stay on their declared pool and the pools never overlap.
@@ -948,8 +1009,8 @@ mod pool_tests {
         let _guard = BLOCKING_TEST_LOCK.lock().unwrap();
         let scheduler = NativeHostRuntimeTaskSchedulerHost::new();
         let (sender, receiver) = mpsc::channel();
-        let mut first_workers = HashSet::new();
-        for round in 0..2 {
+        let first_workers = allPoolWorkers();
+        for _ in 0..2 {
             for index in 0..320 {
                 let sender = sender.clone();
                 let other = NativeHostRuntimeTaskSchedulerHost::new();
@@ -957,14 +1018,14 @@ mod pool_tests {
                     0 => scheduler.scheduleHostRuntimeTask(
                         "pool-sync",
                         Box::new(move || {
-                            sender.send(("blocking", threadName())).unwrap();
+                            sender.send(("blocking", workerIdentity())).unwrap();
                         }),
                     ),
                     1 => other.scheduleHostRuntimeBlockingAsyncTask(
                         "pool-blocking-async",
                         Box::new(move || {
                             Box::pin(async move {
-                                sender.send(("blocking", threadName())).unwrap();
+                                sender.send(("blocking", workerIdentity())).unwrap();
                             })
                         }),
                     ),
@@ -977,7 +1038,7 @@ mod pool_tests {
                                 tokio::time::sleep(Duration::from_millis(1)).await;
                                 assert_eq!(owner, std::thread::current().id());
                                 assert_eq!(*local, 42);
-                                sender.send(("coordination", threadName())).unwrap();
+                                sender.send(("coordination", workerIdentity())).unwrap();
                             })
                         }),
                     ),
@@ -985,7 +1046,7 @@ mod pool_tests {
                         "pool-cooperative",
                         Box::new(move || {
                             Box::pin(async move {
-                                sender.send(("coordination", threadName())).unwrap();
+                                sender.send(("coordination", workerIdentity())).unwrap();
                             })
                         }),
                     ),
@@ -993,7 +1054,7 @@ mod pool_tests {
                         "pool-delayed",
                         1,
                         Box::new(move || {
-                            sender.send(("blocking", threadName())).unwrap();
+                            sender.send(("blocking", workerIdentity())).unwrap();
                         }),
                     ),
                 }
@@ -1005,28 +1066,25 @@ mod pool_tests {
             let coordination = workers
                 .iter()
                 .filter(|(pool, _)| *pool == "coordination")
-                .map(|(_, name)| name.clone())
+                .map(|(_, identity)| identity.clone())
                 .collect::<HashSet<_>>();
             let blocking = workers
                 .iter()
                 .filter(|(pool, _)| *pool == "blocking")
-                .map(|(_, name)| name.clone())
+                .map(|(_, identity)| identity.clone())
                 .collect::<HashSet<_>>();
-            assert_eq!(coordination.len(), RUNTIME_WORKER_COUNT);
-            assert_eq!(blocking.len(), BLOCKING_WORKER_COUNT);
+            assert!(!coordination.is_empty());
+            assert!(!blocking.is_empty());
+            assert!(workers.is_subset(&first_workers));
             assert!(coordination.is_disjoint(&blocking));
             assert!(coordination
                 .iter()
-                .all(|name| name.starts_with(RUNTIME_WORKER_PREFIX)));
+                .all(|(_, name)| name.starts_with(RUNTIME_WORKER_PREFIX)));
             assert!(blocking
                 .iter()
-                .all(|name| name.starts_with(BLOCKING_WORKER_PREFIX)));
-            if round == 0 {
-                first_workers = workers;
-            } else {
-                assert_eq!(workers, first_workers);
-            }
+                .all(|(_, name)| name.starts_with(BLOCKING_WORKER_PREFIX)));
         }
+        assert_eq!(allPoolWorkers(), first_workers);
     }
 
     /// Verifies a fully occupied blocking pool cannot delay coordination tasks.
@@ -1222,9 +1280,10 @@ mod admission_tests {
             .map(|_| receiver.recv_timeout(Duration::from_secs(5)).unwrap())
             .collect::<std::collections::HashSet<_>>();
         assert!(!owners.is_empty() && owners.len() <= NETWORK_WORKER_COUNT);
-        assert!(owners
-            .iter()
-            .all(|(_, name)| name.starts_with("operit-net-")));
+        let prefix = if cfg!(feature = "esp32-compat") { "operit-ha-" } else { "operit-net-" };
+        let worker_count = if cfg!(feature = "esp32-compat") { 1 } else { NETWORK_WORKER_COUNT };
+        assert!(owners.len() <= worker_count);
+        assert!(owners.iter().all(|(_, name)| name.starts_with(prefix)));
         for release in releases {
             release.send(()).unwrap();
         }

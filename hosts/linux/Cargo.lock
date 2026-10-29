@@ -1679,6 +1679,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "flume",
+ "if-addrs",
  "libc",
  "mdns-sd",
  "operit-host-api",
@@ -1703,6 +1704,7 @@ dependencies = [
  "reqwest",
  "tokio",
  "tokio-tungstenite",
+ "tower",
 ]
 
 [[package]]

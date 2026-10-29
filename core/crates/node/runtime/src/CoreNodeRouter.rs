@@ -1945,7 +1945,7 @@ impl CoreNodeRouter {
                 self.requireDirectPeer(&previousNodeId, PairingDirection::Either)?;
                 RuntimeRemoteLinkService::newWithRouter((*self.localCore).clone(), self.clone())
                     .acceptPeerSpaceCall(&previousNodeId, request.payload)
-                    .map_err(CoreLinkError::internal)
+                    .map_err(crate::NodeSpaceService::spaceCallError)
             })();
             return CoreCallResponse { requestId, result };
         }
@@ -1975,7 +1975,7 @@ impl CoreNodeRouter {
                     }
                     let service = RuntimeRemoteLinkService::newWithRouter((*self.localCore).clone(), self.clone());
                     let result = crate::NodeSpaceService::acceptSpaceControlCall(&service, &request.originNodeId, request.payload)
-                        .map_err(CoreLinkError::internal);
+                        .map_err(crate::NodeSpaceService::spaceCallError);
                     return CoreCallResponse { requestId, result };
                 }
                 if request.payload.target == NODE_SPACE_APPROVAL_TARGET {
@@ -4489,6 +4489,13 @@ mod tests {
         ) -> CoreCallResponse {
             if self.policyOnly {
                 assert_eq!(request.routeKind, RoutedCoreRequestKind::Target);
+                if request.payload.target == crate::NodeSpaceService::NODE_SPACE_TARGET {
+                    assert_eq!(request.payload.methodName, "projectionProtocol");
+                    let protocol = serde_json::json!({"version":1,"nodeId":request.targetNodeId,
+                        "endpoint":false,"authorityMode":"localReplay","maxMessageBytes":65536,
+                        "snapshotPaging":false,"projectionReference":false});
+                    return CoreCallResponse::ok(request.payload.requestId, operit_link::toCoreValue(protocol).unwrap());
+                }
                 assert_eq!(request.payload.target, crate::NodeSpaceService::NODE_SPACE_CONTROL_TARGET);
                 assert!(matches!(request.payload.methodName.as_str(), "exchange" | "exchangePreferences"), "no business RPC is allowed");
                 self.callCount.fetch_add(1, Ordering::SeqCst);
@@ -5528,8 +5535,11 @@ mod tests {
                 stream.descriptor.args.clone(),
             ))
             .expect("real live embedded ChatMessage stream must reopen through CoreNodeRouter");
-        // Each observer creates its own renderer and replays ordered chunks.
-        // A fresh renderer does not restore a snapshot or emit an initial reset.
+        // Each observer starts with a reset for its own renderer, then replays
+        // ordered chunks before receiving live updates.
+        let reset = receiveEvent(&mut openedStream).await;
+        let reset: MarkdownStreamEvent = operit_link::fromCoreValue(reset.value).unwrap();
+        assert_eq!(reset.eventType, "reset");
         let replay = receiveEvent(&mut openedStream).await;
         assert_eq!(replay.kind, CoreEventKind::Changed);
         let replayEvent: MarkdownStreamEvent = operit_link::fromCoreValue(replay.value).unwrap();
