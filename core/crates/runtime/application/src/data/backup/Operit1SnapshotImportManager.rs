@@ -660,6 +660,13 @@ impl Operit1SnapshotImportManager {
                         .map_err(|error| error.to_string())?;
                     (*GitHubAuthPreferences::store(self.storageHost.clone())).clone()
                 }
+                "payload/files/datastore/current_chat_id.preferences_pb" => {
+                    use operit_store::PreferencesDataStore::CoreNodeStateStore;
+                    (*CoreNodeStateStore::newWithStorage(
+                        self.storageHost.clone(),
+                        operit_util::RuntimeStorageLayout::CURRENT_CHAT_ID_PREFERENCES_PATH,
+                    )).clone()
+                }
                 _ => PreferencesDataStore::new(filePath),
             };
             for (key, value) in preferences
@@ -805,7 +812,7 @@ impl Operit1SnapshotImportManager {
     /// Imports the OP1 v21 token ledger and pricing identities without deriving usage from chats.
     fn importTokenStatistics(&self, parsed: &ParsedOperit1Snapshot) -> Result<(i32, i32), String> {
         self.withStagedOperit1ChatDatabase(parsed, |connection, bridge| {
-            if bridge != Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV28 {
+            if bridge != Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV29 {
                 return Ok((0, 0));
             }
             let usageRows = connection

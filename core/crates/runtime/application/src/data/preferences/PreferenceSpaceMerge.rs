@@ -20,10 +20,8 @@ use super::ThemeConfigManager::ThemeConfigManager;
 use super::TtsConfigManager::TtsConfigManager;
 
 /// Collects merge declarations without opening preference stores.
-pub(crate) fn schema(
-    history: &[operit_store::SyncOperationStore::SyncOperation],
-) -> PreferenceMergeSchema {
-    let mut schema = PreferenceMergeSchema {
+pub(crate) fn schema() -> PreferenceMergeSchema {
+    PreferenceMergeSchema {
         stores: vec![
             {
                 let path = operit_util::RuntimeStorageLayout::MODEL_CONFIGS_PREFERENCES_PATH;
@@ -31,7 +29,6 @@ pub(crate) fn schema(
                     path: path.to_string(),
                     encrypted: true,
                     open: |storage, path| ModelConfigManager::preferenceStore(storage, path),
-                    decode: Some(ModelConfigManager::decodeSyncedEntry),
                     merge: StoragePreferencesMergeDescriptor {
                         version: 1,
                         catalog: Some(StoragePreferencesMergeCatalog {
@@ -53,7 +50,6 @@ pub(crate) fn schema(
                     path: path.to_string(),
                     encrypted: true,
                     open: |storage, path| TtsConfigManager::preferenceStore(storage, path),
-                    decode: Some(TtsConfigManager::decodeSyncedEntry),
                     merge: StoragePreferencesMergeDescriptor {
                         version: 1,
                         catalog: Some(StoragePreferencesMergeCatalog {
@@ -79,7 +75,6 @@ pub(crate) fn schema(
                     path: path.to_string(),
                     encrypted: true,
                     open: |storage, path| SttConfigManager::preferenceStore(storage, path),
-                    decode: Some(SttConfigManager::decodeSyncedEntry),
                     merge: StoragePreferencesMergeDescriptor {
                         version: 1,
                         catalog: Some(StoragePreferencesMergeCatalog {
@@ -105,7 +100,6 @@ pub(crate) fn schema(
                     path: path.to_string(),
                     encrypted: false,
                     open: |storage, _| super::UserPreferencesManager::UserPreferencesManager::store(storage),
-                    decode: Some(super::UserPreferencesManager::UserPreferencesManager::decodeSyncedEntry),
                     merge: StoragePreferencesMergeDescriptor {
                         version: 1,
                         catalog: Some(StoragePreferencesMergeCatalog {
@@ -136,7 +130,6 @@ pub(crate) fn schema(
                     path: operit_util::RuntimeStorageLayout::FUNCTIONAL_CONFIGS_PREFERENCES_PATH.to_string(),
                     encrypted: false,
                     open: |storage, path| FunctionalConfigManager::preferenceStore(storage, path),
-                    decode: Some(FunctionalConfigManager::decodeSyncedEntry),
                     merge: StoragePreferencesMergeDescriptor {
                         version: 1,
                         catalog: None,
@@ -151,40 +144,22 @@ pub(crate) fn schema(
                 }
             },
             {
-                operit_store::PreferenceMerge::PreferenceMergeStore::values(operit_util::RuntimeStorageLayout::API_PREFERENCES_PATH, false, |storage, _| ApiPreferences::store(storage), ApiPreferences::decodeSyncedEntry)
+                operit_store::PreferenceMerge::PreferenceMergeStore::values(operit_util::RuntimeStorageLayout::API_PREFERENCES_PATH, false, |storage, _| ApiPreferences::store(storage))
             },
             {
-                operit_store::PreferenceMerge::PreferenceMergeStore::values(operit_util::RuntimeStorageLayout::ONBOARDING_PREFERENCES_PATH, false, |storage, _| OnboardingPreferences::store(storage), OnboardingPreferences::decodeSyncedEntry)
+                operit_store::PreferenceMerge::PreferenceMergeStore::values(operit_util::RuntimeStorageLayout::ONBOARDING_PREFERENCES_PATH, false, |storage, _| OnboardingPreferences::store(storage))
             },
             {
-                operit_store::PreferenceMerge::PreferenceMergeStore::values(operit_util::RuntimeStorageLayout::REMOTE_ANNOUNCEMENT_PREFERENCES_PATH, false, |storage, _| RemoteAnnouncementPreferences::store(storage), RemoteAnnouncementPreferences::decodeSyncedEntry)
+                operit_store::PreferenceMerge::PreferenceMergeStore::values(operit_util::RuntimeStorageLayout::REMOTE_ANNOUNCEMENT_PREFERENCES_PATH, false, |storage, _| RemoteAnnouncementPreferences::store(storage))
             },
             {
-                operit_store::PreferenceMerge::PreferenceMergeStore::values(operit_util::RuntimeStorageLayout::SIDEBAR_DOCK_PREFERENCES_PATH, false, |storage, _| SidebarDockPreferences::store(storage), SidebarDockPreferences::decodeSyncedEntry)
+                operit_store::PreferenceMerge::PreferenceMergeStore::values(operit_util::RuntimeStorageLayout::SIDEBAR_DOCK_PREFERENCES_PATH, false, |storage, _| SidebarDockPreferences::store(storage))
             },
             PreferenceMergeStore::values(
             operit_util::RuntimeStorageLayout::WORKSPACES_PREFERENCES_PATH, false,
-            operit_store::repository::WorkspacePreferenceStore::WorkspacePreferenceStore::openStore,
-            operit_store::repository::WorkspacePreferenceStore::WorkspacePreferenceStore::decodeSyncedEntry,
-            ),
+            operit_store::repository::WorkspacePreferenceStore::WorkspacePreferenceStore::openStore),
         ],
-    };
-    let paths = history
-        .iter()
-        .filter(|operation| operation.domain == "preferences")
-        .filter_map(|operation| {
-            operation
-                .payload
-                .get("storagePath")
-                .and_then(serde_json::Value::as_str)
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    schema.stores.extend(
-        paths
-            .into_iter()
-            .filter_map(operit_store::CoreSpaceStore::CoreSpaceStore::preferenceSyncStore),
-    );
-    schema
+    }
 }
 /// Opens only explicitly configured native preference owners, including their versioned migrations.
 pub(crate) fn open(
@@ -194,7 +169,7 @@ pub(crate) fn open(
     operit_store::PreferencesDataStore::PreferencesDataStore,
     operit_store::PreferencesDataStore::PreferencesDataStoreError,
 > {
-    let owner = schema(&[])
+    let owner = schema()
         .stores
         .into_iter()
         .find(|owner| owner.path == path)
@@ -211,13 +186,14 @@ pub(crate) fn layout(
 ) -> operit_store::PreferenceLayout::PreferenceLayout {
     use operit_store::PreferencesDataStore::PreferencesDataStoreError;
     use operit_util::RuntimeStorageLayout::{
-        PACKAGE_MANAGER_PREFERENCES_PATH, SKILL_VISIBILITY_PREFERENCES_PATH,
+        CURRENT_CHAT_ID_PREFERENCES_PATH, PACKAGE_MANAGER_PREFERENCES_PATH,
+        SKILL_VISIBILITY_PREFERENCES_PATH,
     };
     operit_store::PreferenceLayout::PreferenceLayout::new(
         storage,
         operit_util::RuntimeStorageLayout::RUNTIME_SYNC_PREFERENCE_LAYOUT_PATH,
     )
-    .withSchema(1, |from, migration| match from {
+    .withSchema(2, |from, migration| match from {
         0 => {
             let extensions =
                 operit_store::ExtensionStore::ExtensionStore::new(migration.storage.clone());
@@ -237,18 +213,41 @@ pub(crate) fn layout(
             );
             Ok(())
         }
+        1 => {
+            // Selection belongs to this device; historical shared writes have no local effect.
+            migration.retireFile(CURRENT_CHAT_ID_PREFERENCES_PATH);
+            Ok(())
+        }
         from => Err(PreferencesDataStoreError::MissingMigration { from, to: from + 1 }),
     })
+}
+
+/// Publishes all ready layout decisions before owner discovery and transaction application.
+pub(crate) fn prepareLayout(storage: Arc<dyn RuntimeStorageHost>) -> Result<(), String> {
+    layout(storage.clone()).prepare()?;
+    crate::data::backup::CharacterPluginLayout::prepare(storage)
 }
 
 /// Prepares existing datasets through the same migration, import and replay path as incoming data.
 pub(crate) fn prepare(storage: Arc<dyn RuntimeStorageHost>) -> Vec<String> {
     use operit_store::PreferenceMerge::applyIndependentOperations;
     let mut errors = Vec::new();
-    if let Err(error) = layout(storage.clone()).prepare() {
+    if let Err(error) = prepareLayout(storage.clone()) {
         errors.push(format!("preference layout: {error}"));
     }
-    let mut schema = schema(&[]);
+    let journal = operit_store::SyncOperationStore::SyncOperationStore::new(storage.clone(), operit_util::RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH);
+    let mut schema = schema();
+    match journal.preferenceDatasets() {
+        Ok(paths) => for path in paths.keys() {
+            if schema.stores.iter().any(|owner| &owner.path == path) { continue; }
+            match schema.owner(path) {
+                Ok(Some(owner)) => schema.stores.push(owner),
+                Ok(None) => {},
+                Err(error) => errors.push(error),
+            }
+        },
+        Err(error) => errors.push(error.to_string()),
+    }
     schema.stores.retain(|owner| {
         let required = operit_link::isolation::sync(
             &format!("preference preparation path={}", owner.path),
@@ -321,6 +320,59 @@ mod tests {
         fn drop(&mut self) {
             assert_eq!(self.root.parent().unwrap(), std::env::temp_dir());
             std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    /// Upgrades existing layouts and acknowledges shared selection history without changing either device.
+    #[test]
+    fn current_chat_selection_stays_local_while_legacy_transactions_complete() {
+        use operit_store::PreferencesDataStore::CoreNodeStateStore;
+        use operit_store::SyncOperationStore::{SyncOperationKnowledge, SyncOperationStore};
+        let path = RuntimeStorageLayout::CURRENT_CHAT_ID_PREFERENCES_PATH;
+        let key = stringPreferencesKey("current_chat_id");
+        let devices = [Fixture::new(), Fixture::new()];
+        let mut originals = Vec::new();
+        for (index, device) in devices.iter().enumerate() {
+            // One device upgrades a v1 layout; the other starts with no layout progress.
+            if index == 0 {
+                CoreNodeStateStore::newWithStorage(device.host.clone(), RuntimeStorageLayout::RUNTIME_SYNC_PREFERENCE_LAYOUT_PATH)
+                    .withSchema(1, |_, _| Ok(())).data().unwrap();
+            }
+            PreferencesDataStore::newWithStorage(device.host.clone(), path)
+                .edit(|values| values.set(&key, format!("local-{index}"))).unwrap();
+            let journal = SyncOperationStore::new(device.host.clone(), RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH);
+            originals.extend(journal.preferenceHistory().unwrap());
+        }
+        assert_eq!(originals.len(), 2);
+        for (index, device) in devices.iter().enumerate() {
+            let journal = SyncOperationStore::new(device.host.clone(), RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH);
+            journal.receiveOperations(&originals).unwrap();
+            let selection = CoreNodeStateStore::newWithStorage(device.host.clone(), path);
+            let saved = device.host.readBytes(path).unwrap();
+            assert_eq!(RuntimeStorageLayout::runtimeStorageOwnership(path).unwrap(), RuntimeStorageLayout::RuntimeStorageOwnership::CoreNode);
+            assert!(operit_store::RuntimeFileSyncStore::RuntimeFileSyncStore::new(device.host.clone(), RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH)
+                .writeBytes(path, b"remote selection").is_err());
+            prepareLayout(device.host.clone()).unwrap();
+            let declarations = schema();
+            let registry = operit_store::PreferenceMerge::registry(device.host.clone(), &declarations, [], |_, _| true).unwrap();
+            let report = registry.receive(&[]).unwrap();
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert!(report.pending.is_empty());
+            assert_eq!(report.retired, 1);
+            assert!(prepare(device.host.clone()).is_empty());
+            assert_eq!(device.host.readBytes(path).unwrap(), saved);
+            assert_eq!(selection.data().unwrap().get(&key), Some(&json!(format!("local-{index}"))));
+            selection.edit(|values| values.set(&key, format!("next-{index}"))).unwrap();
+            assert!(journal.publishPreferenceOutboxes().unwrap().is_empty());
+            assert_eq!(journal.preferenceHistory().unwrap().len(), originals.len());
+            assert!(registry.receive(&[]).unwrap().pending.is_empty());
+            assert!(registry.snapshots().unwrap().0.iter().all(|snapshot| snapshot.data.owner.path != path));
+            let history = journal.preferenceHistory().unwrap();
+            let receipt = journal.receipt().unwrap();
+            for original in &originals {
+                assert!(history.contains(original));
+                assert!(receipt.containsSequence(&original.originDeviceId, original.sequence));
+            }
         }
     }
 
@@ -411,7 +463,7 @@ mod tests {
         let operations = journal.preferenceHistory().unwrap();
         let outcomes = applyIndependentOperations(
             target.host.clone(),
-            &schema(&operations),
+            &schema(),
             &[],
             &operations,
             |_, _| true,
@@ -506,7 +558,7 @@ mod tests {
         for _ in 0..2 {
             let outcomes = applyIndependentOperations(
                 target.host.clone(),
-                &schema(&operations),
+                &schema(),
                 &[],
                 &operations,
                 |_, _| true,
@@ -581,7 +633,7 @@ mod tests {
         for _ in 0..2 {
             let outcomes = applyIndependentOperations(
                 fixture.host.clone(),
-                &schema(&operations),
+                &schema(),
                 &[],
                 &operations,
                 |_, _| true,
@@ -594,13 +646,9 @@ mod tests {
                     .map(|outcome| &outcome.result)
                     .collect::<Vec<_>>()
             );
-            let skipped = outcomes
-                .into_iter()
-                .filter(|outcome| outcome.skipped)
-                .flat_map(|outcome| outcome.operations)
-                .collect::<Vec<_>>();
-            assert_eq!(skipped.len(), operations.len());
-            journal.skipOperations(&skipped).unwrap();
+            assert!(outcomes.iter().all(|outcome| !outcome.skipped));
+            assert_eq!(journal.pendingOperationCount().unwrap(), 0);
+            for op in &operations { assert!(journal.preferenceHistory().unwrap().contains(op)); }
             for operation in &operations {
                 let path = operation.payload["storagePath"].as_str().unwrap();
                 let data = PreferencesDataStore::newWithStorage(fixture.host.clone(), path)
@@ -645,9 +693,7 @@ mod tests {
                         operit_store::PreferencesDataStore::PreferencesDataStore::newWithStorage(
                             storage, path,
                         )
-                    },
-                    |_| Ok(()),
-                )],
+                    })],
             },
             &[],
             &[operation],
@@ -694,7 +740,7 @@ mod tests {
         let baseline = firstJournal.preferenceHistory().unwrap();
         let outcomes = applyIndependentOperations(
             second.host.clone(),
-            &schema(&baseline),
+            &schema(),
             &[],
             &baseline,
             |_, _| true,
@@ -724,7 +770,7 @@ mod tests {
                     let history = journal.preferenceHistory().unwrap();
                     let outcomes = applyIndependentOperations(
                         host.clone(),
-                        &schema(&history),
+                        &schema(),
                         &history,
                         &[operation.clone()],
                         |_, _| true,
@@ -812,7 +858,7 @@ mod tests {
 
     /// Commits the existing extension migration before retiring sources and keeps new-owner edits authoritative.
     #[test]
-    fn layout_transfers_extension_settings_before_completing_fifteen_retired_operations() {
+    fn layout_migrates_local_extension_settings_and_confirms_retired_history() {
         use operit_store::ExtensionStore::{ExtensionRecord, ExtensionStore};
         use operit_store::SyncOperationStore::SyncOperationStore;
         let source = Fixture::new();
@@ -856,11 +902,11 @@ mod tests {
             layout(target.host.clone())
                 .prepareOperations(&mut history, &mut pending)
                 .unwrap(),
-            15
+            0
         );
-        assert!(pending.is_empty());
-        assert_eq!(journal.pendingOperationCount().unwrap(), 0);
-        assert_eq!(journal.preferenceHistory().unwrap(), incoming);
+        assert_eq!(pending.len(), 15);
+        assert_eq!(journal.pendingOperationCount().unwrap(), 15);
+        assert!(journal.preferenceHistory().unwrap().is_empty());
         let extensions = ExtensionStore::new(target.host.clone());
         let mut migrated = extensions.record("package", "demo").unwrap();
         assert_eq!(migrated.schemaVersion, 1);
@@ -892,13 +938,22 @@ mod tests {
             layout(target.host.clone())
                 .prepareOperations(&mut history, &mut pending)
                 .unwrap(),
-            1
+            0
         );
         assert_eq!(
             extensions.record("package", "demo").unwrap().settings["order"],
             9
         );
-        assert_eq!(journal.pendingOperationCount().unwrap(), 0);
+        assert_eq!(journal.pendingOperationCount().unwrap(), 16);
+        assert!(pending.iter().any(|op|op.payload["settings"] == json!(99) || op.payload["value"]["order"] == 99));
+        let declarations = schema();
+        let registry = operit_store::PreferenceMerge::registry(target.host.clone(), &declarations, [], |_, _| true).unwrap();
+        let report = registry.receive(&[]).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.pending.is_empty());
+        assert_eq!(report.retired, 16);
+        assert_eq!(extensions.record("package", "demo").unwrap().settings["order"], 9);
+        assert_eq!(journal.preferenceHistory().unwrap().len(), 16);
     }
 
     /// Failed business migration leaves the layout uncommitted and preserves all received originals.
@@ -935,9 +990,51 @@ mod tests {
             layout(target.host.clone())
                 .prepareOperations(&mut history, &mut pending)
                 .unwrap(),
-            15
+            0
         );
-        assert_eq!(journal.pendingOperationCount().unwrap(), 0);
-        assert_eq!(journal.preferenceHistory().unwrap(), incoming);
+        assert_eq!(journal.pendingOperationCount().unwrap(), 15);
+        assert_eq!(journal.pendingOperations().unwrap(), before);
+        assert!(journal.preferenceHistory().unwrap().is_empty());
     }
+    /// The production theme owner retains collection absence through migration and correction.
+    #[test]
+    fn theme_collection_migration_and_correction_preserve_late_history_priority() {
+        use operit_store::{PreferenceMerge::applyOperations, Transaction};
+        use super::super::UserPreferencesManager::UserPreferencesManager;
+        let source = Fixture::new();
+        let target = Fixture::new();
+        let path = RuntimeStorageLayout::USER_PREFERENCES_PATH;
+        let record = |id: &str| json!({"id":id,"name":id,
+            "snapshot":serde_json::from_str::<Value>(include_str!("theme_snapshot_fixture.json")).unwrap(),
+            "createdAt":1,"updatedAt":1});
+        let old_schema = PreferenceMergeSchema { stores: vec![PreferenceMergeStore {
+            path:path.into(),encrypted:false,
+            open: |host,path| PreferencesDataStore::newWithStorage(host,path).withSchema(2,|_,_|Ok(())),
+            merge: StoragePreferencesMergeDescriptor {version:1,catalog:None,references:vec![],projection:None},
+        }] };
+        let original = historical(path,"theme_configs",json!([record("kept")]),2,false,50);
+        applyOperations(source.host.clone(),&old_schema,&[],&[original],|_,_|true).unwrap();
+        let old = PreferencesDataStore::newWithStorage(source.host.clone(),path).withSchema(2,|_,_|Ok(()));
+        let checkpoint = old.syncSnapshot().unwrap();
+        assert!(old.repairSyncedSnapshot(&checkpoint.token().unwrap(),&checkpoint).unwrap());
+        let source_store = UserPreferencesManager::store(source.host.clone());
+        source_store.prepareSync().unwrap();
+        applyOperations(source.host.clone(),&schema(),&[],&[],|_,_|true).unwrap();
+        let authority = source_store.syncSnapshot().unwrap();
+        let target_store = UserPreferencesManager::store(target.host.clone());
+        target_store.prepareSync().unwrap();
+        assert!(target_store.repairSyncedSnapshot(&target_store.syncSnapshot().unwrap().token().unwrap(),&authority).unwrap());
+        for revision in [40,60] {
+            let incoming = historical(path,"theme_configs",json!([record("kept"),record("unseen")]),2,false,revision);
+            for host in [source.host.clone(),target.host.clone()] {
+                applyOperations(host,&schema(),&[],&[incoming.clone()],|_,_|true).unwrap();
+            }
+            assert_eq!(target_store.data().unwrap().contains(&stringPreferencesKey("theme_config_unseen")),revision == 60);
+            assert_eq!(source_store.syncSnapshot().unwrap().data,target_store.syncSnapshot().unwrap().data);
+        }
+        assert_eq!(authority.data.revision,checkpoint.data.revision);
+        assert_eq!(authority.covered,checkpoint.covered);
+        assert!(Transaction::compare(&source_store.syncSnapshot().unwrap(),&target_store.syncSnapshot().unwrap()).unwrap().is_none());
+    }
+
 }

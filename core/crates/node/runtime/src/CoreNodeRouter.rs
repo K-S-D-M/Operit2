@@ -2614,6 +2614,10 @@ mod tests {
     }
 
     impl RuntimeStorageHost for TestRuntimeStorageHost {
+        fn openTransactionDatabase(&self, path: &str) -> operit_host_api::HostResult<Box<dyn operit_host_api::RuntimeSqliteConnection>> {
+            operit_host_api::RuntimeSqliteHost::openSqliteDatabase(
+                &operit_host_native_storage::NativeRuntimeStorageHost::new(self.runtimeRoot.clone(),self.workspaceRoot.clone()),path)
+        }
         /// Confirms synchronous in-memory publication without copying or rewriting bytes.
         fn flushFile(&self, path: &str) -> operit_host_api::HostResult<()> {
             if !self.exists(path)? {
@@ -4316,7 +4320,7 @@ mod tests {
                 mutable_shared_stream(usize::MAX),
                 mutable_shared_stream(usize::MAX),
             );
-            let source = coreResponseStreamSource(responseStream.clone(), streamId.to_string());
+            let source = coreResponseStreamSource(responseStream.clone(), streamId.to_string(), None);
             let mut message = ChatMessage::new("ai".to_string());
             message.contentStream =
                 Some(CoreStream::fromSourceWithId(streamId.to_string(), source));
