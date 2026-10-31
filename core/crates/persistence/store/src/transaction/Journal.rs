@@ -8,6 +8,13 @@ use crate::SyncOperationStore::{SyncOperation, SyncOperationStoreError as Error,
 
 pub(crate) struct Journal(Box<dyn RuntimeSqliteConnection>);
 
+// Direct appends and recoverable preference edits share a durable identity floor.
+const AUTHOR_SEQUENCE_HIGH_WATER_SQL: &str = "SELECT MAX(
+    COALESCE((SELECT sequence FROM transaction_authors WHERE origin=?1),0),
+    COALESCE((SELECT MAX(sequence) FROM originals WHERE origin=?1),0),
+    COALESCE((SELECT MAX(sequence) FROM _operit_compacted WHERE origin=?1),0),
+    COALESCE((SELECT MAX(last) FROM legacy_receipts WHERE origin=?1),0))";
+
 impl Journal {
     pub(crate) fn open(host: &dyn RuntimeStorageHost, root: &str) -> Result<Self, Error> {
         let mut connection = host.openTransactionDatabase(&format!("{root}/transactions.sqlite"))?;
@@ -109,6 +116,29 @@ impl Journal {
         self.0.query(sql, params)?.into_iter().map(|row| Ok(serde_json::from_str(&row.valueAt(0)?.asString()?)?)).collect()
     }
 
+    /// Uses origin/sequence indexes and exact intervals without decoding already received headers.
+    pub(crate) fn headers_since<K: crate::SyncOperationStore::SyncOperationKnowledge>(
+        &mut self, clock: &K, domains: &[String], projection: &str, export: bool, floors: &BTreeMap<String,i64>,
+    ) -> Result<Vec<JournalRecord>, Error> {
+        let mut headers = Vec::new();
+        let domains = serde_json::to_string(domains)?;
+        let sql = format!("SELECT header FROM originals WHERE origin=?1 AND sequence>=?2
+            AND (?3 OR pending=0) AND (?4='[]' OR domain IN (SELECT value FROM json_each(?4)))
+            AND ({projection}) AND NOT EXISTS (SELECT 1 FROM json_each(?5) r
+                WHERE sequence BETWEEN json_extract(r.value,'$[0]') AND json_extract(r.value,'$[1]'))
+            ORDER BY sequence");
+        for row in self.0.query("SELECT origin,MAX(sequence) FROM originals GROUP BY origin", vec![])? {
+            let origin = row.valueAt(0)?.asString()?;
+            let Some(next) = clock.nextMissingSequence(&origin, floors.get(&origin).copied().unwrap_or(0)) else { continue; };
+            if next > row.valueAt(1)?.asI64()? { continue; }
+            for row in self.0.query(&sql, vec![text(&origin),SqliteValue::Integer(next),
+                SqliteValue::Integer(i64::from(export)),text(&domains),text(&serde_json::to_string(&clock.knownRanges(&origin))?)])? {
+                headers.push(serde_json::from_str(&row.valueAt(0)?.asString()?)?);
+            }
+        }
+        Ok(headers)
+    }
+
     pub(crate) fn pending_ids(&mut self) -> Result<Vec<String>, Error> {
         self.0.query("SELECT id FROM originals WHERE pending=1 ORDER BY id", vec![])?.into_iter()
             .map(|row| Ok(row.valueAt(0)?.asString()?)).collect()
@@ -164,7 +194,7 @@ impl Journal {
     }
 
     pub(crate) fn highest(&mut self, origin: &str) -> Result<i64, Error> {
-        let rows = self.0.query("SELECT MAX(COALESCE((SELECT MAX(sequence) FROM originals WHERE origin=?1),0),COALESCE((SELECT MAX(sequence) FROM _operit_compacted WHERE origin=?1),0))", vec![text(origin)])?;
+        let rows = self.0.query(AUTHOR_SEQUENCE_HIGH_WATER_SQL, vec![text(origin)])?;
         Ok(rows[0].valueAt(0)?.asI64()?)
     }
 
@@ -224,7 +254,8 @@ impl Journal {
                 Some(row) => (row.valueAt(0)?.asI64()?, row.valueAt(1)?.asI64()?),
                 None => (0,0),
             };
-            let sequence = sequence.checked_add(1).ok_or_else(|| Error::Message("Transaction sequence overflow".into()))?;
+            let seen_sequence = tx.query(AUTHOR_SEQUENCE_HIGH_WATER_SQL, vec![text(origin)])?[0].valueAt(0)?.asI64()?;
+            let sequence = sequence.max(seen_sequence).checked_add(1).ok_or_else(|| Error::Message("Transaction sequence overflow".into()))?;
             let created_at = operit_host_api::TimeUtils::tryCurrentTimeMillis().map_err(Error::Message)?;
             let seen = tx.query("SELECT MAX(COALESCE((SELECT MAX(business_time) FROM originals),0),COALESCE((SELECT MAX(business_time) FROM _operit_compacted),0))", vec![])?[0].valueAt(0)?.asI64()?;
             let logical = logical.max(seen).max(created_at).checked_add(1).ok_or_else(|| Error::Message("Transaction logical clock overflow".into()))?;

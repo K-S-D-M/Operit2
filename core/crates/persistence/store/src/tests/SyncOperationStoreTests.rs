@@ -681,7 +681,7 @@ fn filtered_pages_read_payload_bytes_linearly() {
         for (index, expected) in operations.chunks(16).enumerate() {
             let mut inventory = BTreeSet::new();
             let page = store.operationsSinceWithInventory(&receipt, &[domain.into()], 16, usize::MAX,
-                (index == 0).then_some(&mut inventory), |entry| entry.payload["content"].is_string()).unwrap();
+                (index == 0).then_some(&mut inventory), Some(&|entry| entry.payload["content"].is_string())).unwrap();
             if index == 0 { assert_eq!(inventory.len(), operations.len()); }
             assert_eq!(page, expected);
             for entry in page { receipt.observe(&entry.originDeviceId, entry.sequence); }
@@ -714,7 +714,7 @@ fn filtered_compaction_does_not_open_later_entities() {
     assert!(readBytes < 32 * 5000, "small page opened later entity payloads: {readBytes} bytes");
     let mut inventory = BTreeSet::new();
     assert_eq!(store.operationsSinceWithInventory(&SyncClock::empty(), &[], 8, usize::MAX,
-        Some(&mut inventory), |entry| entry.payload["export"] == true).unwrap(), page);
+        Some(&mut inventory), Some(&|entry| entry.payload["export"] == true)).unwrap(), page);
     assert_eq!(inventory.len(), 64);
 }
 
@@ -1593,6 +1593,13 @@ fn sparse_receipt_exports_missing_predecessor_before_page_limit() {
             vec![earlier.clone()]
         );
     }
+    receipt.observe("device-a", 101);
+    store.withJournal(|journal| journal.transaction(|tx| {
+        tx.execute("UPDATE originals SET header='not JSON'", vec![])?;
+        Ok(())
+    })).unwrap();
+    assert!(store.operationsSince(&receipt, &[], 1).unwrap().is_empty());
+    assert!(store.preferenceMergeHistory().unwrap().is_empty());
 }
 
 /// Combines independent control acknowledgements with sparse receipts and out-of-order journal offsets.
@@ -1994,7 +2001,7 @@ fn relay_pages_compact_archived_and_pending_records_together() {
     store.appendOperation(&first).unwrap();
     store.receiveOperations(&[newer.clone(), other]).unwrap();
     let mut inventory = BTreeSet::new();
-    let page = store.operationsSinceWithInventory(&SyncClock::empty(), &[], 1, 1024, Some(&mut inventory), |_| true).unwrap();
+    let page = store.operationsSinceWithInventory(&SyncClock::empty(), &[], 1, 1024, Some(&mut inventory), Some(&|_| true)).unwrap();
     assert_eq!(page, vec![newer.clone()]);
     assert_eq!(inventory.len(), 2, "total must include later pages but exclude compacted old states");
     assert!(!inventory.contains(&first.opId));
@@ -2645,4 +2652,21 @@ fn empty_preference_preparation_replays_explicit_history_for_a_prepared_dynamic_
     assert_eq!(outcomes.len(), 1);
     assert!(outcomes[0].result.is_ok(), "{:?}", outcomes[0].result);
     assert_eq!(local.data().unwrap().get(&stringPreferencesKey("remote")), Some(&json!(true)));
+}
+
+/// A recoverable file intent owns its ID before publication in the journal.
+#[test]
+fn direct_allocator_skips_reserved_preference_id() {
+    let host = Arc::new(MemoryStorageHost::default());
+    let journal = SyncOperationStore::new(host, "runtime/sync");
+    let mutation = || NewSyncOperation {
+        domain: "preferences".into(), entityType: "allocator-test".into(), entityId: "allocator-test".into(),
+        operation: "set".into(), semantics: SyncOperationSemantics::EntityState, payload: json!({}),
+    };
+    let reserved = journal.withJournal(|j|j.reserve("allocator-test:preferences", mutation())).unwrap();
+    let direct = journal.appendLocalOperation("allocator-test:preferences", mutation()).unwrap();
+    assert_eq!(reserved.sequence, 1);
+    assert_eq!(direct.sequence, 2);
+    let next = journal.withJournal(|j|j.reserve("allocator-test:preferences", mutation())).unwrap();
+    assert_eq!(next.sequence, 3);
 }
