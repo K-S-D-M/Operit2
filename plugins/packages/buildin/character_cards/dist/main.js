@@ -1953,6 +1953,14 @@ function searchMemoryDatabase(database, settings2, options, config, debug = fals
 // src/memory-jobs/prompt-template.ts
 var extractionTemplate = '\u4F60\u8981\u4ECE\u5BF9\u8BDD\u4E2D\u6784\u5EFA\u957F\u671F\u8BB0\u5FC6\u56FE\u8C31\u3002\r\n\r\n$duplicatesPromptPart\r\n$existingMemoriesPrompt\r\n$existingFoldersPrompt\r\n\r\n\u3010\u5199\u5165\u524D\u5148\u8FC7\u7B5B\u3011\r\n- \u53EA\u8BB0\u5F55"\u7528\u6237\u7279\u5F02\u4E14\u53EF\u590D\u7528"\u7684\u4FE1\u606F\uFF1A\u7A33\u5B9A\u504F\u597D\u3001\u7EA6\u675F\u3001\u5DF2\u786E\u8BA4\u51B3\u7B56\u3001\u53CD\u590D\u9519\u8BEF\u3001\u9879\u76EE\u4E8B\u5B9E\u3001\u957F\u671F\u4E16\u754C\u89C2\u4E2D\u7684\u7A33\u5B9A\u8BBE\u5B9A\u3002\r\n- \u4E0D\u8BB0\u5F55\u5E38\u8BC6/\u516C\u5F00\u5B9A\u4E49\uFF08\u5982"TS\u662F\u4EC0\u4E48""Node\u662F\u4EC0\u4E48""\u78C1\u504F\u89D2\u662F\u4EC0\u4E48"\uFF09\u3002\r\n- \u4E0D\u8BB0\u5F55\u672A\u6765\u63A8\u6D4B\u9879\uFF1A\u4E0B\u4E00\u6B65\u5EFA\u8BAE\u3001TODO\u3001\u6682\u5B9A\u8BA1\u5212\u3002\r\n- \u82E5\u6CA1\u6709\u957F\u671F\u4EF7\u503C\u4FE1\u53F7\uFF0C\u76F4\u63A5\u8FD4\u56DE `{}`\u3002\r\n\r\n\u3010\u62BD\u53D6\u7B56\u7565\u3011\r\n- \u63D0\u4F9B\u7684\u5DF2\u6709\u8BB0\u5FC6\u53EA\u662F\u68C0\u7D22\u7EBF\u7D22\uFF0C\u4E0D\u662F\u4E8B\u5B9E\u8BC1\u636E\uFF1B\u53EA\u6709\u5BF9\u8BDD\u660E\u786E\u8BC1\u660E\u4E3B\u4F53\u548C\u4E8B\u5B9E\u76F8\u540C\u65F6\u624D\u53EF `update`\u3001`merge` \u6216\u8FDE\u8FB9\uFF0C\u5426\u5219\u5FFD\u7565\u8BE5\u5019\u9009\u3002\r\n- \u4F18\u5148 `update` / `merge`\uFF0C\u5176\u6B21\u624D\u662F `new`\u3002\r\n- `new` \u4EC5\u5728\u786E\u5B9E\u65B0\u589E\u6982\u5FF5\u65F6\u4F7F\u7528\uFF08\u6700\u591A 5 \u6761\uFF09\u3002\r\n- \u957F\u671F\u5C0F\u8BF4/\u4E16\u754C\u89C2\u573A\u666F\u4E2D\uFF0C\u53CD\u590D\u51FA\u73B0\u4E14\u5F71\u54CD\u8FDE\u7EED\u6027\u7684\u89D2\u8272\u3001\u5730\u70B9\u3001\u7EC4\u7EC7\u3001\u89C4\u5219\u3001\u65F6\u95F4\u7EBF\u53EF\u4EE5\u5165\u5E93\u3002\r\n- \u82E5\u6838\u5FC3\u662F"\u66F4\u65B0\u65E7\u6982\u5FF5"\uFF0C`main` \u5FC5\u987B\u4E3A `null`\uFF0C\u53EA\u7528 `update`\u3002\r\n- \u5982\u679C\u53EA\u662F\u5BF9\u5DF2\u6709\u8BB0\u5FC6\u7684\u6539\u5199\uFF08\u540C\u4E3B\u4F53 + \u540C\u52A8\u4F5C + \u540C\u7ED3\u679C\uFF09\uFF0C\u6309\u91CD\u590D\u5904\u7406\uFF1A\u4F18\u5148 `update`/`merge`\uFF0C\u4E0D\u8981\u518D `new`\u3002\r\n- \u5982\u679C `main` \u4E0E\u5DF2\u6709\u8BB0\u5FC6\u5728\u8BED\u4E49\u4E0A\u662F\u540C\u4E00\u4E8B\u4EF6\uFF0C`main` \u8BBE\u4E3A `null`\uFF0C\u6539\u7528 `update` \u6216 `merge`\u3002\r\n- \u5982\u679C\u5F53\u524D\u8F6E\u7684\u5927\u90E8\u5206\u4E8B\u5B9E\u5DF2\u88AB\u5DF2\u6709\u8BB0\u5FC6\u8986\u76D6\uFF0C\u4E0D\u8981\u518D\u521B\u5EFA\u5E73\u884C `new`\uFF0C\u4F18\u5148\u7ED9\u51FA\u4E00\u6B21 `update` \u6216\u4E00\u6B21 `merge`\u3002\r\n- \u5728\u6709\u660E\u786E\u91CD\u590D\u8BC1\u636E\u65F6\u7EE7\u7EED `new` \u89C6\u4E3A\u4E0D\u5408\u683C\u8F93\u51FA\u3002\r\n- \u63D0\u4F9B\u7ED9\u4F60\u7684\u5DF2\u6709\u8BB0\u5FC6\u6837\u672C\u662F\u53EF\u64CD\u4F5C\u5BF9\u8C61\uFF1A\u5373\u4F7F\u672C\u8F6E\u6CA1\u6709 `new`\uFF0C\u4E5F\u53EF\u4EE5\u76F4\u63A5\u5BF9\u8FD9\u4E9B\u5DF2\u6709\u8BB0\u5FC6\u505A `update`\u3001`merge`\u3001`links`\u3002\r\n- `update`\u3001`merge`\u3001`links`\u3001`alias_for` \u5F15\u7528\u7684\u6807\u9898\u5FC5\u987B\u4ECE\u5DF2\u6709\u8BB0\u5FC6\u6807\u9898\u4E2D\u9010\u5B57\u590D\u5236\uFF0C\u7981\u6B62\u6539\u5199\u3001\u8865\u5145\u3001\u7FFB\u8BD1\u6216\u731C\u6D4B\uFF1B\u6CA1\u6709\u7CBE\u786E\u5339\u914D\u7684\u6807\u9898\u5C31\u5FFD\u7565\u8BE5\u6761\u76EE\u3002\r\n\r\n\u3010\u8BED\u6C14\u7B56\u7565\u3011\r\n- \u8BED\u6C14\u53EF\u6839\u636E\u573A\u666F\u53D8\u5316\uFF08\u6280\u672F\u3001\u65E5\u5E38\u804A\u5929\u3001\u5C0F\u8BF4\u521B\u4F5C\uFF09\uFF0C\u4F46\u53EA\u80FD\u6539\u53D8\u8868\u8FBE\u65B9\u5F0F\uFF0C\u4E0D\u80FD\u6539\u53D8\u5165\u5E93\u6807\u51C6\u3002\r\n- \u7ED3\u6784\u548C\u4E8B\u5B9E\u5FC5\u987B\u7A33\u5B9A\uFF1A\u8BED\u6C14\u53D8\u5316\u4E0D\u7B49\u4E8E\u653E\u5BBD\u7B5B\u9009\u3002\r\n- \u4E0D\u80FD\u56E0\u4E3A\u8BED\u6C14\u81EA\u7136\u5316\u5C31\u8BB0\u5F55\u5E38\u8BC6\u6216\u672A\u6765\u8BA1\u5212\u3002\r\n- \u6807\u9898\u4FDD\u6301\u7B80\u6D01\u5E76\u805A\u7126\u4E8B\u4EF6\uFF0C\u5185\u5BB9\u5728\u53EF\u8BFB\u7684\u524D\u63D0\u4E0B\u8D34\u5408\u573A\u666F\u8BED\u6C14\u3002\r\n\r\n\u3010\u6807\u9898\u4E0E\u5185\u5BB9\u5199\u6CD5\u3011\r\n- `main` \u6807\u9898\u4F18\u5148\u5199\u4E8B\u4EF6\uFF0C\u4E0D\u5199\u5B9A\u4E49\u3002\r\n- \u63A8\u8350\u6807\u9898\u6A21\u677F\uFF1A\r\n  - \u4E8B\u4EF6\uFF1A`[\u9886\u57DF] \u4E8B\u4EF6\uFF1A\u52A8\u4F5C + \u7ED3\u679C`\r\n  - \u4E16\u754C\u89C2\u5B9E\u4F53\uFF1A`\u5B9E\u4F53\uFF1A\u540D\u79F0\uFF08\u8EAB\u4EFD/\u7C7B\u578B\uFF09`\r\n- \u4E0D\u63A8\u8350\u6807\u9898\uFF1A`X\u662F\u4EC0\u4E48`\u3001`X\u7684\u5B9A\u4E49`\u3001\u767E\u79D1\u5F0F\u6CDB\u6807\u9898\u3002\r\n- \u5185\u5BB9\u53EA\u5199"\u5DF2\u53D1\u751F\u4E8B\u5B9E + \u5F53\u524D\u5DF2\u786E\u8BA4\u72B6\u6001"\u3002\r\n- \u5185\u5BB9\u7981\u6B62\u5199\u672A\u6765\u52A8\u4F5C\u3001TODO\u3001\u63A8\u6D4B\u6027\u8BA1\u5212\u3002\r\n$memoryExtractionCustomRulesInstruction\r\n\r\n\u3010\u8FDE\u63A5\u5173\u7CFB\u89C4\u5219\u3011\r\n- \u53EA\u6709\u5F53\u5BF9\u8BDD\u91CC\u6709\u660E\u786E\u8BC1\u636E\u65F6\u624D\u5EFA\u8FB9\u3002\r\n- \u63A8\u8350\u5173\u7CFB\u7C7B\u578B\uFF1A\r\n  - \u4E8B\u4EF6\u6D41\u7A0B\uFF1A`FOLLOWS`\u3001`CORRECTS`\u3001`UPDATES`\r\n  - \u53C2\u4E0E\u4E0E\u4E0A\u4E0B\u6587\uFF1A`INVOLVES`\u3001`HAPPENS_AT`\r\n  - \u4E16\u754C\u89C2\u7ED3\u6784\uFF1A`PART_OF`\u3001`ALLIED_WITH`\u3001`OPPOSES`\r\n- \u4E0D\u80FD\u4EC5\u51ED"\u540C\u6BB5\u63D0\u5230\u8FC7"\u5C31\u8FDE\u8FB9\u3002\r\n- \u62FF\u4E0D\u51C6\u5C31\u4E0D\u8FDE\u3002\r\n- \u5EFA\u8FB9\u8303\u56F4\u4E0D\u5E94\u53EA\u9650\u4E8E\u672C\u8F6E\u65B0\u8F93\u51FA\uFF1B\u5982\u679C"\u5DF2\u6709\u6837\u672C\u8BB0\u5FC6"\u4E0E\u672C\u8F6E\u4E8B\u4EF6/\u5B9E\u4F53\u5173\u7CFB\u660E\u786E\uFF0C\u4E5F\u5E94\u4E3B\u52A8\u5EFA\u8FB9\u3002\r\n- \u8F93\u51FA\u524D\u8BF7\u5728\u5168\u91CF\u5BF9\u8C61\u4E0A\u505A\u4E24\u4E24\u5173\u7CFB\u68C0\u67E5\uFF1A`main`\u3001`new`\u3001`update` \u76EE\u6807\u3001\u4EE5\u53CA\u63D0\u4F9B\u7684\u5DF2\u6709\u8BB0\u5FC6\uFF1B\u51E1\u6709\u660E\u786E\u8BC1\u636E\u90FD\u5E94\u5EFA\u8FB9\u3002\r\n\r\n\u3010\u793A\u4F8B\uFF08\u5FC5\u987B\u9075\u5FAA\uFF09\u3011\r\n- \u4EC5\u5728\u95EE\u7B54\u5E38\u8BC6\uFF08\u5982"\u78C1\u504F\u89D2\u662F\u4EC0\u4E48"\uFF09\u4E14\u65E0\u7528\u6237\u7279\u5F02\u4FE1\u53F7\uFF1A\u8FD4\u56DE `{}`\u3002\r\n- \u4EC5\u89E3\u91CA TS/Node \u7B49\u516C\u5F00\u5B9A\u4E49\uFF1A\u8FD4\u56DE `{}`\u3002\r\n- \u95F2\u804A\u4F46\u6709\u5B9E\u9645\u4EA4\u6D41\u5185\u5BB9\uFF1A\u538B\u7F29\u6210\u4E00\u6761\u4E8B\u4EF6\u578B `main` \u8BB0\u5F55\uFF0C\u4E0D\u62C6\u6280\u672F\u7EC6\u8282\u3002\r\n- \u53EA\u6709\u7A7A\u6CDB\u5BD2\u6684\uFF08\u5982\u4EC5"\u4F60\u597D/\u5728\u5417"\uFF09\uFF1A\u8FD4\u56DE `{}`\u3002\r\n- \u672C\u8F6E\u51FA\u73B0"\u7528\u6237\u72AF\u9519\u5E76\u88AB\u7EA0\u6B63"\uFF1A\u4F5C\u4E3A\u4E8B\u4EF6\u5199\u5165 `main`\u3002\r\n- \u957F\u671F\u5C0F\u8BF4/\u4E16\u754C\u89C2\u8BA8\u8BBA\uFF1A\u53CD\u590D\u51FA\u73B0\u4E14\u5F71\u54CD\u8FDE\u7EED\u6027\u7684\u89D2\u8272\u3001\u5730\u540D\u3001\u7EC4\u7EC7\u3001\u89C4\u5219\u3001\u65F6\u95F4\u7EBF\u5E94\u5165\u5E93\uFF0C\u6309\u9700\u4F7F\u7528 `new`/`links`\u3002\r\n- \u4EC5\u89E3\u91CA\u533B\u7597\u5B9A\u4E49\uFF08\u5982"\u6D41\u611F\u662F\u4EC0\u4E48"\uFF09\uFF1A\u8FD4\u56DE `{}`\u3002\r\n- \u4EC5\u89E3\u91CA\u91D1\u878D\u5B9A\u4E49\uFF08\u5982"ETF\u662F\u4EC0\u4E48"\uFF09\uFF1A\u8FD4\u56DE `{}`\u3002\r\n- \u9879\u76EE\u672C\u8F6E\u6709\u660E\u786E\u8FDB\u5C55\uFF08\u4FEE\u590D\u5B8C\u6210/\u6458\u8981\u5B8C\u6210/\u4EFB\u52A1\u7EC8\u6B62\uFF09\uFF1A\u5199\u4E00\u6761\u4E8B\u4EF6\u578B `main`\u3002\r\n- \u53CD\u590D\u89E3\u91CA\u4F46\u6CA1\u6709\u65B0\u8FDB\u5C55/\u65B0\u51B3\u7B56\uFF1A\u8FD4\u56DE `{}`\u3002\r\n- \u4E16\u754C\u89C2\u8BBE\u5B9A\u53D1\u751F\u53D8\u5316\uFF08\u5173\u7CFB/\u5F52\u5C5E\u53D8\u66F4\uFF09\uFF1A\u4F18\u5148 `update`\uFF0C\u5E76\u5728\u8BC1\u636E\u660E\u786E\u65F6\u8FDE `UPDATES` / `PART_OF`\u3002\r\n- \u672C\u8F6E\u53EA\u662F\u91CD\u8FF0\u5DF2\u5B58\u5728\u4E8B\u4EF6\uFF1A\u4F18\u5148 `update`/`merge`\uFF0C\u4E0D\u8981 `new`\u3002\r\n- \u4E8B\u4EF6\u91CC\u660E\u786E\u51FA\u73B0\u53C2\u4E0E\u8005/\u5DE5\u5177\u5305\u4E14\u5173\u7CFB\u6E05\u6670\uFF1A\u8865\u5145 `INVOLVES` \u94FE\u63A5\u3002\r\n- \u672C\u8F6E\u786E\u8BA4\u4E86"\u5DF2\u6709\u6837\u672C\u8BB0\u5FC6"\u548C\u5176\u4ED6\u8BB0\u5FC6\u7684\u660E\u786E\u5173\u7CFB\uFF1A\u5373\u4F7F\u6CA1\u6709 `new`\uFF0C\u4E5F\u5E94\u5728 `links` \u4E2D\u4F53\u73B0\u3002\r\n\r\n\u3010\u8F93\u51FA\u683C\u5F0F\uFF08\u4E25\u683CJSON\uFF09\u3011\r\n- \u9664\u8FD4\u56DE `{}` \u5916\uFF0C\u5FC5\u987B\u5305\u542B `main`\u3001`new`\u3001`update`\u3001`merge`\u3001`links`$profileOptionalKey\uFF1B\u6570\u7EC4\u4E2D\u7684\u6BCF\u4E00\u9879\u5FC5\u987B\u662F\u5177\u540D\u5BF9\u8C61\uFF0C\u7981\u6B62\u4F4D\u7F6E\u6570\u7EC4\u3002\r\n- `main`\uFF1A`null` \u6216 `{"title":"...","content":"...","tags":["..."],"folder_path":"..."}`\u3002\r\n- `new`\uFF1A`[{"title":"...","content":"...","tags":["..."],"folder_path":"...","alias_for":null}, ...]`\u3002\r\n- `update`\uFF1A`[{"title":"...","content":"\u65B0\u5B8C\u6574\u5185\u5BB9","reason":"...","credibility":null,"importance":null}, ...]`\u3002\r\n- `merge`\uFF1A`[{"source_titles":["A","B"],"title":"...","content":"...","tags":["..."],"folder_path":"...","reason":"..."}, ...]`\u3002\r\n- `links`\uFF1A`[{"source":"...","target":"...","type":"\u5927\u5199\u4E0B\u5212\u7EBF\u5173\u7CFB","description":"...","weight":0.0}, ...]`\u3002\r\n- \u53EF\u4FE1\u5EA6\u3001\u91CD\u8981\u6027\u3001\u6743\u91CD\u5FC5\u987B\u662F 0.0 \u5230 1.0 \u7684 JSON \u6570\u5B57\uFF1B\u53EF\u4FE1\u5EA6\u3001\u91CD\u8981\u6027\u548C `alias_for` \u53EF\u7528 JSON `null`\u3002\r\n$profileMarkdownSchemaLine\r\n\r\n$profileUpdateInstruction\r\n\r\n\u53EA\u8FD4\u56DE\u5408\u6CD5 JSON \u5BF9\u8C61\uFF0C\u4E0D\u8981\u8F93\u51FA\u5176\u4ED6\u5185\u5BB9\u3002\r\n';
 
+// src/storage/meta-schema.json
+var meta_schema_default = {
+  version: 1,
+  steps: [
+    [{ op: "set_object_field", key: "state", field: "legacyImportPending", value: true }]
+  ]
+};
+
 // src/storage/merge.json
 var merge_default = {
   cards: {
@@ -2244,6 +2252,135 @@ var merge_default = {
           }
         ],
         target: "runtime/plugin_data/space/com.operit.character_cards/groups.preferences.json"
+      },
+      {
+        key: {
+          kind: "exact",
+          key: "initialization"
+        },
+        path: [
+          {
+            kind: "field",
+            name: "card"
+          },
+          {
+            kind: "field",
+            name: "id"
+          }
+        ],
+        target: "runtime/plugin_data/space/com.operit.character_cards/cards.preferences.json"
+      },
+      {
+        key: {
+          kind: "exact",
+          key: "initialization"
+        },
+        path: [
+          {
+            kind: "field",
+            name: "card"
+          },
+          {
+            kind: "field",
+            name: "chatProviderId"
+          }
+        ],
+        target: "runtime/config/preferences/model_configs.preferences.json"
+      },
+      {
+        key: {
+          kind: "exact",
+          key: "initialization"
+        },
+        path: [
+          {
+            kind: "field",
+            name: "card"
+          },
+          {
+            kind: "field",
+            name: "ttsConfigId"
+          }
+        ],
+        target: "runtime/config/preferences/tts_configs.preferences.json"
+      },
+      {
+        key: {
+          kind: "exact",
+          key: "initialization"
+        },
+        path: [
+          {
+            kind: "field",
+            name: "card"
+          },
+          {
+            kind: "field",
+            name: "themeConfigId"
+          }
+        ],
+        target: "runtime/config/preferences/user_preferences.preferences.json"
+      },
+      {
+        key: {
+          kind: "exact",
+          key: "initialization"
+        },
+        path: [
+          {
+            kind: "field",
+            name: "card"
+          },
+          {
+            kind: "field",
+            name: "sharedMemoryId"
+          }
+        ],
+        target: "runtime/plugin_data/space/com.operit.character_cards/stores.preferences.json"
+      },
+      {
+        key: {
+          kind: "exact",
+          key: "initialization"
+        },
+        path: [
+          {
+            kind: "field",
+            name: "card"
+          },
+          {
+            kind: "field",
+            name: "attachedTagIds"
+          },
+          {
+            kind: "array_values"
+          }
+        ],
+        target: "runtime/plugin_data/space/com.operit.character_cards/tags.preferences.json"
+      },
+      {
+        key: {
+          kind: "exact",
+          key: "initialization"
+        },
+        path: [
+          {
+            kind: "field",
+            name: "card"
+          },
+          {
+            kind: "field",
+            name: "sharedMemoryMounts"
+          },
+          {
+            kind: "array_values"
+          },
+          {
+            kind: "field",
+            name: "sharedMemoryId"
+          }
+        ],
+        target: "runtime/plugin_data/space/com.operit.character_cards/stores.preferences.json"
       }
     ],
     projection: null
@@ -2979,7 +3116,7 @@ function migrateCharacterStorage(storage, directory) {
             const document2 = absolute(directory, move.destination + "/USER.md");
             if (!(yield Tools.Files.exists(document2)).exists) {
               completed(yield Tools.Files.mkdir(document2.slice(0, document2.lastIndexOf("/")), true));
-              completed(yield Tools.Files.write(document2, ""));
+              completed((yield Tools.Files.write(document2, "")).operation);
             }
           }
           plan.phase = "authors";
@@ -3353,8 +3490,8 @@ var CharacterStorage = class _CharacterStorage {
     this.migration = migration;
     this.memory = memory;
   }
-  /** Opens JSON configuration owners and upgrades the plugin schema before business reads. */
-  static open() {
+  /** Opens the real owners for explicit inspection without migrating or initializing business data. */
+  static openForRecovery() {
     return __async(this, null, function* () {
       const directory = ToolPkg.getSpaceDataDir();
       if (typeof directory !== "string" || directory.trim() === "") throw new Error("Plugin data directory is unavailable");
@@ -3374,23 +3511,31 @@ var CharacterStorage = class _CharacterStorage {
         const migration = yield Tools.Storage.dataStore.open({ path: ToolPkg.getLocalDataDir() + "/migration.preferences.json" });
         handles.push(migration);
         memory = yield CharacterMemoryDatabase.open();
-        const storage = new _CharacterStorage(configuration, metadata, chats, migration, memory);
-        metadata.withSchema(1, (version, preferences) => {
-          if (version !== 0) throw new Error("Missing character schema migration: " + version);
-          const state = preferences.get("state");
-          if (state !== void 0) {
-            assertObject(state, "character schema metadata");
-            preferences.set("state", { ...state, legacyImportPending: true });
-          }
-        });
-        yield metadata.data();
-        yield migrateCharacterStorage(storage, directory);
-        yield memory.retireLegacyEmbeddings();
-        return storage;
+        return new _CharacterStorage(configuration, metadata, chats, migration, memory);
       } catch (error) {
         const closed = yield Promise.allSettled([...handles.map((handle) => handle.close()), ...memory === void 0 ? [] : [memory.close()]]);
         const failures = closed.filter((result2) => result2.status === "rejected").map((result2) => result2.reason);
         if (failures.length !== 0) throw Object.assign(new Error("Character storage open and handle cleanup failed"), { cause: error, cleanupErrors: failures });
+        throw error;
+      }
+    });
+  }
+  /** Opens JSON configuration owners and upgrades the plugin schema before business reads. */
+  static open() {
+    return __async(this, null, function* () {
+      const storage = yield _CharacterStorage.openForRecovery();
+      try {
+        storage.metadata.withSchema(meta_schema_default.version, meta_schema_default.steps);
+        yield storage.metadata.data();
+        yield migrateCharacterStorage(storage, ToolPkg.getSpaceDataDir());
+        yield storage.memory.retireLegacyEmbeddings();
+        return storage;
+      } catch (error) {
+        try {
+          yield storage.close();
+        } catch (cleanupError) {
+          throw Object.assign(new Error("Character storage open and handle cleanup failed"), { cause: error, cleanupError });
+        }
         throw error;
       }
     });
@@ -3401,6 +3546,20 @@ var CharacterStorage = class _CharacterStorage {
       const result2 = {};
       for (const name of configurationNames) result2[name] = yield this.configuration[name].data();
       return result2;
+    });
+  }
+  /** Releases every retained host handle after an unsuccessful repository initialization. */
+  close() {
+    return __async(this, null, function* () {
+      const closed = yield Promise.allSettled([
+        ...Object.values(this.configuration).map((handle) => handle.close()),
+        this.metadata.close(),
+        this.chats.close(),
+        this.migration.close(),
+        this.memory.close()
+      ]);
+      const failures = closed.filter((result2) => result2.status === "rejected").map((result2) => result2.reason);
+      if (failures.length !== 0) throw Object.assign(new Error("Character storage handle cleanup failed"), { cleanupErrors: failures });
     });
   }
 };
@@ -4784,6 +4943,169 @@ var RepositorySession = class extends DatabaseMemoryRepository {
   }
 };
 
+// src/storage/initialization.ts
+function recoveryPlan(source) {
+  const plan = createPlan();
+  plan.card = source.card;
+  if (source.owner !== null) {
+    assertObject(source.owner, "existing memory owner");
+    const { ownerKey, userDocumentPath: userDocumentPath2, ...memory } = source.owner;
+    plan.memory = { ...memory, memories: [], links: [], chunks: [], candidates: [], embeddings: [] };
+  }
+  assertPlan(plan);
+  return plan;
+}
+function recoverySource(storage) {
+  return __async(this, null, function* () {
+    const entries = (yield storage.configuration.cards.data()).entries();
+    if (entries.length !== 1 || !entries[0][0].startsWith(recordPrefix))
+      throw new Error("\u6B64\u4FEE\u590D\u4EC5\u5904\u7406\u9996\u6B21\u5B89\u88C5\u4E2D\u65AD\uFF0C\u9700\u8981\u4FDD\u7559\u6070\u597D\u4E00\u5F20\u89D2\u8272\u5361\uFF1B\u4E0D\u4F1A\u6E05\u7A7A\u6216\u63A5\u7BA1\u5176\u4ED6\u6570\u636E\u3002");
+    const [key2, value] = entries[0];
+    const card = readCharacter(value, key2.slice(recordPrefix.length));
+    if (key2 !== recordPrefix + card.id || !equal(card, value)) throw new Error("\u89D2\u8272\u5361\u683C\u5F0F\u4E0D\u5B8C\u6574\uFF0C\u4E0D\u80FD\u4F5C\u4E3A\u9996\u6B21\u521D\u59CB\u5316\u4FEE\u590D\u6765\u6E90\u3002");
+    const owner2 = yield storage.memory.get("owners", "character:" + card.id);
+    const source = { card, owner: owner2 === null ? null : owner2.value };
+    yield validateRecords(storage, recoveryPlan(source));
+    return source;
+  });
+}
+function inspectCharacterInitialization() {
+  return __async(this, null, function* () {
+    const storage = yield CharacterStorage.openForRecovery();
+    try {
+      const metadata = yield storage.metadata.data();
+      if (metadata.contains("state")) return { status: "ready" };
+      const pending = metadata.get("initialization");
+      if (pending !== void 0) {
+        assertPlan(pending);
+        return { status: "planned", cardName: pending.card.name };
+      }
+      return { status: "repairable", source: yield recoverySource(storage) };
+    } finally {
+      yield storage.close();
+    }
+  });
+}
+function repairCharacterInitialization(expected) {
+  return __async(this, null, function* () {
+    const storage = yield CharacterStorage.openForRecovery();
+    try {
+      storage.metadata.withSchema(meta_schema_default.version, meta_schema_default.steps);
+      const source = yield recoverySource(storage);
+      if (!equal(source, expected)) throw new Error("\u6570\u636E\u5DF2\u5728\u68C0\u67E5\u540E\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u518D\u786E\u8BA4\u4FEE\u590D\u3002");
+      const plan = recoveryPlan(source);
+      yield storage.metadata.edit((preferences) => {
+        if (preferences.contains("state") || preferences.contains("initialization"))
+          throw new Error("\u521D\u59CB\u5316\u72B6\u6001\u5DF2\u53D1\u751F\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u68C0\u67E5\u3002");
+        preferences.set("initialization", storedValue(plan));
+      });
+      yield initializeCharacterStorage(storage, ToolPkg.getSpaceDataDir());
+    } finally {
+      yield storage.close();
+    }
+  });
+}
+function createPlan() {
+  const state = createInitialState(Date.now());
+  const { ownerKey, userDocumentPath: userDocumentPath2, ...memory } = state.owners[0];
+  return { version: 1, card: state.cards[0], memory, memoryPreferences: state.memoryPreferences, memoryRecall: state.memoryRecall };
+}
+function plannedOwner(plan) {
+  const ownerKey = "character:" + plan.card.id;
+  return { ...plan.memory, ownerKey, userDocumentPath: userDocumentPath(ownerKey) };
+}
+function plannedOwnerMetadata(plan) {
+  const { memories, links, chunks, candidates, embeddings, ...metadata } = plannedOwner(plan);
+  return metadata;
+}
+function assertPlan(value) {
+  assertObject(value, "character initialization plan");
+  if (value.version !== 1) throw new Error("Unsupported character initialization plan");
+  assertObject(value.card, "initial character");
+  if (!equal(readCharacter(value.card, requireId(value.card.id, "initial character id")), value.card))
+    throw new Error("Invalid character initialization card");
+  assertObject(value.memory, "initial memory space");
+  const owner2 = plannedOwner(value);
+  assertMemorySpace(owner2);
+  for (const name of ["memories", "links", "chunks", "candidates", "embeddings"])
+    if (owner2[name].length !== 0) throw new Error("Character initialization plan contains memory records");
+  if (owner2.rebuildTask !== null) throw new Error("Character initialization plan contains a memory job");
+  assertObject(value.memoryPreferences, "initial memory preferences");
+  assertBoolean(value.memoryPreferences.userDescriptionEnabled, "user description enabled");
+  assertBoolean(value.memoryPreferences.autoUpdateEnabled, "memory auto update enabled");
+  if (!equal(normalizeMemoryRecallSettings(value.memoryRecall), value.memoryRecall))
+    throw new Error("Character initialization plan has incomplete recall settings");
+}
+function validateRecords(storage, plan) {
+  return __async(this, null, function* () {
+    const configuration = yield storage.data();
+    for (const name of configurationNames) {
+      const entries = configuration[name].entries();
+      if (entries.length === 0) continue;
+      if (plan === void 0 || name !== "cards" || entries.length !== 1 || entries[0][0] !== recordPrefix + plan.card.id || !equal(entries[0][1], plan.card))
+        throw new Error("Character initialization found unplanned configuration: " + name);
+    }
+    const rows = yield storage.memory.query("SELECT collection,key,value FROM plugin_objects LIMIT 2");
+    if (rows.length === 0) return;
+    if (plan === void 0) throw new Error("Character initialization found memory records without a plan");
+    const expected = plannedOwnerMetadata(plan);
+    if (rows.length !== 1 || rows[0].collection !== "owners" || rows[0].key !== expected.ownerKey || !equal(JSON.parse(String(rows[0].value)), expected))
+      throw new Error("Character initialization found unplanned memory records");
+  });
+}
+function initializeCharacterStorage(storage, directory) {
+  return __async(this, null, function* () {
+    const metadata = yield storage.metadata.data();
+    if (metadata.contains("state")) {
+      if (metadata.contains("initialization")) throw new Error("Character initialization plan remains beside completed metadata");
+      return;
+    }
+    let persisted = metadata.get("initialization");
+    if (persisted === void 0) {
+      yield validateRecords(storage, void 0);
+      const plan2 = createPlan();
+      yield storage.metadata.edit((preferences) => {
+        if (preferences.contains("state") || preferences.contains("initialization"))
+          throw new Error("Character initialization changed concurrently");
+        preferences.set("initialization", storedValue(plan2));
+      });
+      persisted = storedValue(plan2);
+    }
+    assertPlan(persisted);
+    const plan = persisted;
+    yield validateRecords(storage, plan);
+    yield storage.configuration.cards.edit((preferences) => {
+      const entries = preferences.entries();
+      if (entries.length === 1 && entries[0][0] === recordPrefix + plan.card.id && equal(entries[0][1], plan.card)) return;
+      if (entries.length !== 0) throw new Error("Character initialization card changed concurrently");
+      preferences.set(recordPrefix + plan.card.id, storedValue(plan.card));
+    });
+    const owner2 = plannedOwner(plan);
+    const existing = yield storage.memory.get("owners", owner2.ownerKey);
+    const ownerMetadata = plannedOwnerMetadata(plan);
+    if (existing === null) {
+      yield storage.memory.commit([{ op: "put", collection: "owners", key: owner2.ownerKey, value: storedValue(ownerMetadata), expectedVersion: null }]);
+    } else if (!equal(existing.value, ownerMetadata)) throw new Error("Character initialization owner changed concurrently");
+    const path = directory + "/" + owner2.userDocumentPath;
+    const file = yield Tools.Files.exists(path);
+    if (file.exists) {
+      if (file.isDirectory) throw new Error("Character initialization document path is a directory");
+    } else {
+      const created = yield Tools.Files.mkdir(path.slice(0, path.lastIndexOf("/")), true);
+      if (!created.successful) throw new Error(created.details);
+      const { operation } = yield Tools.Files.write(path, "", false);
+      if (!operation.successful) throw new Error(operation.details);
+    }
+    yield validateRecords(storage, plan);
+    yield storage.metadata.edit((preferences) => {
+      if (preferences.contains("state") || !equal(preferences.get("initialization"), plan))
+        throw new Error("Character initialization changed concurrently");
+      preferences.set("state", { version: 1, active: { CharacterCard: { id: plan.card.id } }, memoryPreferences: plan.memoryPreferences, memoryRecall: plan.memoryRecall });
+      preferences.remove("initialization");
+    });
+  });
+}
+
 // src/storage/database.ts
 function completed2(result2) {
   if (!result2.successful) throw new Error(result2.details);
@@ -4824,29 +5146,18 @@ var DatabaseCharacterRepository = class _DatabaseCharacterRepository {
         throw new Error("Plugin data directory is unavailable");
       const storage = yield CharacterStorage.open();
       const repository2 = new _DatabaseCharacterRepository(storage, directory, directories2);
-      const existing = (yield storage.metadata.data()).get("state");
-      if (existing === void 0) {
-        const state = createInitialState(Date.now());
-        for (const name of configurationNames) {
-          yield storage.configuration[name].edit((preferences) => {
-            if (preferences.entries().length !== 0) throw new Error("Character initialization found existing configuration: " + name);
-            for (const value of state[name]) preferences.set(recordPrefix + value.id, storedValue(value));
-          });
+      try {
+        yield initializeCharacterStorage(storage, directory);
+        yield repository2.readMetadata();
+        return repository2;
+      } catch (error) {
+        try {
+          yield storage.close();
+        } catch (cleanupError) {
+          throw Object.assign(new Error("Character initialization and handle cleanup failed"), { cause: error, cleanupError });
         }
-        const initialMemory = records(state).filter((row) => !configurationNames.some((name) => name === row.collection));
-        if (initialMemory.length !== 0) yield storage.memory.commit(initialMemory.map((row) => ({ op: "put", ...row, expectedVersion: null })));
-        for (const owner2 of state.owners) {
-          const path = directory + "/" + owner2.userDocumentPath;
-          completed2(yield Tools.Files.mkdir(path.slice(0, path.lastIndexOf("/")), true));
-          completed2(yield Tools.Files.write(path, "", false));
-        }
-        yield storage.metadata.edit((preferences) => {
-          if (preferences.contains("state")) throw new Error("Character initialization changed concurrently");
-          preferences.set("state", { version: state.version, active: storedValue(state.active), memoryPreferences: storedValue(state.memoryPreferences), memoryRecall: storedValue(state.memoryRecall) });
-        });
+        throw error;
       }
-      yield repository2.readMetadata();
-      return repository2;
     });
   }
   /** Combines complete JSON preferences with independently stored memory records for a domain session. */
@@ -5157,7 +5468,7 @@ var DatabaseCharacterRepository = class _DatabaseCharacterRepository {
           );
         }
         const stagedPath = document2.path + ".pending";
-        completed2(yield Tools.Files.write(stagedPath, document2.content, false));
+        completed2((yield Tools.Files.write(stagedPath, document2.content, false)).operation);
         stagedDocuments.push({ path: document2.path, stagedPath });
       }
       for (const name of configurationNames) {
@@ -5198,6 +5509,26 @@ function connectDirectorySources(sources) {
 }
 function getRepository() {
   return repository ?? (repository = Promise.resolve().then(() => DatabaseCharacterRepository.open(directories)));
+}
+function recoverRepository(source) {
+  return __async(this, null, function* () {
+    const previous = repository;
+    if (previous !== void 0) {
+      let failed = false;
+      try {
+        yield previous;
+      } catch {
+        failed = true;
+      }
+      if (!failed) throw new Error("\u89D2\u8272\u5361\u670D\u52A1\u5DF2\u7ECF\u6B63\u5E38\u8FD0\u884C\uFF0C\u65E0\u9700\u4FEE\u590D\u521D\u59CB\u5316\u3002");
+    }
+    if (repository !== previous) throw new Error("\u5DF2\u6709\u521D\u59CB\u5316\u6216\u4FEE\u590D\u8BF7\u6C42\u6B63\u5728\u6267\u884C\u3002");
+    repository = Promise.resolve().then(() => __async(null, null, function* () {
+      if (source !== null) yield repairCharacterInitialization(source);
+      return DatabaseCharacterRepository.open(directories);
+    }));
+    return repository;
+  });
 }
 
 // src/chat-storage.ts
@@ -8251,6 +8582,12 @@ function initializeService() {
     yield getService();
   });
 }
+function recoverService(source) {
+  return __async(this, null, function* () {
+    const owner2 = yield recoverRepository(source);
+    service = Promise.resolve(createCharacterCardsService(owner2));
+  });
+}
 function dispatch2(request) {
   return __async(this, null, function* () {
     return (yield getService()).dispatch(request);
@@ -8466,6 +8803,20 @@ function receiveDomainRequest(value) {
 function registerUiRequestChannel() {
   ToolPkg.ipc.on("character-memory.request", receiveUiRequest);
   ToolPkg.ipc.on("character-memory.domain", receiveDomainRequest);
+  ToolPkg.ipc.on("character-memory.initialization", receiveInitializationRecovery);
+}
+function receiveInitializationRecovery(value) {
+  return __async(this, null, function* () {
+    const request = record(value, "character-memory.initialization");
+    if (request.action === "inspect") return inspectCharacterInitialization();
+    if (request.action === "repair") {
+      const source = record(request.source, "initialization recovery source");
+      if (!("card" in source) || !("owner" in source)) throw new Error("Missing inspected initialization source");
+      yield recoverService(source);
+    } else if (request.action === "resume") yield recoverService(null);
+    else throw new Error("Unknown initialization recovery action");
+    return { status: "ready" };
+  });
 }
 function registerServiceLifecycle() {
   ToolPkg.registerAppLifecycleHook({ id: "service-initialize", event: "application_on_create", function: onServiceInitialize });

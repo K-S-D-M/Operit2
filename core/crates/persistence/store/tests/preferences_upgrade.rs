@@ -376,9 +376,9 @@ fn legacy_provider_field(path: &str, sequence: i64) -> operit_store::SyncOperati
     }))
 }
 
-/// Skips old-schema field edits before replaying a current-schema complete assignment.
+/// A missing source skips the owner batch; initialization then seals both old originals.
 #[test]
-fn unresolved_old_field_stays_pending_while_current_root_commits() {
+fn unresolved_old_field_skips_until_initialization_while_existing_source_replays() {
     let path = "runtime/config/preferences/late-provider-root.preferences.json";
     let provider = json!({"id":"DEEPSEEK", "name":"current name", "models":[]});
     let field = legacy_provider_field(path, 7);
@@ -404,14 +404,31 @@ fn unresolved_old_field_stays_pending_while_current_root_commits() {
             let outcomes = operit_store::PreferenceMerge::applyIndependentOperations(
                 fixture.host.clone(), &fixture_merge_schema(&[&path]), &[], &batch, |_,_| true);
             assert!(outcomes.iter().all(|outcome| !outcome.skipped));
-            let pending = SyncOperationStore::new(fixture.host.clone(), "runtime/sync").pendingOperationIds().unwrap();
-            assert_eq!(pending.contains(&field.opId), !existing);
-            assert!(history(&fixture).contains(&root));
+            let journal = SyncOperationStore::new(fixture.host.clone(), "runtime/sync");
+            assert!(journal.pendingOperationIds().unwrap().is_empty());
+            if !journal.skippedOperations().unwrap().is_empty() {
+                let authority = Fixture::new();
+                let store = PreferencesDataStore::newWithStorage(authority.host.clone(),path).withSchema(4,|_,_|Ok(()));
+                store.edit(|values|values.set(&stringPreferencesKey("provider_DEEPSEEK"),provider.clone())).unwrap();
+                let mut source = store.syncSnapshot().unwrap();
+                source.covered.extend([field.opId.clone(),root.opId.clone()]);
+                let declarations = fixture_merge_schema(&[path]);
+                let registry = operit_store::PreferenceMerge::registry(fixture.host.clone(),&declarations,[],|_,_|true).unwrap();
+                let current = registry.snapshot(&source.data.owner).unwrap();
+                assert!(registry.repair(&source.data.owner,&current.token().unwrap(),&source).unwrap());
+            }
+            assert!(journal.skippedOperations().unwrap().is_empty());
             let data = PreferencesDataStore::newWithStorage(fixture.host.clone(), path).data().unwrap();
             assert_eq!(data.get(&stringPreferencesKey("provider_DEEPSEEK")), Some(&provider));
             let originals = history(&fixture);
-            assert_eq!(originals.contains(&field), existing);
-            assert!(originals.contains(&root));
+            if existing {
+                assert!(originals.contains(&field) && originals.contains(&root));
+            } else {
+                assert!(!originals.contains(&field) && !originals.contains(&root));
+                assert!(originals.iter().any(|operation|
+                    operit_store::Transaction::compaction::Initialization::decode(operation).unwrap()
+                        .is_some_and(|initialization|initialization.covered.contains(&field.opId) && initialization.covered.contains(&root.opId))));
+            }
         }
     }
 }
@@ -492,7 +509,7 @@ fn effective_replay_commits_no_sibling_of_an_invalid_transaction() {
 /// Keeps committed ordinary datasets out of an unrelated delta's replay and lock scope.
 #[test]
 fn incremental_replay_only_materializes_the_changed_dataset() {
-    use operit_store::SyncOperationStore::{SyncOperation, SyncOperationSemantics};
+    use operit_store::SyncOperationStore::{SyncOperation, SyncOperationSemantics, SyncOperationKnowledge};
     let fixture = Fixture::new();
     let paths = (0..50).map(|dataset| format!("{}/probe-{dataset}.preferences.json",
         operit_util::RuntimeStorageLayout::CONFIG_PREFERENCES_DIR_PATH)).collect::<Vec<_>>();
@@ -536,7 +553,13 @@ fn incremental_replay_only_materializes_the_changed_dataset() {
     assert_eq!(outcomes[0].operations, vec![delta]);
     let current = PreferencesDataStore::newWithStorage(fixture.host.clone(), path).data().unwrap();
     assert_eq!(current.get(&stringPreferencesKey("value")), Some(&json!(201)));
-    assert_eq!(journal.preferenceHistory().unwrap().len(), 10_001);
+    assert_eq!(journal.preferenceHistory().unwrap().len(), 50, "one retained assignment per dataset");
+    let receipt = journal.receipt().unwrap();
+    for dataset in 0..50 {
+        for sequence in 1..=200 {
+            assert!(receipt.containsSequence(&format!("probe-{dataset}"), sequence));
+        }
+    }
 }
 
 /// Duplicate delivery validates immutable content without decoding committed business history again.

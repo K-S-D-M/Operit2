@@ -1,10 +1,10 @@
+import schema from "./meta-schema.json";
 import type { Storage } from "../../../../../types/storage";
 import declarations from "./merge.json";
 import type { StoragePreferencesMergeDescriptor } from "../../../../../types/storage.generated";
 const merge = declarations as Record<keyof typeof declarations, StoragePreferencesMergeDescriptor>;
 import { clone } from "./records";
 import { migrateCharacterStorage } from "./migrations/legacy-to-v1";
-import { assertObject } from "../validation";
 import { CharacterMemoryDatabase } from "./memory";
 
 export const configurationNames = ["cards", "groups", "tags", "stores", "conversationGroups"] as const;
@@ -33,8 +33,8 @@ export class CharacterStorage {
     readonly memory: CharacterMemoryDatabase,
   ) {}
 
-  /** Opens JSON configuration owners and upgrades the plugin schema before business reads. */
-  static async open(): Promise<CharacterStorage> {
+  /** Opens the real owners for explicit inspection without migrating or initializing business data. */
+  static async openForRecovery(): Promise<CharacterStorage> {
     const directory = ToolPkg.getSpaceDataDir();
     if (typeof directory !== "string" || directory.trim() === "") throw new Error("Plugin data directory is unavailable");
     const handles: Storage.DataStore[] = [];
@@ -52,25 +52,27 @@ export class CharacterStorage {
       const migration = await Tools.Storage.dataStore.open({ path: ToolPkg.getLocalDataDir() + "/migration.preferences.json" });
       handles.push(migration);
       memory = await CharacterMemoryDatabase.open();
-      const storage = new CharacterStorage(configuration, metadata, chats, migration, memory);
-      // The schema callback only marks the format upgrade. File and record work belongs
-      // to the repository's initialization, outside any pending preferences edit.
-      metadata.withSchema(1, (version, preferences) => {
-        if (version !== 0) throw new Error("Missing character schema migration: " + version);
-        const state = preferences.get<Record<string, Storage.Value>>("state");
-        if (state !== undefined) {
-          assertObject(state, "character schema metadata");
-          preferences.set("state", { ...state, legacyImportPending: true });
-        }
-      });
-      await metadata.data();
-      await migrateCharacterStorage(storage, directory);
-      await memory.retireLegacyEmbeddings();
-      return storage;
+      return new CharacterStorage(configuration, metadata, chats, migration, memory);
     } catch (error) {
       const closed = await Promise.allSettled([...handles.map(handle => handle.close()), ...(memory === undefined ? [] : [memory.close()])]);
       const failures = closed.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => result.reason);
       if (failures.length !== 0) throw Object.assign(new Error("Character storage open and handle cleanup failed"), { cause: error, cleanupErrors: failures });
+      throw error;
+    }
+  }
+
+  /** Opens JSON configuration owners and upgrades the plugin schema before business reads. */
+  static async open(): Promise<CharacterStorage> {
+    const storage = await CharacterStorage.openForRecovery();
+    try {
+      storage.metadata.withSchema(schema.version, schema.steps as Storage.MigrationRule[][]);
+      await storage.metadata.data();
+      await migrateCharacterStorage(storage, ToolPkg.getSpaceDataDir());
+      await storage.memory.retireLegacyEmbeddings();
+      return storage;
+    } catch (error) {
+      try { await storage.close(); }
+      catch (cleanupError) { throw Object.assign(new Error("Character storage open and handle cleanup failed"), { cause: error, cleanupError }); }
       throw error;
     }
   }
@@ -80,5 +82,15 @@ export class CharacterStorage {
     const result = {} as ConfigurationSnapshot;
     for (const name of configurationNames) result[name] = await this.configuration[name].data();
     return result;
+  }
+
+  /** Releases every retained host handle after an unsuccessful repository initialization. */
+  async close(): Promise<void> {
+    const closed = await Promise.allSettled([
+      ...Object.values(this.configuration).map(handle => handle.close()),
+      this.metadata.close(), this.chats.close(), this.migration.close(), this.memory.close(),
+    ]);
+    const failures = closed.filter((result): result is PromiseRejectedResult => result.status === "rejected").map(result => result.reason);
+    if (failures.length !== 0) throw Object.assign(new Error("Character storage handle cleanup failed"), { cleanupErrors: failures });
   }
 }
