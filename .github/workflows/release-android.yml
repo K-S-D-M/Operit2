@@ -1,0 +1,45 @@
+name: Android Auto Release
+
+on:
+  workflow_run:
+    workflows: ["Android Flutter Build"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: 下载 APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: operit2-android-${{ github.event.workflow_run.head_sha }}
+          path: dist
+
+      - name: 获取版本号和日期
+        id: version
+        run: |
+          apk=$(ls dist/operit2-app-android-arm64-v8a-*.apk | head -1)
+          echo "APK=$apk"
+          # 从文件名提取版本，例如 operit2-app-android-arm64-v8a-2.0.0-preview.22.apk
+          ver=$(basename "$apk" .apk | sed 's/operit2-app-android-arm64-v8a-//')
+          echo "VERSION=$ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=v2.0.0-$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Operit2 2.0.0 daily build ${{ steps.version.outputs.tag }}
+          body: |
+            # Operit2 2.0.0 daily build
+            ## 构建信息
+            - 平台：Android arm64-v8a
+            - 版本：${{ steps.version.outputs.version }}
+            - 提交：${{ github.event.workflow_run.head_sha }}
+          files: dist/operit2-app-android-arm64-v8a-*.apk
