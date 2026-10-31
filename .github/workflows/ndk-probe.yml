@@ -1,0 +1,22 @@
+name: NDK Probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: windows-2025
+    steps:
+      - name: Probe
+        shell: pwsh
+        run: |
+          "ANDROID_HOME=$env:ANDROID_HOME"
+          "ANDROID_NDK_HOME=$env:ANDROID_NDK_HOME"
+          "ANDROID_NDK_ROOT=$env:ANDROID_NDK_ROOT"
+          "ANDROID_NDK=$env:ANDROID_NDK"
+          "--- SDK ndk dir ---"
+          Get-ChildItem "$env:ANDROID_HOME\ndk" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          "--- ProgramFiles ndk dir ---"
+          Get-ChildItem "C:\Program Files (x86)\Android\android-sdk\ndk" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          foreach ($root in @("$env:ANDROID_HOME\ndk\27.3.13750724","C:\Program Files (x86)\Android\android-sdk\ndk\27.3.13750724")) {
+            "--- $root : exists=$(Test-Path $root)"
+            Get-ChildItem "$root\toolchains\llvm\prebuilt\windows-x86_64\bin" -Filter "aarch64-linux-android24-clang*" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          }
