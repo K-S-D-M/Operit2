@@ -82,8 +82,10 @@ jobs:
 
     env:
       RUST_TOOLCHAIN_VERSION: 1.95.0
-      # 必须与 build-android 的同名变量一致：V8 缓存清单会记录该 NDK 版本，
-      # 两侧不一致会让 Windows 端判定缓存失效并重新发起源码构建。
+      # V8 缓存清单记录 android_ndk_version。runner 镜像会不断新增 NDK 目录
+      # （Gradle 还会额外装 Flutter SDK 的版本），只靠目录探测会让两个 job
+      # 取到不同版本、缓存互相失效，因此这里显式钉死声明值。
+      OPERIT_ANDROID_V8_NDK_VERSION: 27.3.13750724
       OPERIT_ANDROID_V8_NDK: /usr/local/lib/android/sdk/ndk/27.3.13750724
 
     steps:
@@ -172,7 +174,9 @@ jobs:
       RUSTFLAGS: -Awarnings
       RUST_TOOLCHAIN_VERSION: 1.95.0
       FVM_VERSION: 4.3.0
-      # 与 build-android-v8 保持一致，保证 V8 缓存清单校验通过。
+      # 与 build-android-v8 保持一致：这是写进 V8 缓存清单的声明版本，
+      # 与实际参与链接的 NDK（flutter.ndkVersion）无关。
+      OPERIT_ANDROID_V8_NDK_VERSION: 27.3.13750724
       OPERIT_ANDROID_V8_NDK: C:\Program Files (x86)\Android\android-sdk\ndk\27.3.13750724
 
     steps:
