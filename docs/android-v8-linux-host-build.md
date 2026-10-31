@@ -60,9 +60,15 @@ Android builds are only supported on Linux.
 
 ### 关键约束（改动前务必确认）
 
-- 两个 job 的 `OPERIT_ANDROID_V8_NDK` 必须指向**同名 NDK 目录**
-  （当前 `27.3.13750724`）。`manifest.json` 记录 `android_ndk_version`，
-  两侧不一致会让 Windows 端判定缓存失效并重新构建，从而再次撞上断言。
+- 两个 job 的 `OPERIT_ANDROID_V8_NDK` 必须指向**同名 NDK 目录**，
+  且两边都要设置 `OPERIT_ANDROID_V8_NDK_VERSION`（当前 `27.3.13750724`）。
+  `manifest.json` 记录 `android_ndk_version`，两侧不一致会让 Windows 端判定
+  缓存失效并重新构建，从而再次撞上断言。
+  该环境变量是必需的：runner 镜像会不断新增 NDK 目录（例如 29.0/30.0），
+  Gradle 还会额外安装 Flutter SDK 自己的 NDK；只靠目录探测会让两个 job
+  取到不同版本。`prepare_android_v8.py` 优先使用这个显式声明值。
+- 运行时脚本会打印 `Android V8 NDK: <路径> (android_ndk_version=...)`，
+  两个 job 的该行必须一致，排查缓存问题时先看它。
 - Linux 端必须存在形如 `libclang.so.<major>` 的文件名：
   Debian 的 `libclang-21-dev` 实际提供 `libclang-21.so.1`，
   工作流补了 `/usr/lib/llvm-21/lib/libclang.so.21` 符号链接。
@@ -85,7 +91,8 @@ Android builds are only supported on Linux.
 
 | 症状 | 可能原因 | 处理 |
 | --- | --- | --- |
-| Windows 端仍出现 `gn gen` / `BUILDCONFIG.gn` 断言 | 未下载到 artifact，或 manifest 配置不匹配 | 检查 `Download prebuilt Android V8` 是否执行、两侧 NDK 目录名是否一致 |
+| Windows 端仍出现 `gn gen` / `BUILDCONFIG.gn` 断言 | 未下载到 artifact，或 manifest 配置不匹配 | 检查 `Download prebuilt Android V8` 是否执行、两侧 NDK 声明值是否一致 |
+| 两端脚本打印的 `android_ndk_version` 不同 | runner 新增了 NDK 目录 / Gradle 装了别的 NDK | 两边都设 `OPERIT_ANDROID_V8_NDK_VERSION` |
 | `Cannot find path ...\.v8-artifact\.version` | `upload-artifact` v4 默认跳过隐藏文件 | 版本文件命名为 `v8-version.txt`，不要用 `.version` |
 | `V8 configuration mismatch: android_ndk_version=...` | 两侧 NDK 版本不同 | 把 `OPERIT_ANDROID_V8_NDK` 对齐到同一版本 |
 | Linux 端 `V8 source bindings require LLVM/libclang 21.1 or newer` | 只有 libclang-21.so.1，脚本按 libclang.so.<major> 探测 | 建立 `libclang.so.21` 符号链接 |
