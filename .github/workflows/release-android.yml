@@ -16,7 +16,7 @@ jobs:
         with:
           name: operit2-android-${{ github.event.workflow_run.head_sha }}
           path: dist
-          run_id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ github.event.workflow_run.id }}
       - name: 获取版本号和日期
         id: version
         run: |
