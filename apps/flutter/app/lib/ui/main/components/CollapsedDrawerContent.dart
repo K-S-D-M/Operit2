@@ -5,6 +5,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:operit_ui/operit_ui.dart';
 
+import '../../../l10n/generated/app_localizations.dart';
 import '../../../core/bridge/OperitRuntimeBridge.dart';
 import '../../../core/bridge/ProxyCoreRuntimeBridge.dart';
 import '../../../core/proxy/generated/CoreProxyClients.g.dart';
@@ -44,7 +45,6 @@ class CollapsedDrawerContent extends StatelessWidget {
   final String? currentChatId;
   final List<core_proxy.ChatHistoryListItem> histories;
   final OperitRuntimeBridge bridge;
-  static const double _topBarHeight = 64;
   static const EdgeInsets _collapsedItemPadding = EdgeInsets.symmetric(
     vertical: 2,
   );
@@ -108,7 +108,7 @@ class CollapsedDrawerContent extends StatelessWidget {
             padding: EdgeInsets.zero,
             children: <Widget>[
               SizedBox(
-                height: topPadding + _topBarHeight,
+                height: topPadding + ThemeTopBarChrome.toolbarHeight,
                 child: Padding(
                   padding: EdgeInsets.only(top: topPadding),
                   child: Center(
@@ -333,6 +333,8 @@ class HistoryRail extends StatelessWidget {
 }
 
 enum _ConversationQuickAction {
+  searchMessages,
+  viewFavorites,
   rename,
   bindWorkspace,
   togglePinned,
@@ -361,6 +363,8 @@ class ConversationDrawerItem extends StatefulWidget {
     required this.canAcceptDrop,
     required this.canDetach,
     required this.onDetach,
+    this.onSearchMessages,
+    this.onViewFavorites,
     this.nested = false,
     this.workspaceStyle = false,
   });
@@ -371,6 +375,8 @@ class ConversationDrawerItem extends StatefulWidget {
   final bool isRunning;
   final NavigationDrawerAppearance appearance;
   final VoidCallback onClick;
+  final VoidCallback? onSearchMessages;
+  final VoidCallback? onViewFavorites;
   final VoidCallback onRename;
   final VoidCallback onBindWorkspace;
   final VoidCallback onTogglePinned;
@@ -540,6 +546,8 @@ class _ConversationDrawerItemState extends State<ConversationDrawerItem>
               selected: selected,
               appearance: appearance,
               compact: workspaceStyle,
+              onSearchMessages: widget.onSearchMessages,
+              onViewFavorites: widget.onViewFavorites,
               onRename: widget.onRename,
               onBindWorkspace: widget.onBindWorkspace,
               onTogglePinned: widget.onTogglePinned,
@@ -774,12 +782,16 @@ class _ConversationMoreMenuButton extends StatelessWidget {
     required this.onToggleLocked,
     required this.onDelete,
     this.onMenuOpenChanged,
+    this.onSearchMessages,
+    this.onViewFavorites,
     this.compact = false,
   });
 
   final core_proxy.ChatHistoryListItem history;
   final bool selected;
   final NavigationDrawerAppearance appearance;
+  final VoidCallback? onSearchMessages;
+  final VoidCallback? onViewFavorites;
   final VoidCallback onRename;
   final VoidCallback onBindWorkspace;
   final VoidCallback onTogglePinned;
@@ -799,6 +811,10 @@ class _ConversationMoreMenuButton extends StatelessWidget {
       onMenuOpenChanged: onMenuOpenChanged,
       onSelected: (action) {
         switch (action) {
+          case _ConversationQuickAction.searchMessages:
+            onSearchMessages?.call();
+          case _ConversationQuickAction.viewFavorites:
+            onViewFavorites?.call();
           case _ConversationQuickAction.rename:
             onRename();
           case _ConversationQuickAction.bindWorkspace:
@@ -812,6 +828,18 @@ class _ConversationMoreMenuButton extends StatelessWidget {
         }
       },
       actions: <SidebarMenuAction<_ConversationQuickAction>>[
+        if (onSearchMessages != null)
+          SidebarMenuAction(
+            value: _ConversationQuickAction.searchMessages,
+            icon: Icons.search_rounded,
+            label: AppLocalizations.of(context)!.messageLocatorSearchMessages,
+          ),
+        if (onViewFavorites != null)
+          SidebarMenuAction(
+            value: _ConversationQuickAction.viewFavorites,
+            icon: Icons.star_outline_rounded,
+            label: AppLocalizations.of(context)!.messageLocatorViewFavorites,
+          ),
         const SidebarMenuAction(
           value: _ConversationQuickAction.rename,
           icon: Icons.edit_outlined,

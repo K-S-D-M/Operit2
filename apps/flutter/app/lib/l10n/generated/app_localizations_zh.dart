@@ -301,6 +301,33 @@ class AppLocalizationsZh extends AppLocalizations {
   }
 
   @override
+  String get messageLocatorSearchMessages => '搜索消息';
+
+  @override
+  String get messageLocatorViewFavorites => '查看收藏';
+
+  @override
+  String get messageLocatorAll => '全部';
+
+  @override
+  String get messageLocatorFavorites => '收藏';
+
+  @override
+  String get messageLocatorNoFavorites => '还没有收藏的消息';
+
+  @override
+  String get messageLocatorLoadFailed => '暂时无法加载消息，请重试';
+
+  @override
+  String get messageLocatorFavoriteFailed => '收藏更新失败，请重试';
+
+  @override
+  String get messageLocatorAddFavorite => '收藏消息';
+
+  @override
+  String get messageLocatorRemoveFavorite => '取消收藏';
+
+  @override
   String get messageLocatorNoMatches => '没有匹配的消息';
 
   @override
@@ -3745,7 +3772,7 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsPeerTransportHelp =>
-      '暴露方式（可多选）。HTTP 和 WebSocket 可共用端口；TCP 暂不能与它们共用端口。蓝牙需要平台支持。关闭发现并取消全部选择可停止监听。修改设置会中断现有连接；仅关闭发现不会关闭直接连接。';
+      '暴露方式（可多选）。HTTP、WebSocket 和 TCP 共用同一个监听端口，可自由组合。蓝牙需要平台支持。关闭发现并取消全部选择可停止监听。修改设置会中断现有连接；仅关闭发现不会关闭直接连接。';
 
   @override
   String get settingsPeerBindAddress => '监听 IP 地址';
@@ -3764,10 +3791,6 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get settingsPeerDiscoveryNeedsTransport => '开启允许被搜索前，请至少选择一种暴露方式。';
-
-  @override
-  String get settingsPeerPortConflict =>
-      '当前 TCP 不能与 HTTP/WebSocket 共用监听端口，请选择 TCP 或 HTTP/WebSocket。';
 
   @override
   String get settingsPeerAddressRequired => '请输入监听 IP 地址。';
@@ -3915,7 +3938,8 @@ class AppLocalizationsZh extends AppLocalizations {
   String get deviceSpaceUpdateEndpointLabel => '直连地址';
 
   @override
-  String get deviceSpaceUpdateEndpointHint => '例如 ws://192.168.1.20:37195/link';
+  String get deviceSpaceUpdateEndpointHint =>
+      '例如 ws://主机:端口/link 或 主机:端口 —— 填对方当前的监听端口';
 
   @override
   String get deviceSpaceUpdateEndpointSaved => '直连地址已更新';

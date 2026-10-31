@@ -154,6 +154,15 @@
       }
     }
   },
+  "messageLocatorSearchMessages": "搜索消息",
+  "messageLocatorViewFavorites": "查看收藏",
+  "messageLocatorAll": "全部",
+  "messageLocatorFavorites": "收藏",
+  "messageLocatorNoFavorites": "还没有收藏的消息",
+  "messageLocatorLoadFailed": "暂时无法加载消息，请重试",
+  "messageLocatorFavoriteFailed": "收藏更新失败，请重试",
+  "messageLocatorAddFavorite": "收藏消息",
+  "messageLocatorRemoveFavorite": "取消收藏",
   "messageLocatorNoMatches": "没有匹配的消息",
   "messageSenderUser": "用户",
   "messageSenderSummary": "总结",
@@ -2041,14 +2050,13 @@
       }
     }
   },
-  "settingsPeerTransportHelp": "暴露方式（可多选）。HTTP 和 WebSocket 可共用端口；TCP 暂不能与它们共用端口。蓝牙需要平台支持。关闭发现并取消全部选择可停止监听。修改设置会中断现有连接；仅关闭发现不会关闭直接连接。",
+  "settingsPeerTransportHelp": "暴露方式（可多选）。HTTP、WebSocket 和 TCP 共用同一个监听端口，可自由组合。蓝牙需要平台支持。关闭发现并取消全部选择可停止监听。修改设置会中断现有连接；仅关闭发现不会关闭直接连接。",
   "settingsPeerBindAddress": "监听 IP 地址",
   "settingsPeerBindAddressHelp": "例如 0.0.0.0，允许局域网访问；也支持 IPv6 地址。",
   "settingsPeerBindPort": "监听端口",
   "settingsPeerBindPortHelp": "固定模式使用此端口监听。",
   "settingsPeerBindPortAutomaticHelp": "由系统分配可用端口；启动后显示实际端口。",
   "settingsPeerDiscoveryNeedsTransport": "开启允许被搜索前，请至少选择一种暴露方式。",
-  "settingsPeerPortConflict": "当前 TCP 不能与 HTTP/WebSocket 共用监听端口，请选择 TCP 或 HTTP/WebSocket。",
   "settingsPeerAddressRequired": "请输入监听 IP 地址。",
   "settingsPeerPortRequired": "请输入 1 到 65535 之间的端口。",
   "settingsPeerApplied": "监听设置已生效。",
@@ -2125,7 +2133,7 @@
   "deviceSpaceConnectDirectHint": "该设备已是本空间成员。与它配对成功即建立直连，无需重新加入空间；配对需要对方显示、由你输入六位确认码。",
   "deviceSpaceUpdateEndpoint": "更新直连地址",
   "deviceSpaceUpdateEndpointLabel": "直连地址",
-  "deviceSpaceUpdateEndpointHint": "例如 ws://192.168.1.20:37195/link",
+  "deviceSpaceUpdateEndpointHint": "例如 ws://主机:端口/link 或 主机:端口 —— 填对方当前的监听端口",
   "deviceSpaceUpdateEndpointSaved": "直连地址已更新",
   "deviceSpaceDirectLinkEstablished": "已建立直连：{device}",
   "@deviceSpaceDirectLinkEstablished": {

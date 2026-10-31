@@ -650,6 +650,60 @@ abstract class AppLocalizations {
   /// **'{count} results'**
   String messageLocatorResultCount(int count);
 
+  /// No description provided for @messageLocatorSearchMessages.
+  ///
+  /// In en, this message translates to:
+  /// **'Search messages'**
+  String get messageLocatorSearchMessages;
+
+  /// No description provided for @messageLocatorViewFavorites.
+  ///
+  /// In en, this message translates to:
+  /// **'View favorites'**
+  String get messageLocatorViewFavorites;
+
+  /// No description provided for @messageLocatorAll.
+  ///
+  /// In en, this message translates to:
+  /// **'All'**
+  String get messageLocatorAll;
+
+  /// No description provided for @messageLocatorFavorites.
+  ///
+  /// In en, this message translates to:
+  /// **'Favorites'**
+  String get messageLocatorFavorites;
+
+  /// No description provided for @messageLocatorNoFavorites.
+  ///
+  /// In en, this message translates to:
+  /// **'No favorite messages yet'**
+  String get messageLocatorNoFavorites;
+
+  /// No description provided for @messageLocatorLoadFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not load messages. Please try again.'**
+  String get messageLocatorLoadFailed;
+
+  /// No description provided for @messageLocatorFavoriteFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not update favorite. Please try again.'**
+  String get messageLocatorFavoriteFailed;
+
+  /// No description provided for @messageLocatorAddFavorite.
+  ///
+  /// In en, this message translates to:
+  /// **'Favorite message'**
+  String get messageLocatorAddFavorite;
+
+  /// No description provided for @messageLocatorRemoveFavorite.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove favorite'**
+  String get messageLocatorRemoveFavorite;
+
   /// No description provided for @messageLocatorNoMatches.
   ///
   /// In en, this message translates to:
@@ -6935,7 +6989,7 @@ abstract class AppLocalizations {
   /// No description provided for @settingsPeerTransportHelp.
   ///
   /// In en, this message translates to:
-  /// **'Listener transports (multiple selections). HTTP and WebSocket can share a port; TCP cannot share that port with them. Bluetooth requires platform support. Clear all selections and disable discovery to stop listening. Changing settings interrupts existing connections. Disabling discovery alone does not stop direct connections.'**
+  /// **'Listener transports (multiple selections). HTTP, WebSocket and TCP share one listening port and can be combined freely. Bluetooth requires platform support. Clear all selections and disable discovery to stop listening. Changing settings interrupts existing connections. Disabling discovery alone does not stop direct connections.'**
   String get settingsPeerTransportHelp;
 
   /// No description provided for @settingsPeerBindAddress.
@@ -6973,12 +7027,6 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Select at least one transport before enabling discovery.'**
   String get settingsPeerDiscoveryNeedsTransport;
-
-  /// No description provided for @settingsPeerPortConflict.
-  ///
-  /// In en, this message translates to:
-  /// **'TCP cannot currently share a listen port with HTTP/WebSocket. Select TCP or HTTP/WebSocket.'**
-  String get settingsPeerPortConflict;
 
   /// No description provided for @settingsPeerAddressRequired.
   ///
@@ -7253,7 +7301,7 @@ abstract class AppLocalizations {
   /// No description provided for @deviceSpaceUpdateEndpointHint.
   ///
   /// In en, this message translates to:
-  /// **'For example ws://192.168.1.20:37195/link'**
+  /// **'e.g. ws://host:port/link or host:port — use the peer\'s current listen port'**
   String get deviceSpaceUpdateEndpointHint;
 
   /// No description provided for @deviceSpaceUpdateEndpointSaved.

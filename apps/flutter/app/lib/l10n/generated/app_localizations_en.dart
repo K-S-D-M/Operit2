@@ -311,6 +311,35 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String get messageLocatorSearchMessages => 'Search messages';
+
+  @override
+  String get messageLocatorViewFavorites => 'View favorites';
+
+  @override
+  String get messageLocatorAll => 'All';
+
+  @override
+  String get messageLocatorFavorites => 'Favorites';
+
+  @override
+  String get messageLocatorNoFavorites => 'No favorite messages yet';
+
+  @override
+  String get messageLocatorLoadFailed =>
+      'Could not load messages. Please try again.';
+
+  @override
+  String get messageLocatorFavoriteFailed =>
+      'Could not update favorite. Please try again.';
+
+  @override
+  String get messageLocatorAddFavorite => 'Favorite message';
+
+  @override
+  String get messageLocatorRemoveFavorite => 'Remove favorite';
+
+  @override
   String get messageLocatorNoMatches => 'No matching messages';
 
   @override
@@ -3899,7 +3928,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsPeerTransportHelp =>
-      'Listener transports (multiple selections). HTTP and WebSocket can share a port; TCP cannot share that port with them. Bluetooth requires platform support. Clear all selections and disable discovery to stop listening. Changing settings interrupts existing connections. Disabling discovery alone does not stop direct connections.';
+      'Listener transports (multiple selections). HTTP, WebSocket and TCP share one listening port and can be combined freely. Bluetooth requires platform support. Clear all selections and disable discovery to stop listening. Changing settings interrupts existing connections. Disabling discovery alone does not stop direct connections.';
 
   @override
   String get settingsPeerBindAddress => 'Listen IP address';
@@ -3922,10 +3951,6 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String get settingsPeerDiscoveryNeedsTransport =>
       'Select at least one transport before enabling discovery.';
-
-  @override
-  String get settingsPeerPortConflict =>
-      'TCP cannot currently share a listen port with HTTP/WebSocket. Select TCP or HTTP/WebSocket.';
 
   @override
   String get settingsPeerAddressRequired => 'Enter a listen IP address.';
@@ -4081,7 +4106,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get deviceSpaceUpdateEndpointHint =>
-      'For example ws://192.168.1.20:37195/link';
+      'e.g. ws://host:port/link or host:port — use the peer\'s current listen port';
 
   @override
   String get deviceSpaceUpdateEndpointSaved => 'Direct address updated';
