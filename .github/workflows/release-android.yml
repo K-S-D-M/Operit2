@@ -1,14 +1,11 @@
 name: Android Auto Release
-
 on:
   workflow_run:
     workflows: ["Android Flutter Build"]
     types:
       - completed
-
 permissions:
   contents: write
-
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -19,18 +16,16 @@ jobs:
         with:
           name: operit2-android-${{ github.event.workflow_run.head_sha }}
           path: dist
-
+          run_id: ${{ github.event.workflow_run.id }}
       - name: 获取版本号和日期
         id: version
         run: |
           apk=$(ls dist/operit2-app-android-arm64-v8a-*.apk | head -1)
           echo "APK=$apk"
-          # 从文件名提取版本，例如 operit2-app-android-arm64-v8a-2.0.0-preview.22.apk
           ver=$(basename "$apk" .apk | sed 's/operit2-app-android-arm64-v8a-//')
           echo "VERSION=$ver"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "tag=v2.0.0-$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
-
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
