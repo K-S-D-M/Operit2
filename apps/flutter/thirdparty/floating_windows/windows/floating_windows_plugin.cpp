@@ -123,8 +123,9 @@ void Apply(WidgetWindow& owner, const Map& args) {
     const auto entry = args.find(Value(key));
     if (entry == args.end()) return fallback;
     double value;
-    if (auto n = std::get_if<double>(&entry->second)) value = *n;
-    else if (auto n = std::get_if<int32_t>(&entry->second)) value = *n;
+    // 两个分支使用不同的局部名：插件在 /WX 下编译，重复的 `n` 会触发 MSVC C4456。
+    if (auto asDouble = std::get_if<double>(&entry->second)) value = *asDouble;
+    else if (auto asInt = std::get_if<int32_t>(&entry->second)) value = *asInt;
     else throw std::invalid_argument("Coordinate must be numeric");
     if (!std::isfinite(value) || std::abs(value) > 1000000) throw std::invalid_argument("Invalid coordinate");
     return static_cast<int>(std::lround(value * GetDpiForWindow(owner.window) / 96.0));
