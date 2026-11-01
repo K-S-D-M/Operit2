@@ -1,40 +1,61 @@
 name: Android Auto Release
+
 on:
   workflow_run:
     workflows: ["Android Flutter Build"]
-    types:
-      - completed
+    types: [completed]
+
 permissions:
   contents: write
+  actions: read
+
 jobs:
   release:
-    runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
     steps:
       - name: 下载 APK artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: operit2-android-${{ github.event.workflow_run.head_sha }}
-          path: dist
-          run-id: ${{ github.event.workflow_run.id }}
-      - name: 获取版本号和日期
-        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC_RUN: ${{ github.event.workflow_run.id }}
+          SRC_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
         run: |
-          apk=$(ls dist/operit2-app-android-arm64-v8a-*.apk | head -1)
-          echo "APK=$apk"
-          ver=$(basename "$apk" .apk | sed 's/operit2-app-android-arm64-v8a-//')
-          echo "VERSION=$ver"
-          echo "version=$ver" >> "$GITHUB_OUTPUT"
-          echo "tag=v2.0.0-$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          set -e
+          echo "source run=$SRC_RUN sha=$SRC_SHA repo=$REPO"
+          mkdir -p dist
+          NAME="operit2-android-${SRC_SHA}"
+          echo "artifact name=$NAME"
+          if gh run download "$SRC_RUN" --repo "$REPO" -n "$NAME" -D dist; then
+            echo "OK via gh run download"
+          else
+            echo "::error::download failed, falling back to artifact API"
+            ART_ID=$(gh api "repos/$REPO/actions/runs/$SRC_RUN/artifacts" --jq ".artifacts[] | select(.name==\"$NAME\") | .id")
+            echo "artifact id=$ART_ID"
+            test -n "$ART_ID"
+            gh api "repos/$REPO/actions/artifacts/$ART_ID/zip" > dist/apk.zip
+            cd dist && unzip -o apk.zip && rm apk.zip && cd ..
+          fi
+          echo '--- dist ---'
+          ls -laR dist | head -40
+
+      - name: 获取版本号和日期
+        id: meta
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          APK=$(find dist -name '*.apk' | head -1)
+          echo "apk=$APK"
+          test -n "$APK"
+          echo "tag=v2.0.0-${DATE}" >> $GITHUB_OUTPUT
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
+
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: Operit2 2.0.0 daily build ${{ steps.version.outputs.tag }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Operit2 ${{ steps.meta.outputs.tag }}
           body: |
-            # Operit2 2.0.0 daily build
-            ## 构建信息
-            - 平台：Android arm64-v8a
-            - 版本：${{ steps.version.outputs.version }}
-            - 提交：${{ github.event.workflow_run.head_sha }}
-          files: dist/operit2-app-android-arm64-v8a-*.apk
+            自动构建发布（来源 run: ${{ github.event.workflow_run.id }}）
+            提交: ${{ github.event.workflow_run.head_sha }}
+          files: dist/**/*.apk
+          fail_on_unmatched_files: true
