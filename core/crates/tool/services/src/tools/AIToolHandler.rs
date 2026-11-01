@@ -1069,7 +1069,22 @@ impl AIToolHandler {
     /// Executes under the native caller context and dispatches lifecycle hooks only for AI requests.
     async fn executeInvocationInContext(&mut self, request: &ToolCall, policy: ToolExecutionPolicy, context: &ToolInvocationContext) -> Result<Vec<ToolResult>, String> {
         let entryRequest = request;
-        let resolved = request.resolveTarget(context)?;
+        let resolved = match request.resolveTarget(context) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let tool = request.toLegacyTool();
+                let result = Self::failedInvocation(&tool, format!("Invalid tool invocation: {error}"));
+                if matches!(policy, ToolExecutionPolicy::Ai { .. }) {
+                    let _lifecycle = ToolInvocationLifecycle {
+                        context: context.clone(),
+                        tool: tool.clone(),
+                    };
+                    self.notifyToolCallRequested(&tool);
+                    self.notifyToolExecutionResult(&tool, &result);
+                }
+                return Ok(vec![result]);
+            }
+        };
         let request = &resolved;
         let legacyTool = std::sync::OnceLock::new();
         let tool = || legacyTool.get_or_init(|| request.toLegacyTool());
@@ -2769,12 +2784,11 @@ mod tests {
         assert!(fixture.handler.hasToolExecutor("tts_set_current_config_id"));
     }
 
-    /// Both proxy entry points accept new YAML and both historical JSON forms without changing routing.
+    /// Both proxy entry points preserve typed JSON objects and legacy JSON text.
     #[tokio::test]
-    async fn proxy_yaml_and_legacy_json_resolve_to_identical_parameters() {
+    async fn proxy_json_objects_and_legacy_text_resolve_to_identical_parameters() {
         let fixture = PipelineFixture::new();
         let expected = json!({"content": "print(\"\\d+\")\n\n", "enabled": true, "nested": {"items": [1, null]}});
-        let yaml = operit_util::ProxyParameters::format_proxy_parameters(expected.as_object().unwrap());
         for name in ["package_proxy", "proxy"] {
             let turn = ToolRuntimeContext {
                 callerChatId: Some("chat".into()), callerParticipantId: None,
@@ -2782,7 +2796,7 @@ mod tests {
                 toolExposureMode: if name == "proxy" { ToolExposureMode::CLI } else { ToolExposureMode::FULL },
                 extensionOwner: "config-owner".into(), executionData: Default::default(),
             };
-            for payload in [Value::String(yaml.clone()), expected.clone(), Value::String(expected.to_string())] {
+            for payload in [expected.clone(), Value::String(expected.to_string())] {
                 let request = ToolCall { name: name.into(), parameters: BTreeMap::from([
                     ("tool_name".into(), json!("files:write")), ("params".into(), payload),
                 ]) };
@@ -2792,6 +2806,167 @@ mod tests {
                 assert_eq!(resolved.name, "files:write");
                 assert_eq!(serde_json::to_value(resolved.parameters).unwrap(), expected);
             }
+        }
+    }
+
+    /// Returns invalid proxy envelopes as tool results and accepts a corrected JSON call afterward.
+    #[tokio::test]
+    async fn proxy_validation_errors_are_results_and_allow_corrected_json_calls() {
+        operit_host_api::HostManager::setDefaultHostJavaScriptRuntimeHost(Arc::new(
+            operit_host_native_scheduler::NativeHostJavaScriptRuntimeHost::new(),
+        ));
+        let mut fixture = PipelineFixture::with_package_assets(Some(&[]));
+        let context = fixture.handler.getContext();
+        operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost(context.runtimeStorageHost.unwrap());
+        operit_store::RuntimeStorageHost::setDefaultRuntimeSqliteHost(context.runtimeSqliteHost.unwrap());
+        operit_util::RuntimeStoreRoot::setDefaultRuntimeStoreRootConfig(
+            operit_util::RuntimeStoreRoot::RuntimeStoreRootConfig::new(
+                fixture.root.join("runtime"), fixture.root.join("workspaces"),
+            ),
+        );
+        {
+            let manager = fixture.handler.getOrCreatePackageManager();
+            let mut manager = manager.lock().unwrap();
+            assert!(manager.claimInitialPackageRegistryLoad().unwrap());
+            manager.loadAvailablePackages();
+        }
+        let hooks = Arc::new(LifecycleProbe::default());
+        let probe = Arc::new(SharedProbe::default());
+        fixture.handler.addToolHook(hooks.clone());
+        fixture.handler.registerSharedTool("fixture:probe".into(), probe.clone(), ToolRegistrationVisibility::PUBLIC);
+        fixture.handler.getToolPermissionSystem().saveAiPermissionMode(AiPermissionMode::Full).unwrap();
+        let invalid = [
+            (json!({"tool_name": "fixture:probe", "params": "command: git status", "timeoutMs": "120000"}), "Unexpected proxy parameter: timeoutMs"),
+            (json!({"params": "{}"}), "Proxy tool_name must be text"),
+            (json!({"tool_name": " fixture:probe", "params": "{}"}), "Proxy tool_name must be exact nonblank text"),
+            (json!({"tool_name": "fixture:probe"}), "Proxy params is required"),
+            (json!({"tool_name": "fixture:probe", "params": "command: [unfinished"}), "expected value"),
+            (json!({"tool_name": "fixture:probe", "params": "[]"}), "invalid type: sequence"),
+            (json!({"tool_name": "fixture:probe", "params": null}), "Proxy params must be a JSON object or its legacy text encoding"),
+            (json!({"tool_name": "proxy", "params": "{}"}), "Proxy cannot target another proxy"),
+        ];
+        for name in ["package_proxy", "proxy"] {
+            let exposure = if name == "proxy" { ToolExposureMode::CLI } else { ToolExposureMode::FULL };
+            let turn = ToolRuntimeContext {
+                callerChatId: Some("chat".into()), callerParticipantId: None,
+                workspacePath: None, workspaceFolders: Vec::new(),
+                toolExposureMode: exposure.clone(), extensionOwner: "config-owner".into(),
+                executionData: Default::default(),
+            };
+            for policy in [ToolExecutionPolicy::Ai { exposure }, ToolExecutionPolicy::Direct] {
+                for (parameters, expectedError) in &invalid {
+                    let request = ToolCall {
+                        name: name.into(),
+                        parameters: parameters.as_object().unwrap().clone().into_iter().collect(),
+                    };
+                    let calls = probe.calls.load(Ordering::SeqCst);
+                    let accessCalls = probe.accessCalls.load(Ordering::SeqCst);
+                    let results = ToolExecutionManager::scopeToolRuntimeContext(turn.clone(),
+                        fixture.handler.executeToolInvocation(&request, policy.clone())).await.unwrap();
+                    assert_eq!(results.len(), 1);
+                    assert_eq!(results[0].toolName, name);
+                    assert!(!results[0].success);
+                    let error = results[0].error.as_deref().unwrap();
+                    assert!(error.starts_with("Invalid tool invocation: "), "{error}");
+                    assert!(error.contains(expectedError), "{error}");
+                    assert_eq!(probe.calls.load(Ordering::SeqCst), calls);
+                    assert_eq!(probe.accessCalls.load(Ordering::SeqCst), accessCalls);
+                    if matches!(policy, ToolExecutionPolicy::Ai { .. }) {
+                        assert_eq!(hooks.take(), ["requested", "result", "finished"]);
+                    } else {
+                        assert!(hooks.take().is_empty());
+                    }
+
+                    let corrected = ToolCall { name: name.into(), parameters: BTreeMap::from([
+                        ("tool_name".into(), json!("fixture:probe")),
+                        ("params".into(), json!({"command": "git status", "timeoutMs": "120000"})),
+                    ]) };
+                    let results = ToolExecutionManager::scopeToolRuntimeContext(turn.clone(),
+                        fixture.handler.executeToolInvocation(&corrected, policy.clone())).await.unwrap();
+                    assert_eq!(results.len(), 1);
+                    assert!(results[0].success);
+                    assert_eq!(results[0].toolName, "fixture:probe");
+                    let ToolResultData::JsonResultData(data) = &results[0].result else { panic!("Expected probe result") };
+                    assert_eq!(data.value["parameters"], json!({"command": "git status", "timeoutMs": "120000"}));
+                    assert_eq!(probe.calls.load(Ordering::SeqCst), calls + 1);
+                    if matches!(policy, ToolExecutionPolicy::Ai { .. }) {
+                        assert_eq!(hooks.take(), ["requested", "intercept", "started", "result", "finished"]);
+                    } else {
+                        assert!(hooks.take().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Invalid proxy parameters reach the model as a tool result and do not abort the batch.
+    #[tokio::test]
+    async fn malformed_proxy_parameters_return_tool_error_and_continue_batch() {
+        use crate::ToolExecutionManager::ToolInvocation;
+        use operit_store::RuntimeStorageHost::{setDefaultRuntimeStorageHost, setDefaultRuntimeSqliteHost};
+
+        operit_host_api::HostManager::setDefaultHostJavaScriptRuntimeHost(Arc::new(
+            operit_host_native_scheduler::NativeHostJavaScriptRuntimeHost::new(),
+        ));
+        let command = "python3 - <<'PY'\nimport json\nprint(json.dumps({}))\nPY";
+        let malformed = format!("command: |-\n  {}", command);
+        let corrected = json!({"command": command}).to_string();
+        for (name, exposure) in [
+            ("package_proxy", ToolExposureMode::FULL),
+            ("proxy", ToolExposureMode::CLI),
+        ] {
+            let mut fixture = PipelineFixture::new();
+            let probe = Arc::new(SharedProbe::default());
+            fixture.handler.registerSharedTool(
+                "pipeline:probe".into(), probe.clone(), ToolRegistrationVisibility::PUBLIC,
+            );
+            fixture.handler.getToolPermissionSystem().setAsyncPermissionRequester(|_, _, _| async {
+                crate::tools::ToolPermissionSystem::PermissionRequestResult::ALLOW
+            });
+            operit_util::RuntimeStoreRoot::setDefaultRuntimeStoreRootConfig(
+                operit_util::RuntimeStoreRoot::RuntimeStoreRootConfig::new(
+                    fixture.root.join("runtime"), fixture.root.join("workspaces"),
+                ),
+            );
+            let context = fixture.handler.getContext();
+            setDefaultRuntimeStorageHost(context.runtimeStorageHost.clone().unwrap());
+            setDefaultRuntimeSqliteHost(context.runtimeSqliteHost.clone().unwrap());
+            let manager = RuntimePackageManager::new(
+                RuntimeStorePaths::new(fixture.root.join("runtime"), fixture.root.join("workspaces")),
+                fixture.handler.clone(),
+            );
+            let invocations = [malformed.clone(), "{\"command\":".into(), corrected.clone()].into_iter().map(|params| {
+                ToolInvocation {
+                    tool: AITool {
+                        name: name.into(),
+                        parameters: vec![
+                            ToolParameter { name: "tool_name".into(), value: "pipeline:probe".into() },
+                            ToolParameter { name: "params".into(), value: params },
+                        ],
+                    },
+                    rawText: String::new(),
+                    responseLocation: (0, 0),
+                }
+            }).collect::<Vec<_>>();
+            let batch = ToolExecutionManager::executeInvocations(
+                &invocations, &mut fixture.handler, &manager,
+                None, Some("chat".into()), None, None, Vec::new(), exposure,
+                "config-owner".into(), Default::default(),
+            ).await.expect("Malformed model parameters must not terminate the chat round");
+
+            assert_eq!(batch.results.len(), 3);
+            for result in &batch.results[..2] {
+                assert!(!result.success);
+                let error = result.error.as_deref().unwrap();
+                assert!(error.starts_with("Invalid tool invocation:"), "{error}");
+            }
+            assert!(batch.message.contains("<error>"));
+            assert!(batch.message.contains("Invalid tool invocation:"));
+            assert!(batch.results[2].success);
+            let value: Value = serde_json::from_str(&batch.results[2].result.toString()).unwrap();
+            assert_eq!(value["parameters"]["command"], command);
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.accessCalls.load(Ordering::SeqCst), 1);
         }
     }
 
