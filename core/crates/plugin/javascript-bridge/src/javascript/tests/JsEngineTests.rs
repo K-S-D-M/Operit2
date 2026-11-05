@@ -180,6 +180,63 @@ fn newTestIpcEngine(executionHost: Arc<dyn JsExecutionHost>) -> super::JsEngine 
     ).expect("test engine must initialize")
 }
 
+/// Exercises the public getters through real scheduled engines for both legacy and current APIs.
+#[tokio::test]
+async fn hook_caller_getters_use_native_snapshot_in_v1_and_v2() {
+    const SCRIPT: &str = r#"
+        exports.inspect = async function(params) {
+            await Promise.resolve();
+            var card;
+            try { card = typeof getCallerCardId === 'function' ? getCallerCardId() : null; }
+            catch (error) { card = error.message; }
+            return { chatId: getChatId(), participantId: getCallerParticipantId(), cardId: card };
+        };
+    "#;
+    for version in ["1.0.0", "1.0.1", "2.0.0"] {
+        testJavaScriptRuntimeHost();
+        register_test_runtime_storage("js-engine-tests");
+        let host = Arc::new(TestPluginConfigExecutionHost::default());
+        let engine = super::JsEngine::new_toolpkg_execution_engine(host.clone(), ToolPkgExecutionContext {
+            context_key: format!("caller-test:{version}"),
+            container_package_name: "test.package".into(), api_version: version.into(),
+            text_resource_host: Arc::new(StaticToolPkgTextResourceHost { resources: BTreeMap::new() }),
+        }).unwrap();
+        *host.callerContext.lock().unwrap() = Some(serde_json::json!({
+            "chatId":"chat-a", "participantId":"participant-a", "extensionOwner":"com.operit.character_cards",
+        }));
+        let params = BTreeMap::from([
+            ("__operit_package_chat_id".into(), serde_json::json!("stale-chat")),
+            ("__operit_package_caller_participant_id".into(), serde_json::json!("stale-participant")),
+            ("__operit_package_caller_owner".into(), serde_json::json!("foreign.provider")),
+            ("eventPayload".into(), serde_json::json!({"metadata":{"executionContext":{"chatId":"forged-chat", "participantId":"forged-participant"}}})),
+        ]);
+        let pending = engine.execute_script_function(SCRIPT, "inspect", &params, &BTreeMap::new(), None, true, None);
+        // Changing the selected chat before polling must not change the submitted request.
+        *host.callerContext.lock().unwrap() = Some(serde_json::json!({
+            "chatId":"chat-b", "participantId":"participant-b", "extensionOwner":"foreign.provider",
+        }));
+        let output: Value = serde_json::from_str(&pending.await.unwrap().unwrap()).unwrap();
+        assert_eq!(output, serde_json::json!({
+            "chatId":"chat-a", "participantId":"participant-a",
+            "cardId": if version == "2.0.0" { Value::Null } else { serde_json::json!("participant-a") },
+        }), "API {version}");
+        let output = engine.execute_script_function(SCRIPT, "inspect", &params, &BTreeMap::new(), None, true, None).await.unwrap().unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["chatId"], "chat-b");
+        assert_eq!(output["participantId"], "participant-b");
+        if version == "2.0.0" { assert!(output["cardId"].is_null()); }
+        else { assert!(output["cardId"].as_str().unwrap().contains("another provider participant")); }
+
+        *host.callerContext.lock().unwrap() = None;
+        let output = engine.execute_script_function(SCRIPT, "inspect", &params, &BTreeMap::new(), None, true, None).await.unwrap().unwrap();
+        let output: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(output["chatId"], "stale-chat", "UI target chat remains available outside a turn");
+        assert!(output.get("participantId").is_none(), "No participant from a preceding turn or supplied parameters");
+        assert!(output.get("cardId").is_none_or(Value::is_null));
+        engine.destroy();
+    }
+}
+
 /// Returns the repository root above core/crates/plugin/javascript-bridge.
 #[allow(non_snake_case)]
 fn testRepositoryRoot() -> &'static Path {
@@ -232,6 +289,8 @@ struct TestPluginConfigExecutionHost {
     environment: Arc<Mutex<BTreeMap<String, String>>>,
     environmentOwners: Arc<Mutex<Vec<operit_plugin_sdk::javascript::JsEnvironmentOwner>>>,
     toolCatalogError: Arc<Mutex<Option<String>>>,
+    callerContext: Arc<Mutex<Option<Value>>>,
+    capturedCallerContext: Option<Value>,
     #[cfg(not(target_arch = "wasm32"))]
     toolPkgIpcThreadName: Arc<Mutex<Option<String>>>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -300,8 +359,14 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
         Ok(())
     }
 
-        /// Captures this fixture's shared state through the same native invocation boundary.
-        fn capture_tool_invocation_host(&self) -> Arc<dyn JsExecutionHost> { Arc::new(self.clone()) }
+    /// Freezes caller identity before work is submitted to the JavaScript scheduler.
+    fn capture_tool_invocation_host(&self) -> Arc<dyn JsExecutionHost> {
+        let mut host = self.clone();
+        host.capturedCallerContext = Some(self.callerContext.lock().unwrap().clone().unwrap_or(serde_json::json!({})));
+        Arc::new(host)
+    }
+
+    fn toolpkg_caller_context(&self) -> Option<Value> { self.capturedCallerContext.clone() }
 
 
 
@@ -479,7 +544,7 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
     fn plugin_config_dir(&self, plugin_id: &str) -> Result<String, String> {
         let safeBaseName = plugin_id.trim().replace(':', "_");
         Ok(format!(
-            "/app/data/extensions/device/plugins/configs/{safeBaseName}"
+            "/operitapp/data/extensions/device/plugins/configs/{safeBaseName}"
         ))
     }
 
@@ -511,7 +576,7 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
             format!("{root}/namespaces/{name}")
         };
         Ok(format!(
-            "/app/data/{}",
+            "/operitapp/data/{}",
             path.strip_prefix("runtime/")
                 .ok_or("invalid test config path")?
         ))
@@ -520,7 +585,7 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
     /// Returns actual Host-visible local data without acquiring the package manager lock.
     fn plugin_local_data_dir(&self, owner_id: &str) -> Result<String, String> {
         let path = operit_store::ExtensionStore::ExtensionStore::localDataPath(owner_id)?;
-        Ok(format!("/app/data/{}", path.strip_prefix("runtime/").ok_or("invalid local data path")?))
+        Ok(format!("/operitapp/data/{}", path.strip_prefix("runtime/").ok_or("invalid local data path")?))
     }
 
     /// Creates registration-local paths independently of the selected installation scope.
@@ -531,7 +596,7 @@ impl JsExecutionHost for TestPluginConfigExecutionHost {
     /// Returns shared data independently of the installed package scope.
     fn plugin_space_data_dir(&self, owner_id: &str) -> Result<String, String> {
         let path = operit_store::ExtensionStore::ExtensionStore::spaceDataPath(owner_id)?;
-        Ok(format!("/app/data/{}", path.strip_prefix("runtime/").ok_or("invalid shared data path")?))
+        Ok(format!("/operitapp/data/{}", path.strip_prefix("runtime/").ok_or("invalid shared data path")?))
     }
 
     /// Creates registration-shared paths without consulting installed state.
@@ -1367,6 +1432,27 @@ fn execute_function_with_active_module_context() {
         expect_js_output(output, "active module context execution"),
         "\"true:true:root-marker\""
     );
+}
+
+/// Initializes the complete generated Tools runtime and the v1 installer in one native context.
+#[test]
+fn bootstrap_initializes_internal_v1_runtime_with_generated_tools() {
+    let mut state = newTestJsEngineState(None);
+    let output = state.evalJavaScriptString(r#"
+        JSON.stringify({
+            internal: typeof globalThis.__operitV1InternalRuntime.create_session,
+            canonical: typeof __operitCanonicalTools.System.terminal.create,
+            public: typeof Tools.System.terminal.create,
+            installed: Tools.System.terminal.create !== __operitCanonicalTools.System.terminal.create
+        })
+    "#).expect("complete bootstrap must initialize without duplicate declarations");
+    let output: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(output, serde_json::json!({
+        "internal": "function",
+        "canonical": "function",
+        "public": "function",
+        "installed": true
+    }));
 }
 
 #[test]
@@ -3558,13 +3644,13 @@ fn registration_config_directory_works_before_installation_without_reentering_ma
             .expect("registration must resolve paths while its caller holds the manager lock");
         let entry: Value = serde_json::from_str(&capture.navigationEntries[0]).unwrap();
         let root = format!(
-            "/app/data/extensions/{}/plugins/configs/first_import",
+            "/operitapp/data/extensions/{}/plugins/configs/first_import",
             scope.as_str()
         );
         assert_eq!(entry["directory"], root);
-        assert_eq!(entry["localDirectory"], "/app/data/plugin_data/device/first_import");
+        assert_eq!(entry["localDirectory"], "/operitapp/data/plugin_data/device/first_import");
         assert_eq!(entry["localAgain"], entry["localDirectory"]);
-        assert_eq!(entry["sharedDirectory"], "/app/data/plugin_data/space/first_import");
+        assert_eq!(entry["sharedDirectory"], "/operitapp/data/plugin_data/space/first_import");
         assert_eq!(
             entry["aliasDirectory"],
             format!("{root}/namespaces/named_alias")
@@ -3606,7 +3692,7 @@ async fn registration_config_context_does_not_leak_into_runtime_execution() {
         .expect("runtime configuration result");
     assert_eq!(
         serde_json::from_str::<String>(&output).unwrap(),
-        "/app/data/extensions/device/plugins/configs/first_import"
+        "/operitapp/data/extensions/device/plugins/configs/first_import"
     );
     assert_eq!(host.registrationConfigReads.load(Ordering::Relaxed), 1);
 }
@@ -3627,7 +3713,7 @@ async fn local_data_directory_is_stable_across_registration_and_runtime() {
         "exports.local_data = function() { return {local:ToolPkg.getLocalDataDir(),shared:ToolPkg.getSpaceDataDir()}; };",
         "local_data", &params, &BTreeMap::new(), None, true, None,
     ).await.expect("local runtime directory").expect("local directory output");
-    assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), serde_json::json!({"local":"/app/data/plugin_data/device/first_import","shared":"/app/data/plugin_data/space/first_import"}));
+    assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), serde_json::json!({"local":"/operitapp/data/plugin_data/device/first_import","shared":"/operitapp/data/plugin_data/space/first_import"}));
 }
 
 /// Rejects an unspecified registration scope instead of choosing an arbitrary storage location.
@@ -3747,7 +3833,7 @@ fn native_interface_resolves_plugin_config_dir() {
 
     assert_eq!(
         path,
-        "/app/data/extensions/device/plugins/configs/plugin_name"
+        "/operitapp/data/extensions/device/plugins/configs/plugin_name"
     );
 }
 
@@ -3897,7 +3983,7 @@ async fn completion_retains_detached_promise_context_until_host_event() {
         resumed,
         serde_json::json!({
             "owner": "original", "runs": 1,
-            "config": "/app/data/extensions/device/plugins/configs/workflow",
+            "config": "/operitapp/data/extensions/device/plugins/configs/workflow",
         })
     );
     assert_eq!(
@@ -4003,7 +4089,7 @@ async fn promise_jobs_restore_execution_host_for_native_calls() {
     assert_eq!(
         value,
         serde_json::json!({
-            "config": "/app/data/extensions/device/plugins/configs/workflow",
+            "config": "/operitapp/data/extensions/device/plugins/configs/workflow",
             "owner": "workflow",
         })
     );

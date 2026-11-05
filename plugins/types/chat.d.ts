@@ -298,6 +298,10 @@ export namespace Chat {
    */
   function listChats(params?: HostListChatsParams): Promise<ChatListResultData>;
   /**
+   * Clears the parent relationship while preserving the conversation and its children.
+   */
+  function promoteToRoot(chatId: string): Promise<string>;
+  /**
    * Reads only the authenticated executing package's extension on an existing target.
    */
   function readExtension(target: ExtensionTarget): Promise<ChatReadExtensionResultData>;
@@ -382,6 +386,10 @@ export namespace Chat {
    * Carries every attachment field that the host passes to submit hooks and the real input processor.
    */
   export interface SendAttachment {
+    /**
+     * Preserves a saved VFS locator independently of the local media path.
+     */
+    vfsPath?: string | null;
     /**
      * Contains the original logical file path, not a reconstructed placeholder.
      */

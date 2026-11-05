@@ -43,6 +43,7 @@ use operit_util::ChatUtils::ChatUtils;
 use operit_util::DocumentConversionUtil::DocumentConversionUtil;
 use operit_util::FileUtils::FileUtils;
 use operit_util::ImagePoolManager::ImagePoolManager;
+use operit_util::MediaLinkBuilder::MediaLinkBuilder;
 use operit_util::MediaPoolManager::MediaPoolManager;
 use operit_util::OCRUtils::{OCRUtils, Quality as OCRQuality};
 use operit_util::RuntimeStorageLayout::RUNTIME_ROOT_PATH_PREFIX;
@@ -157,6 +158,12 @@ impl StandardFileSystemTools {
                         return Err(CROSS_NODE_TRANSFER_MESSAGE.to_string());
                     }
                     localPathSeen = true;
+                    let context = ToolExecutionManager::currentToolRuntimeContext();
+                    let resolved = PathMapper::resolveFileToolPath(
+                        context.as_ref().map(|context| context.fileDirectory(self.runtimeStorageHost.clone())).transpose()?.flatten().as_deref(),
+                        &value,
+                    )?;
+                    Self::rewritePathParameter(&mut call, name, &resolved);
                 }
                 continue;
             }
@@ -169,7 +176,12 @@ impl StandardFileSystemTools {
                         return Err(CROSS_NODE_TRANSFER_MESSAGE.to_string());
                     }
                     localPathSeen = true;
-                    Self::rewritePathParameter(&mut call, name, &innerPath);
+                    let context = ToolExecutionManager::currentToolRuntimeContext();
+                    let resolved = PathMapper::resolveFileToolPath(
+                        context.as_ref().map(|context| context.fileDirectory(self.runtimeStorageHost.clone())).transpose()?.flatten().as_deref(),
+                        &innerPath,
+                    )?;
+                    Self::rewritePathParameter(&mut call, name, &resolved);
                 }
                 QualifiedVfsResolution::RemoteTarget { node, pathPrefix, innerPath } => {
                     if localPathSeen {
@@ -245,33 +257,20 @@ impl StandardFileSystemTools {
         change: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         let mut storagePaths = Vec::new();
-        let mut workspacePaths = Vec::new();
         for path in paths {
             let canonical = PathMapper::canonicalizeVfsPath(path)?;
-            if let Some(relative) = PathMapper::relativePath("/app/workspaces", &canonical)? {
-                if !relative.is_empty() {
-                    workspacePaths.push(format!("workspaces/{relative}"));
+            for (vfsRoot, storageRoot) in [
+                ("/operitapp/workspaces", "workspaces"),
+                ("/operitapp/outputs", "runtime/data/chat_outputs"),
+                ("/operitapp/data", "runtime"),
+            ] {
+                if let Some(relative) = PathMapper::relativePath(vfsRoot, &canonical)? {
+                    storagePaths.push(if relative.is_empty() { storageRoot.into() } else { format!("{storageRoot}/{relative}") });
                 }
             }
-            if let Some(relative) = PathMapper::relativePath("/app/data", &canonical)? {
-                storagePaths.push(format!("runtime/{relative}"));
-            }
         }
-        let tracked = || {
-            RuntimeFileSyncStore::new(self.runtimeStorageHost.clone(), RUNTIME_SYNC_DIR_PATH)
-                .trackChanges(&storagePaths, change)
-        };
-        if workspacePaths.is_empty() {
-            tracked()
-        } else {
-            operit_store::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(
-                self.runtimeStorageHost.clone(),
-                RUNTIME_SYNC_DIR_PATH,
-            )
-            // Re-hash the touched workspace files so same-size rewrites publish
-            // immediately instead of waiting for the periodic full-hash round.
-            .trackPaths(&workspacePaths, tracked)
-        }
+        RuntimeFileSyncStore::new(self.runtimeStorageHost.clone(), RUNTIME_SYNC_DIR_PATH)
+            .trackChanges(&storagePaths, change)
     }
 
     /// Writes text and publishes changed Space files, including appended bytes.
@@ -617,7 +616,7 @@ impl StandardFileSystemTools {
                 format!("Error registering {mediaType} file: {path}"),
             );
         }
-        let content = buildMediaLink(mediaType, &mediaId);
+        let content = MediaLinkBuilder::media(mediaType, &mediaId);
         successData(
             tool,
             ToolResultData::FileContentData(FileContentData {
@@ -754,7 +753,7 @@ impl StandardFileSystemTools {
             return None;
         }
 
-        let prompt = format!("{}\n{}", buildImageMediaLink(&imageId), intent);
+        let prompt = format!("{}\n{}", MediaLinkBuilder::image(&imageId), intent);
         let request = RuntimeChatCallRequest {
             functionType: FunctionType::IMAGE_RECOGNITION,
             turns: vec![PromptTurn::new(PromptTurnKind::USER, prompt)],
@@ -814,7 +813,7 @@ impl StandardFileSystemTools {
                 format!("Error registering image file: {path}"),
             );
         }
-        let content = buildImageMediaLink(&imageId);
+        let content = MediaLinkBuilder::image(&imageId);
         successData(
             tool,
             ToolResultData::FileContentData(FileContentData {
@@ -2508,18 +2507,6 @@ fn fileExtension(path: &str) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase()
-}
-
-#[allow(non_snake_case)]
-/// Builds the canonical image media-link tag used by chat providers.
-fn buildImageMediaLink(imageId: &str) -> String {
-    format!("<link type=\"image\" id=\"{imageId}\"></link>")
-}
-
-#[allow(non_snake_case)]
-/// Builds the canonical audio or video media-link tag.
-fn buildMediaLink(mediaType: &str, mediaId: &str) -> String {
-    format!("<link type=\"{mediaType}\" id=\"{mediaId}\"></link>")
 }
 
 #[allow(non_snake_case)]

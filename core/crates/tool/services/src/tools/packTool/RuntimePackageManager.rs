@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use crate::runtime_support::{RuntimePluginAsset, ToolRuntimeSupport};
 use crate::tools::condition::ConditionEvaluator::{ConditionEvaluator, ConditionValue};
 use crate::tools::mcp::MCPManager::MCPManager;
+use crate::tools::a2a::A2ARepository::is_a2a_package;
 use crate::tools::mcp::MCPPackage::MCPPackage;
 use crate::tools::mcp::MCPServerConfig::MCPServerConfig;
 use crate::tools::mcp_runtime::MCPLocalServer::MCPLocalServer;
@@ -238,6 +239,11 @@ pub struct ToolPkgLoadIssue {
     pub code: String,
     pub message: String,
     pub packageKind: String,
+}
+
+struct FailedPackageDeletionTarget {
+    owner: Option<String>,
+    sourcePath: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -1053,6 +1059,20 @@ impl RuntimePackageManager {
                 enabledPackageNames.insert(child.packageName.clone());
             }
         }
+        if let Ok(repository) = crate::tools::a2a::A2ARepository::A2ARepository::new(self.context.as_ref().clone()) {
+            if let Ok(records) = repository.records() {
+                for record in records {
+                    let name = crate::tools::a2a::A2ARepository::package_name(&record.id);
+                    if availablePackages.get(&name).is_some_and(|package| is_a2a_package(package)) {
+                        if repository.config(&record.id).is_ok_and(|config| !config.disabled) {
+                            enabledPackageNames.insert(name);
+                        } else {
+                            enabledPackageNames.remove(&name);
+                        }
+                    }
+                }
+            }
+        }
         enabledPackageNames.into_iter().collect()
     }
 
@@ -1091,6 +1111,13 @@ impl RuntimePackageManager {
         let normalizedPackageName = self.normalizePackageName(packageName);
         if normalizedPackageName.trim().is_empty() {
             return "Package name cannot be empty".to_string();
+        }
+        if self.availablePackages().get(&normalizedPackageName).is_some_and(|package| is_a2a_package(package)) {
+            let id = normalizedPackageName.strip_prefix(crate::tools::a2a::A2ARepository::PACKAGE_PREFIX).expect("A2A package prefix");
+            return match crate::tools::a2a::A2ARepository::A2ARepository::new(self.context.as_ref().clone()).and_then(|repository| repository.set_enabled(id, true)) {
+                Ok(()) => format!("Enabled A2A package: {normalizedPackageName}"),
+                Err(error) => error,
+            };
         }
 
         if !self
@@ -1205,6 +1232,17 @@ impl RuntimePackageManager {
     #[operit_route_macros::operit_plugin_sdk_expose]
     pub fn disablePackage(&mut self, packageName: &str) -> String {
         let normalizedPackageName = self.normalizePackageName(packageName);
+        if self.availablePackages().get(&normalizedPackageName).is_some_and(|package| is_a2a_package(package)) {
+            let id = normalizedPackageName.strip_prefix(crate::tools::a2a::A2ARepository::PACKAGE_PREFIX).expect("A2A package prefix");
+            match crate::tools::a2a::A2ARepository::A2ARepository::new(self.context.as_ref().clone()).and_then(|repository| repository.set_enabled(id, false)) {
+                Ok(()) => {
+                    self.pluginPackageManager.deactivatePackage(&normalizedPackageName);
+                    self.unregisterPackageTools(&normalizedPackageName);
+                    return format!("Disabled A2A package: {normalizedPackageName}");
+                }
+                Err(error) => return error,
+            }
+        }
         let mut enabledPackageNames = BTreeSet::from_iter(self.getEnabledPackageNames());
         let mut subpackageStates = self.getToolPkgSubpackageStatesInternal();
         self.pluginPackageManager
@@ -1302,6 +1340,12 @@ impl RuntimePackageManager {
     #[allow(non_snake_case)]
     /// Removes custom code from built-in identities or deletes the selected package installation.
     pub fn deletePackage(&mut self, packageName: &str) -> bool {
+        if self.availablePackages().get(packageName).is_some_and(|package| is_a2a_package(package)) {
+            let id = packageName.strip_prefix(crate::tools::a2a::A2ARepository::PACKAGE_PREFIX).expect("A2A package prefix");
+            if crate::tools::a2a::A2ARepository::A2ARepository::new(self.context.as_ref().clone()).and_then(|repository| repository.delete(id)).is_err() { return false; }
+            self.reloadA2APackages();
+            return true;
+        }
         let name = match self
             .toolPkgManager()
             .resolveToolPkgSubpackageRuntimeInternal(packageName)
@@ -1345,6 +1389,62 @@ impl RuntimePackageManager {
         true
     }
 
+    /// Resolves installed records and files that a load failure can actually remove.
+    #[allow(non_snake_case)]
+    fn failedPackageDeletionTarget(
+        &self,
+        issue: &ToolPkgLoadIssue,
+    ) -> Result<FailedPackageDeletionTarget, String> {
+        let source = Path::new(&issue.sourcePath);
+        let installedScope = ["device", "space"].into_iter().find(|scope| {
+            let root = ExtensionStore::root("package", scope).expect("valid package scope");
+            source.parent() == Some(self.storePaths.runtime_storage_path(&root).as_path())
+        });
+        let records = ExtensionStore::default().records("package")?;
+        // Even an unreadable archive can still have a registered installation owner.
+        let owner = if issue.packageName.is_none() {
+            records
+                .iter()
+                .find(|record| {
+                    Some(record.scope.as_str()) == installedScope
+                        && source.file_name().and_then(|name| name.to_str())
+                            == Some(record.sourceName.as_str())
+                })
+                .map(|record| record.id.clone())
+        } else {
+            issue.packageName.clone()
+        };
+        let sourceOnly = issue.code == "duplicate_package"
+            && owner
+                .as_ref()
+                .is_some_and(|name| self.availablePackages().contains_key(name));
+        let owner = owner.filter(|name| {
+            !sourceOnly && records.iter().any(|record| record.id == *name)
+        });
+        // Parse failures may have no identity or installation record. Only remove a file
+        // directly inside an installation directory, never an asset or a scan directory.
+        let sourcePath = if installedScope.is_some() {
+            let info = self
+                .fileSystemHost
+                .fileExists(&issue.sourcePath)
+                .map_err(|error| error.to_string())?;
+            (info.exists && !info.isDirectory).then(|| issue.sourcePath.clone())
+        } else {
+            None
+        };
+        Ok(FailedPackageDeletionTarget { owner, sourcePath })
+    }
+
+    /// Reports deletion eligibility using the same installed targets as the delete operation.
+    #[allow(non_snake_case)]
+    pub fn canDeleteToolPkgLoadIssue(&self, issue: &ToolPkgLoadIssue) -> Result<bool, String> {
+        if issue.packageKind == "a2a" {
+            return Ok(ExtensionStore::default().records("a2a")?.iter().any(|record| Some(&record.id) == issue.packageName.as_ref()));
+        }
+        let target = self.failedPackageDeletionTarget(issue)?;
+        Ok(target.owner.is_some() || target.sourcePath.is_some())
+    }
+
     /// Deletes the persisted source of a current load failure without requiring a loaded package.
     #[allow(non_snake_case)]
     pub fn deleteToolPkgLoadIssue(&mut self, issue: ToolPkgLoadIssue) -> Result<(), String> {
@@ -1358,45 +1458,26 @@ impl RuntimePackageManager {
                     && current.packageKind == issue.packageKind
             })
             .ok_or("Package load issue is no longer present; refresh the package list")?;
-
-        let source = Path::new(&issue.sourcePath);
-        let installedScope = ["device", "space"].into_iter().find(|scope| {
-            let root = ExtensionStore::root("package", scope).expect("valid package scope");
-            source.parent() == Some(self.storePaths.runtime_storage_path(&root).as_path())
-        });
-        // Even an unreadable archive can still have a registered installation owner.
-        let owner = if issue.packageName.is_none() {
-            ExtensionStore::default()
-                .records("package")?
-                .into_iter()
-                .find(|record| {
-                    Some(record.scope.as_str()) == installedScope
-                        && source.file_name().and_then(|name| name.to_str())
-                            == Some(record.sourceName.as_str())
-                })
-                .map(|record| record.id)
-        } else {
-            issue.packageName.clone()
-        };
-        let sourceOnly = issue.code == "duplicate_package"
-            && owner
-                .as_ref()
-                .is_some_and(|name| self.availablePackages().contains_key(name));
+        if issue.packageKind == "a2a" {
+            let id = issue.packageName.as_deref().ok_or("A2A load issue has no installation identity")?;
+            crate::tools::a2a::A2ARepository::A2ARepository::new(self.context.as_ref().clone())?.delete(id)?;
+            self.reloadA2APackages();
+            return Ok(());
+        }
+        let target = self.failedPackageDeletionTarget(&issue)?;
         let mut removed = false;
-        if let Some(name) = owner.as_deref().filter(|_| !sourceOnly) {
+        if let Some(name) = target.owner.as_deref() {
             self.disablePackage(name);
             removed = ExtensionStore::default().deleteFailedPackageInstallations(name)?;
         }
-        // Parse failures may have no identity or installation record. Only remove a file
-        // directly inside an installation directory, never an asset or a scan directory.
-        if installedScope.is_some() {
+        if let Some(sourcePath) = target.sourcePath {
             let info = self
                 .fileSystemHost
-                .fileExists(&issue.sourcePath)
+                .fileExists(&sourcePath)
                 .map_err(|error| error.to_string())?;
             if info.exists && !info.isDirectory {
                 self.fileSystemHost
-                    .deleteFile(&issue.sourcePath, false)
+                    .deleteFile(&sourcePath, false)
                     .map_err(|error| error.to_string())?;
                 removed = true;
             }
@@ -2518,8 +2599,43 @@ impl RuntimePackageManager {
         let assetSnapshot = self.scanBuiltInPackageAssets();
         let mergedSnapshot = self.scanExternalPackages(&assetSnapshot);
         self.applyPackageScanSnapshot(mergedSnapshot);
+        self.reloadA2APackages();
         self.notifyToolPkgRuntimeChangeListeners();
         self.packageRegistryReadiness.complete_scan();
+    }
+
+    /// Projects A2A installations into the same package catalog used by activation and tool search.
+    pub fn reloadA2APackages(&mut self) {
+        Arc::make_mut(&mut self.manualToolPkgLoadIssues).retain(|issue| issue.packageKind != "a2a");
+        let removed = self.availablePackages().values().filter(|package| is_a2a_package(package))
+            .map(|package| package.name.clone()).collect::<Vec<_>>();
+        for name in removed {
+            self.availablePackagesMut().remove(&name);
+            self.pluginPackageManager.deactivatePackage(&name);
+            self.unregisterPackageTools(&name);
+        }
+        let loaded = (|| -> Result<(), String> {
+            let repository = crate::tools::a2a::A2ARepository::A2ARepository::new(self.context.as_ref().clone())?;
+            for record in repository.records()? {
+                let config = match repository.config(&record.id) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        self.recordManualToolPkgLoadIssue(&record.id, Some(&record.id), "a2a_load_failed", &error, "a2a");
+                        continue;
+                    }
+                };
+                let package = crate::tools::a2a::A2ARepository::tool_package(&record.id, &config);
+                if self.availablePackages().contains_key(&package.name) || self.isRegisteredMCPServer(&package.name) {
+                    self.recordManualToolPkgLoadIssue(&record.id, Some(&record.id), "a2a_load_failed", "A2A package name conflicts with another installed package", "a2a");
+                    continue;
+                }
+                self.availablePackagesMut().insert(package.name.clone(), package);
+            }
+            Ok(())
+        })();
+        if let Err(error) = loaded {
+            self.recordManualToolPkgLoadIssue("a2a", None, "a2a_load_failed", &error, "a2a");
+        }
     }
 
     #[allow(non_snake_case)]
@@ -2567,6 +2683,7 @@ impl RuntimePackageManager {
 
         for (packageName, toolPackage) in self.pluginPackageManager.availablePackages() {
             if toolPackage.is_built_in
+                || is_a2a_package(&toolPackage)
                 || self.toolPkgManager().hasSubpackage(&packageName)
                 || self.toolPkgManager().isToolPkgContainer(&packageName)
             {
@@ -3311,6 +3428,12 @@ impl RuntimePackageManager {
 
     /// Moves the parent installation and all child-package state to the selected scope.
     pub fn setPackageScope(&mut self, packageName: &str, scope: &str) -> Result<(), String> {
+        if self.availablePackages().get(packageName).is_some_and(|package| is_a2a_package(package)) {
+            let id = packageName.strip_prefix(crate::tools::a2a::A2ARepository::PACKAGE_PREFIX).expect("A2A package prefix");
+            ExtensionStore::default().moveScope("a2a", id, scope)?;
+            self.reloadA2APackages();
+            return Ok(());
+        }
         let name = match self
             .toolPkgManager()
             .resolveToolPkgSubpackageRuntimeInternal(packageName)

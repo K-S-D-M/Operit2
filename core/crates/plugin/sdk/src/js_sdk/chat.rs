@@ -214,7 +214,7 @@ pub enum ChatInitialTurn {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatSummaryPolicy {
-    /// Keeps the continued reply outside automatic summary scheduling.
+    /// Defers ordinary history summaries; tool-loop context limits still trigger compaction.
     #[serde(rename = "defer")]
     Defer,
     /// Checks configured summary thresholds after this reply has actually completed.
@@ -389,6 +389,8 @@ pub trait ChatHost: Send + Sync {
     fn updatePinned(&self, chatId: String, pinned: bool) -> JsFuture<String>;
     /// Updates only the deletion lock of an existing canonical chat.
     fn updateLocked(&self, chatId: String, locked: bool) -> JsFuture<String>;
+    /// Clears the parent relationship while preserving the conversation and its children.
+    fn promoteToRoot(&self, chatId: String) -> JsFuture<String>;
     /// Persists the supplied unique existing chat identifiers in display order.
     fn reorder(&self, chatIds: Vec<String>) -> JsFuture<String>;
     ///
@@ -456,6 +458,9 @@ pub struct ChatStartServiceOptions {
 #[allow(non_snake_case)]
 #[serde(deny_unknown_fields)]
 pub struct ChatSendAttachment {
+    /// Preserves a saved VFS locator independently of the local media path.
+    #[serde(default, skip_serializing_if = "JsOptional::is_undefined")]
+    pub vfsPath: JsOptional<String>,
     /// Contains the original logical file path, not a reconstructed placeholder.
     pub filePath: String,
     /// Identifies the actual originating node or explicitly contains null.

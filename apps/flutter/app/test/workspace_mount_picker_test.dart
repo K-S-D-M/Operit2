@@ -22,7 +22,7 @@ void main() {
       backend: 'android_documents',
       root:
           'content://com.ai.assistance.operit.documents.ubuntu/tree/project%2Ftest',
-      namespace: '/mnt/android/documents',
+      namespace: '/virtual/android/documents',
       name: '测试项目',
     );
     final picker = _WorkspaceMountPicker(source);
@@ -94,7 +94,7 @@ Future<void> _mountWorkspacePicker(
             onOpenTerminalSessions: () {},
             onOpenBrowserSessions: () {},
             onOpenBrowser: ({url, localFilePath, workspaceHtmlPath}) {},
-            onActivateCurrentTab: () {},
+            onFinishWebVisit: (_, _) {},
             onCloseCurrentTab: () {},
             onOpenWorkspaceCreator: () {},
             onBindWorkspace: (workspace) async => bindings.add(workspace),

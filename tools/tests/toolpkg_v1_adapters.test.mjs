@@ -132,7 +132,7 @@ test('v1 declarations match their recorded source hashes', () => {
 test('v1 zip maps environment and restores the source result path', async () => {
   const { tools, calls } = engine();
   const result = await tools.Files.zip('/work', '/archive.zip', 'linux', false);
-  assert.deepEqual(plain(calls[0]), { name: 'zip', args: ['/mnt/linux/work', '/mnt/linux/archive.zip', false] });
+  assert.deepEqual(plain(calls[0]), { name: 'zip', args: ['/virtual/linux/work', '/virtual/linux/archive.zip', false] });
   assert.equal(result.env, 'linux');
   assert.equal(result.path, '/work');
 });
@@ -144,20 +144,31 @@ test('v1 defaults to its documented Android contract and delegates mounts to the
   assert.equal(calls[0].args[0].path, '/sdcard/file.txt');
   assert.equal(result.env, 'android');
   assert.equal(result.path, '/storage/emulated/0/file.txt');
-  await tools.Files.list('/app/data/plugins/demo');
-  assert.equal(calls[1].args[0], '/app/data/plugins/demo');
+  await tools.Files.list('/operitapp/data/plugins/demo');
+  assert.equal(calls[1].args[0], '/operitapp/data/plugins/demo');
   await assert.rejects(tools.Files.read('/unsupported-root/file.txt'), /no VFS mapping/);
   await assert.rejects(tools.Files.read('/../../file.txt'), /escapes/);
   await assert.rejects(tools.Files.list('/work', 'invented'), /Unsupported/);
   assert.equal(calls.length, 2);
 });
 
+test('both VFS roots pass through adapters and preserve plugin result paths', async () => {
+  const { tools, calls } = engine();
+  const app = await tools.Files.list('/app/data/plugins/demo');
+  assert.equal(calls[0].args[0], '/app/data/plugins/demo');
+  assert.equal(app.path, '/app/data/plugins/demo');
+  const mount = await tools.Files.list('/mnt/linux/work');
+  assert.equal(calls[1].args[0], '/mnt/linux/work');
+  assert.equal(mount.path, '/mnt/linux/work');
+});
+
+
 /** Checks legacy options are converted without leaking environment into v2 options. */
 test('v1 read options preserve intent and caller ownership', async () => {
   const { tools, calls } = engine();
   const options = Object.freeze({ path: '/work/file', environment: 'linux', intent: 'read', direct_image: false });
   await tools.Files.read(options);
-  assert.deepEqual(plain(calls[0].args), [{ path: '/mnt/linux/work/file', intent: 'read', direct_image: false }]);
+  assert.deepEqual(plain(calls[0].args), [{ path: '/virtual/linux/work/file', intent: 'read', direct_image: false }]);
   assert.equal(options.environment, 'linux');
 });
 
@@ -165,7 +176,7 @@ test('v1 read options preserve intent and caller ownership', async () => {
 test('v1 cross-environment copy preserves both addresses', async () => {
   const { tools, calls } = engine();
   const result = await tools.Files.copy('/tmp/a', '/sdcard/b', true, 'linux', 'android');
-  assert.deepEqual(plain(calls[0].args), ['/mnt/linux/tmp/a', '/sdcard/b', true]);
+  assert.deepEqual(plain(calls[0].args), ['/virtual/linux/tmp/a', '/sdcard/b', true]);
   assert.equal(result.path, '/tmp/a');
   assert.equal(result.env, 'linux');
 });
@@ -191,10 +202,10 @@ test('v1 download supports both handwritten overloads', async () => {
   const { tools, calls } = engine();
   const headers = Object.freeze({ Accept: 'text/plain' });
   await tools.Files.download('https://example.invalid/file', '/out', 'linux', headers);
-  assert.deepEqual(plain(calls[0].args), ['https://example.invalid/file', '/mnt/linux/out', headers]);
+  assert.deepEqual(plain(calls[0].args), ['https://example.invalid/file', '/virtual/linux/out', headers]);
   const options = Object.freeze({ visit_key: 'visit', link_number: 2, destination: '/out', environment: 'linux', headers });
   const result = await tools.Files.download(options);
-  assert.deepEqual(plain(calls[1].args), [{ visit_key: 'visit', link_number: 2, destination: '/mnt/linux/out', headers }]);
+  assert.deepEqual(plain(calls[1].args), [{ visit_key: 'visit', link_number: 2, destination: '/virtual/linux/out', headers }]);
   assert.equal(result.path, '/out');
   assert.equal(result.env, 'linux');
   assert.equal(options.destination, '/out');
@@ -205,8 +216,8 @@ test('v2 keeps its original signatures and receives no legacy result fields', as
   const { tools, calls, context } = engine();
   await tools.Files.zip('/work', '/out', 'linux', false);
   context.version = '2.0.0';
-  const result = await tools.Files.zip('/app/workspaces/a', '/app/data/out', false);
-  assert.deepEqual(plain(calls[1].args), ['/app/workspaces/a', '/app/data/out', false]);
+  const result = await tools.Files.zip('/operitapp/workspaces/a', '/operitapp/data/out', false);
+  assert.deepEqual(plain(calls[1].args), ['/operitapp/workspaces/a', '/operitapp/data/out', false]);
   assert.equal(Object.hasOwn(result, 'env'), false);
   context.version = '1.0.1';
   assert.equal((await tools.Files.list('/work', 'linux')).env, 'linux');
@@ -271,6 +282,37 @@ test('legacy caller IDs are provider-scoped and absent from the current contract
   assert.throws(() => context.getCallerCardId(), /another provider participant/);
   context.params = {};
   assert.equal(context.getCallerCardId(), undefined);
+});
+
+/** V1 hooks use the native invocation snapshot even without legacy tool parameters. */
+test('v1 hook memory uses the neutral caller transport and rejects foreign participants', async t => {
+  const { domain, context, tools, calls } = await roleProvider(t);
+  const card = await domain('character.create', { values: { name: 'Hook memory owner' } });
+  context.params = {
+    eventPayload: { metadata: { executionContext: { chatId: 'forged-chat', participantId: 'forged-card' } } },
+    __operit_package_chat_id: 'hook-chat',
+    __operit_package_caller_participant_id: card.id,
+    __operit_package_caller_owner: 'com.operit.character_cards',
+  };
+  assert.equal(context.getCallerCardId(), card.id);
+  await tools.Memory.create('Hook memory', 'Owned by the captured role');
+  const result = await tools.Memory.query('Hook memory');
+  assert.equal(result.memories[0].title, 'Hook memory');
+  const query = calls.findLast(call => call.name === 'character_memory:query_memory');
+  assert.equal(query.args[0].__operit_package_caller_participant_id, card.id);
+  assert.equal(query.args[0].__operit_package_chat_id, 'hook-chat');
+  assert.equal(query.args[0].__operit_package_caller_owner, 'com.operit.character_cards');
+
+  delete context.params.__operit_package_caller_participant_id;
+  delete context.params.__operit_package_caller_owner;
+  assert.equal(context.getCallerCardId(), undefined);
+  await assert.rejects(tools.Memory.query('*'), /caller_card_id or target_owner_key parameter is required/);
+  const count = calls.length;
+  context.params.__operit_package_caller_participant_id = card.id;
+  context.params.__operit_package_caller_owner = 'another.provider';
+  assert.throws(() => context.getCallerCardId(), /another provider participant/);
+  await assert.rejects(tools.Memory.query('*'), /another provider participant/);
+  assert.equal(calls.length, count, 'another provider must not enter character memory tools');
 });
 
 /** Checks the historical image globals stay synchronous and disappear on API 2. */
@@ -401,7 +443,7 @@ test('VoiceBar v1 clicks retain the host speech request after the synchronous UI
 
 /** Exercises genuine public API handlers and memory tool IPC against the existing disk-backed plugin. */
 async function roleProvider(t, version = '1.0.0') {
-  const disk = await createDiskHarness(t), apis = new Map();
+  const disk = await createDiskHarness(t, { legacyIdentity: 'default' }), apis = new Map();
   const plugin = loadModule('src/public-api.ts', { ...disk.globals, ToolPkg: {
     ...disk.globals.ToolPkg,
     /** Captures the actual exported callbacks registered by the production provider. */
@@ -456,7 +498,7 @@ async function roleProvider(t, version = '1.0.0') {
 test('legacy chat roles and creation use the real prerequisite provider', async t => {
   const runtime = await roleProvider(t);
   const library = await runtime.domain('memory.shared.create', { name: 'Actual shared library' });
-  const card = await runtime.domain('character.create', { values: { name: 'Real legacy role', chatModelBindingMode: 'FIXED_MODEL', chatModelId: 'configured-model', memoryBindingMode: 'SHARED', sharedMemoryId: library.id } });
+  const card = await runtime.domain('character.create', { values: { name: 'Real legacy role', chatModelBindingMode: 'FIXED_MODEL', chatModelId: 'configured-model', chatProviderId: 'configured-provider', memoryBindingMode: 'SHARED', sharedMemoryId: library.id } });
   const listed = await runtime.tools.Chat.listCharacterCards();
   assert.ok(listed.cards.some(entry => entry.id === card.id && entry.name === card.name));
   const created = await runtime.tools.Chat.createNew('native-folder', false, card.id);
@@ -467,7 +509,7 @@ test('legacy chat roles and creation use the real prerequisite provider', async 
     { name: 'Chat.updateGroup', args: [['new-chat'], 'native-folder'] },
   ]);
   const before = runtime.calls.filter(entry => entry.name === 'Chat.createNew').length;
-  await assert.rejects(runtime.tools.Chat.createNew(undefined, undefined, 'missing-role'), /character does not identify exactly one record: missing-role/);
+  await assert.rejects(runtime.tools.Chat.createNew(undefined, undefined, 'missing-role'), /Character not found: missing-role/);
   assert.equal(runtime.calls.filter(entry => entry.name === 'Chat.createNew').length, before);
   runtime.context.version = '2.0.0';
   const options = Object.freeze({ sourceChatId: 'source-chat', input: { owner: 'opaque' } });
@@ -530,14 +572,24 @@ test('legacy memory operations reach the actual disk-backed provider', async t =
 
 /** Verifies lossless numeric relationship IDs round-trip through actual create, query, update and delete operations. */
 test('legacy numeric memory links round-trip through decimal-string provider identities', async t => {
-  const { tools, calls } = await roleProvider(t, '1.0.1');
+  const { tools, calls, disk } = await roleProvider(t, '1.0.1');
   await tools.Memory.create('Source', 'Source content');
   await tools.Memory.create('Target', 'Target content');
   const created = await tools.Memory.link({ sourceTitle: 'Source', targetTitle: 'Target', description: 'Actual link' });
   assert.equal(created.description, 'Actual link');
+  await assert.rejects(tools.Memory.queryLinks(), /Invalid memory relationship identity/);
+  // Imported legacy links have decimal identities; newly allocated UUIDs cannot become v1 numbers.
+  const database = await disk.storage.objects.open({ path: disk.directory + '/memory.sqlite' });
+  const [stored] = await database.collection('links').list();
+  const { ownerKey, record } = stored.value;
+  await database.commit([
+    { op: 'delete', collection: 'links', key: stored.key, expectedVersion: stored.version },
+    { op: 'put', collection: 'links', key: ownerKey + '/42', value: { ownerKey, record: { ...record, id: '42' } }, expectedVersion: null },
+  ]);
+  await database.close();
   const query = await tools.Memory.queryLinks();
   assert.equal(query.totalCount, 1);
-  assert.ok(Number.isSafeInteger(query.links[0].linkId));
+  assert.equal(query.links[0].linkId, 42);
   const updated = await tools.Memory.updateLink({ linkId: query.links[0].linkId, weight: 0.9 });
   assert.equal(updated.weight, 0.9);
   assert.equal(calls.at(-1).args[0].link_id, String(query.links[0].linkId));

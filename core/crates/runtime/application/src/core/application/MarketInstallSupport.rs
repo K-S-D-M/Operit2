@@ -17,9 +17,9 @@ use super::OperitApplication::OperitApplication;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MarketInstallMarker {
-    entry_id: String,
-    version_id: String,
+pub(super) struct MarketInstallMarker {
+    pub(super) entry_id: String,
+    pub(super) version_id: String,
 }
 
 fn marker_path(root: &Path) -> PathBuf {
@@ -77,39 +77,49 @@ fn mcp_config_marker_root(server_id: &str) -> PathBuf {
         ))
 }
 
-fn installed_marker_roots(app: &OperitApplication) -> Result<Vec<PathBuf>, String> {
+fn installed_marker_installations(
+    app: &OperitApplication,
+) -> Result<Vec<(&'static str, String, PathBuf)>, String> {
     let fs = app
         .hostManager
         .fileSystemHost
         .as_ref()
         .ok_or("FileSystemHost is missing")?;
-    let mut roots = Vec::new();
+    let mut installations = Vec::new();
     let packages = app.packageManager();
     for source in packages
         .lock()
         .map_err(|error| error.to_string())?
         .getPublishablePackageSources()
     {
-        roots.push(artifact_marker_root(&source.packageName)?);
+        installations.push((
+            "package",
+            source.packageName.clone(),
+            artifact_marker_root(&source.packageName)?,
+        ));
     }
     for skill in app
         .skillRepository()
         .getAvailableSkillPackages()
         .into_values()
     {
-        roots.push(skill.directory);
+        installations.push(("skill", skill.name.clone(), skill.directory));
     }
     let mcp = MCPLocalServer::getInstance(&app.hostManager);
     for id in mcp.getAllMCPServersChecked()?.keys() {
-        roots.push(mcp_config_marker_root(id));
+        installations.push(("mcp", id.clone(), mcp_config_marker_root(id)));
     }
     let plugins = RuntimeStorePaths::default().mcp_plugins_dir();
     if let Ok(entries) = fs.listFiles(&plugins.to_string_lossy()) {
         for entry in entries.into_iter().filter(|entry| entry.isDirectory) {
-            roots.push(plugins.join(entry.name));
+            installations.push((
+                "mcp_plugin",
+                entry.name.clone(),
+                plugins.join(entry.name),
+            ));
         }
     }
-    Ok(roots)
+    Ok(installations)
 }
 
 pub(super) fn installed_versions(
@@ -120,11 +130,43 @@ pub(super) fn installed_versions(
         .fileSystemHost
         .as_ref()
         .ok_or("FileSystemHost is missing")?;
-    Ok(installed_marker_roots(app)?
+    let mut versions: BTreeMap<_, _> = installed_marker_installations(app)?
         .into_iter()
-        .filter_map(|root| read_marker(fs.as_ref(), &root))
+        .filter_map(|(_, _, root)| read_marker(fs.as_ref(), &root))
         .map(|marker| (marker.entry_id, marker.version_id))
-        .collect())
+        .collect();
+    for marker in a2a_marker_origins(app)?.into_values() {
+        versions.insert(marker.entry_id, marker.version_id);
+    }
+    Ok(versions)
+}
+
+/// Returns market ownership markers keyed by the extension kind and local id.
+pub(super) fn installed_marker_origins(
+    app: &OperitApplication,
+) -> Result<BTreeMap<(String, String), MarketInstallMarker>, String> {
+    let fs = app
+        .hostManager
+        .fileSystemHost
+        .as_ref()
+        .ok_or("FileSystemHost is missing")?;
+    let mut origins: BTreeMap<_,_> = installed_marker_installations(app)?
+        .into_iter()
+        .filter_map(|(kind, id, root)| {
+            read_marker(fs.as_ref(), &root).map(|marker| ((kind.to_string(), id), marker))
+        })
+        .collect();
+    origins.extend(a2a_marker_origins(app)?);
+    Ok(origins)
+}
+
+fn a2a_marker_origins(app: &OperitApplication) -> Result<BTreeMap<(String, String), MarketInstallMarker>, String> {
+    let repository = operit_tools::tools::a2a::A2ARepository::A2ARepository::new(app.hostManager.clone())?;
+    Ok(repository.records()?.into_iter().filter_map(|record| {
+        let entry_id = record.settings["marketEntryId"].as_str()?.to_string();
+        let version_id = record.settings["installedMarketVersionId"].as_str()?.to_string();
+        Some((("a2a".into(), record.id), MarketInstallMarker {entry_id, version_id}))
+    }).collect())
 }
 
 /// Imports a market entry and records only the version that actually succeeded.
@@ -184,6 +226,14 @@ pub(super) fn install_entry(
                 &entry.id,
                 version_id,
             )?;
+        }
+        "a2a" => {
+            let version = entry.latest_version.as_ref().filter(|version| version.id == version_id)
+                .ok_or("Requested A2A market version has no installation manifest")?;
+            let config = version.install_config.as_deref().or_else(|| entry.repo_version.as_ref().and_then(|repo| repo.install_config.as_deref())).ok_or("A2A market entry has no installation configuration")?;
+            let repository = operit_tools::tools::a2a::A2ARepository::A2ARepository::new(app.hostManager.clone())?;
+            repository.import_market(config, &entry.id, version_id)?;
+            app.packageManager().lock().map_err(|e| e.to_string())?.reloadA2APackages();
         }
         "skill" => {
             install_skill(app, &entry, version_id)?;

@@ -4,6 +4,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:operit2/ui/common/markdown/MarkdownNodeGrouper.dart';
+import 'package:operit2/ui/common/interactions/ChainedScrollController.dart';
 import 'package:operit2/ui/features/chat/components/part/ThinkToolsXmlNodeGrouper.dart';
 
 const _tool = MarkdownNodeStable(
@@ -42,6 +43,8 @@ Widget _renderGroup(
   List<MarkdownNodeStable> nodes, {
   bool live = true,
   List<Widget> body = const [Text('Tool body')],
+  Widget Function(Widget child)? wrap,
+  TargetPlatform? platform,
 }) {
   const grouper = ThinkToolsXmlNodeGrouper(showThinkingProcess: true);
   final group =
@@ -49,39 +52,39 @@ Widget _renderGroup(
   final lastVisibleIndex = nodes.lastIndexWhere(
     (node) => node.content.trim().isNotEmpty,
   );
+  final content = grouper.renderGroup(
+    group: group,
+    nodes: nodes,
+    rendererId: 'activity-test',
+    isVisible: true,
+    isLastNode: group.endIndexInclusive == lastVisibleIndex,
+    textColor: Colors.black,
+    xmlRenderer:
+        ({
+          required xmlContent,
+          required isStreaming,
+          required textColor,
+          xmlStream,
+          xmlMarkdownEventStream,
+          renderInstanceKey,
+        }) => const SizedBox.shrink(),
+    mergeRender:
+        ({
+          required startIndex,
+          required endIndexInclusive,
+          required renderInstanceKeyPrefix,
+          required shouldRenderNode,
+        }) => body,
+    xmlStreamResolver: (index) =>
+        live && index == 0 ? const Stream<String>.empty() : null,
+    xmlMarkdownEventStreamResolver: (_) => null,
+    onLinkClick: null,
+    fillMaxWidth: true,
+    textStyle: const TextStyle(),
+  );
   return MaterialApp(
-    home: Scaffold(
-      body: grouper.renderGroup(
-        group: group,
-        nodes: nodes,
-        rendererId: 'activity-test',
-        isVisible: true,
-        isLastNode: group.endIndexInclusive == lastVisibleIndex,
-        textColor: Colors.black,
-        xmlRenderer:
-            ({
-              required xmlContent,
-              required isStreaming,
-              required textColor,
-              xmlStream,
-              xmlMarkdownEventStream,
-              renderInstanceKey,
-            }) => const SizedBox.shrink(),
-        mergeRender:
-            ({
-              required startIndex,
-              required endIndexInclusive,
-              required renderInstanceKeyPrefix,
-              required shouldRenderNode,
-            }) => body,
-        xmlStreamResolver: (index) =>
-            live && index == 0 ? const Stream<String>.empty() : null,
-        xmlMarkdownEventStreamResolver: (_) => null,
-        onLinkClick: null,
-        fillMaxWidth: true,
-        textStyle: const TextStyle(),
-      ),
-    ),
+    theme: platform == null ? null : ThemeData(platform: platform),
+    home: Scaffold(body: wrap?.call(content) ?? content),
   );
 }
 
@@ -103,6 +106,98 @@ void main() {
       _renderGroup([_tool], body: const [SizedBox(height: 1800)]),
     );
     await tester.pump();
+  }
+
+  for (final trackpad in [false, true]) {
+    for (final chainedInner in [true, false]) {
+      testWidgets(
+        'three live layers hand off ${trackpad ? "pan" : "wheel"} from ${chainedInner ? "chained" : "ordinary"} content to chat',
+        (tester) async {
+          final outer = ScrollController();
+          final inner = chainedInner
+              ? ChainedScrollController()
+              : ScrollController();
+          addTearDown(outer.dispose);
+          addTearDown(inner.dispose);
+          await tester.pumpWidget(
+            _renderGroup(
+              [_tool],
+              platform: TargetPlatform.macOS,
+              body: [
+                const SizedBox(height: 800),
+                SizedBox(
+                  height: 160,
+                  child: SingleChildScrollView(
+                    key: const ValueKey('deep-body'),
+                    controller: inner,
+                    physics: const ClampingScrollPhysics(),
+                    child: const SizedBox(height: 800),
+                  ),
+                ),
+              ],
+              wrap: (child) => ChainedScrollScope(
+                child: SizedBox(
+                  height: 500,
+                  child: CustomScrollView(
+                    controller: outer,
+                    physics: const ClampingScrollPhysics(),
+                    slivers: [
+                      SliverToBoxAdapter(child: child),
+                      const SliverToBoxAdapter(child: SizedBox(height: 1000)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pump();
+          final middle = tester
+              .state<ScrollableState>(
+                find
+                    .descendant(
+                      of: find.byType(ListView),
+                      matching: find.byType(Scrollable),
+                    )
+                    .first,
+              )
+              .position;
+          middle.jumpTo(middle.maxScrollExtent - 14);
+          middle.pointerScroll(-1);
+          inner.jumpTo(inner.position.maxScrollExtent - 10);
+          await tester.pump();
+          final point = tester.getCenter(
+            find.byKey(const ValueKey('deep-body')),
+          );
+          if (trackpad) {
+            final gesture = await tester.createGesture(
+              kind: PointerDeviceKind.trackpad,
+            );
+            await gesture.panZoomStart(point);
+            await gesture.panZoomUpdate(point, pan: const Offset(0, -20));
+            await gesture.panZoomUpdate(point, pan: const Offset(0, -100));
+            await tester.pump();
+            expect(outer.offset, greaterThan(0));
+            final before = outer.offset;
+            await gesture.panZoomUpdate(point, pan: const Offset(0, -130));
+            await tester.pump();
+            expect(outer.offset, closeTo(before + 30, 0.01));
+            await gesture.panZoomEnd();
+          } else {
+            await tester.sendEventToBinding(
+              PointerScrollEvent(
+                position: point,
+                scrollDelta: const Offset(0, 100),
+              ),
+            );
+            await tester.pump();
+            expect(outer.offset, 75);
+          }
+          expect(inner.offset, inner.position.maxScrollExtent);
+          expect(middle.pixels, middle.maxScrollExtent);
+          await tester.pumpWidget(const SizedBox.shrink());
+        },
+      );
+    }
   }
 
   testWidgets('wheel scrolling up pauses live group following until bottom', (
@@ -272,6 +367,20 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
+  testWidgets('appending thinking keeps the same tool group active', (
+    tester,
+  ) async {
+    await tester.pumpWidget(_renderGroup([_tool]));
+    await tester.pumpWidget(_renderGroup([_tool, _lineBreak, _think, _tool]));
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(find.textContaining('Executing'), findsOneWidget);
+    expect(find.textContaining('1 thinking'), findsOneWidget);
+    expect(find.textContaining('2 calls'), findsOneWidget);
+    expect(find.textContaining('Completed'), findsNothing);
+    expect(find.text('Tool body'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('folds a group when its stream finishes', (tester) async {
     await tester.pumpWidget(_renderGroup([_tool, _lineBreak]));
     expect(find.text('Tool body'), findsOneWidget);
@@ -284,7 +393,7 @@ void main() {
 
   for (final (description, trailing) in [
     ('answer text', [_answer]),
-    ('a later thinking and tool group', [_think, _tool]),
+    ('a later thinking and tool group after text', [_answer, _think, _tool]),
   ]) {
     testWidgets('folds an earlier group when $description arrives', (
       tester,

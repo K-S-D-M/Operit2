@@ -48,6 +48,7 @@ class WorkspacePanel extends StatefulWidget {
     required this.currentChatId,
     required this.hasBoundWorkspace,
     required this.workspacePath,
+    this.fileDirectory,
     required this.chatCore,
     required this.onListWorkspaceFiles,
     required this.onListWorkspaceBindingDirectories,
@@ -65,6 +66,7 @@ class WorkspacePanel extends StatefulWidget {
   final SidebarDockController? sidebarDockController;
   final bool hasBoundWorkspace;
   final String? workspacePath;
+  final String? fileDirectory;
   final GeneratedChatRuntimeHolderMainCoreProxy chatCore;
   final Future<List<WorkspaceFileEntry>> Function(String path)
   onListWorkspaceFiles;
@@ -341,8 +343,9 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
   @override
   Widget build(BuildContext context) {
     return WorkspacePanelSurface(
-      transparentSurface: OperitTheme.of(context)
-          .themePreferenceSnapshot.transparentSurfaceEnabled,
+      transparentSurface: OperitTheme.of(
+        context,
+      ).themePreferenceSnapshot.transparentSurfaceEnabled,
       child: _buildWorkspaceLayout(),
     );
   }
@@ -1134,6 +1137,7 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
     return WorkspaceTabContent(
       tab: tab,
       workspacePath: widget.workspacePath,
+      fileDirectory: widget.fileDirectory,
       workspaceUsage: _workspaceOverviewUsage(),
       terminalSessionCountListenable: _terminalSessionCount,
       browserSessionCountListenable: _browserSessionCount,
@@ -1169,8 +1173,6 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
       ),
       onFinishWebVisit: (tab, response) =>
           _finishWebVisitTab(tab, response, paneIndex: paneIndex),
-      onActivateCurrentTab: () =>
-          _selectWorkspaceTab(tab, paneIndex: paneIndex),
       onCloseCurrentTab: () => _closeWorkspaceTab(tab, paneIndex: paneIndex),
       onOpenWorkspaceCreator: _showCreateWorkspaceDialog,
       onBindWorkspace: _bindWorkspaceFolder,
@@ -1289,14 +1291,12 @@ class _WorkspacePanelState extends State<WorkspacePanel> {
 
   /// Returns a VFS locator whose filesystem is resolved by the selected terminal host.
   String _manualTerminalWorkingDirectory() {
-    if (!widget.hasBoundWorkspace) {
-      return '/app/data';
+    final directory =
+        widget.fileDirectory?.trim() ?? widget.workspacePath?.trim();
+    if (directory == null || directory.isEmpty) {
+      throw StateError('当前对话的文件目录尚未就绪');
     }
-    final workspaceDirectory = widget.workspacePath?.trim();
-    if (workspaceDirectory == null || workspaceDirectory.isEmpty) {
-      throw StateError('工作区路径为空');
-    }
-    return workspaceDirectory;
+    return directory;
   }
 
   String _nextManualTerminalSessionName() {

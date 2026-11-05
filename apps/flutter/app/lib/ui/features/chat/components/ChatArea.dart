@@ -9,6 +9,8 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
 
 import '../../../common/markdown/StreamMarkdownRenderer.dart';
+import '../../../common/markdown/MarkdownFileScope.dart';
+import '../../../common/interactions/ChainedScrollController.dart';
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../data/preferences/UserPreferencesManager.dart';
 import '../../../theme/OperitTheme.dart';
@@ -36,6 +38,7 @@ class ChatArea extends StatefulWidget {
     required this.errorMessage,
     required this.scrollController,
     required this.currentChatId,
+    this.fileDirectory,
     required this.identityAvatarUri,
     this.onIdentityTap,
     required this.clients,
@@ -77,6 +80,7 @@ class ChatArea extends StatefulWidget {
   final String? errorMessage;
   final ScrollController scrollController;
   final String? currentChatId;
+  final String? fileDirectory;
   final String? identityAvatarUri;
   final VoidCallback? onIdentityTap;
   final GeneratedCoreProxyClients clients;
@@ -351,15 +355,17 @@ class _ChatAreaState extends State<ChatArea>
       ],
     );
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final viewportHeight = constraints.maxHeight;
-        if (_viewportHeight != viewportHeight) {
-          _viewportHeight = viewportHeight;
-          _scheduleViewportResizeUpdate();
-        }
-        return viewport;
-      },
+    return ChainedScrollScope(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final viewportHeight = constraints.maxHeight;
+          if (_viewportHeight != viewportHeight) {
+            _viewportHeight = viewportHeight;
+            _scheduleViewportResizeUpdate();
+          }
+          return viewport;
+        },
+      ),
     );
   }
 
@@ -906,6 +912,9 @@ class _ChatAreaState extends State<ChatArea>
     _chatBusyNotifier.value = widget.isLoading;
     _layoutScrollController.delegate = widget.scrollController;
     final chatChanged = oldWidget.currentChatId != widget.currentChatId;
+    if (oldWidget.fileDirectory != widget.fileDirectory) {
+      _messageRowCache.clear();
+    }
     if (chatChanged) {
       _stopBottomFollow();
       _lastScrollMaxExtent = null;
@@ -1045,7 +1054,12 @@ class _ChatAreaState extends State<ChatArea>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          chatMessage,
+          MarkdownFileScope.forParts(
+            parts: message.parts,
+            fallbackBasePath: widget.fileDirectory,
+            clients: widget.clients,
+            child: chatMessage,
+          ),
           if (!selectionMode)
             if (widget.currentChatId case final chatId?)
               ChatMessageSlotHost(
@@ -1493,6 +1507,8 @@ bool _sameMessageForRender(ChatUiMessage left, ChatUiMessage right) {
         right.pluginExtensions,
       ) &&
       left.sender == right.sender &&
+      markdownFileContextForParts(left.parts) ==
+          markdownFileContextForParts(right.parts) &&
       (_sameMessagePartsForRender(left, right) ||
           _sameLiveAiStreamForRender(left, right, contentStreamSame)) &&
       left.timestamp == right.timestamp &&

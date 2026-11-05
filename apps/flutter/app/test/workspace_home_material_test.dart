@@ -87,7 +87,12 @@ void main() {
           addTearDown(tester.view.resetPhysicalSize);
           addTearDown(tester.view.resetDevicePixelRatio);
           await tester.pumpWidget(
-            fixture.app(brightness: brightness, scale: scale, bound: false),
+            fixture.app(
+              brightness: brightness,
+              scale: scale,
+              bound: false,
+              fileDirectory: '/operitapp/outputs/2026-11-04_20-19-26-115',
+            ),
           );
           await tester.pumpAndSettle();
 
@@ -134,7 +139,7 @@ void main() {
         terminal: 'shell',
         terminalType: 'shell',
         sessionKind: 'pty',
-        workingDir: '/app/data',
+        workingDir: '/operitapp/data',
         commandRunning: false,
       ),
     ];
@@ -184,7 +189,7 @@ void main() {
     final folder = find.text('项目目录');
     final addFolder = find.byTooltip('挂载文件夹');
     expect(folder, findsOneWidget);
-    expect(find.text('/app/workspaces/project'), findsOneWidget);
+    expect(find.text('/operitapp/workspaces/project'), findsOneWidget);
     expect(find.text('切换工作区'), findsNothing);
     expect(find.text('挂载新文件夹'), findsNothing);
     expect(
@@ -202,6 +207,24 @@ void main() {
     expect(fixture.calls, <String>['folder', 'mount']);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets(
+    'unbound output directory opens through the existing file browser callback',
+    (tester) async {
+      final fixture = _HomeFixture();
+      addTearDown(fixture.dispose);
+      const output = '/operitapp/outputs/2026-11-04_01-52-04-000';
+      await tester.pumpWidget(fixture.app(bound: false, fileDirectory: output));
+      await tester.pumpAndSettle();
+      expect(find.textContaining(output), findsOneWidget);
+      expect(find.text('工作区（可选）'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('chat-output-directory')));
+      expect(fixture.openedFolder!.path, output);
+      expect(fixture.openedFolder!.relativePath, '');
+      expect(fixture.calls, ['folder']);
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('workspace menu contains only a native unbind item', (
     tester,
@@ -273,7 +296,7 @@ void main() {
             terminal: 'shell',
             terminalType: 'shell',
             sessionKind: 'pty',
-            workingDir: '/app/workspaces/project',
+            workingDir: '/operitapp/workspaces/project',
             commandRunning: false,
           ),
       ];
@@ -324,7 +347,7 @@ class _HomeFixture {
   static const name = 'Operit2Bug / a deliberately long workspace title';
   static const folder = WorkspaceMountedFolder(
     name: '项目目录',
-    path: '/app/workspaces/project',
+    path: '/operitapp/workspaces/project',
     relativePath: '.',
   );
   final terminals = ValueNotifier<int>(0);
@@ -333,6 +356,7 @@ class _HomeFixture {
     const <WorkspaceTerminalSessionInfo>[],
   );
   final calls = <String>[];
+  WorkspaceMountedFolder? openedFolder;
 
   /// Mounts the actual overview with a Material theme and no runtime requests.
   Widget app({
@@ -344,6 +368,7 @@ class _HomeFixture {
     ],
     bool foldersLoading = false,
     String? foldersError,
+    String? fileDirectory,
   }) {
     return MaterialApp(
       theme: ThemeData(
@@ -362,8 +387,9 @@ class _HomeFixture {
       home: Scaffold(
         body: WorkspaceHomeContent(
           workspacePath: bound
-              ? '/app/workspaces/project/with/a/long/directory/path'
+              ? '/operitapp/workspaces/project/with/a/long/directory/path'
               : null,
+          fileDirectory: fileDirectory,
           workspaceUsage: bound
               ? WorkspaceOverviewUsage(
                   workspaceName: name,
@@ -377,7 +403,10 @@ class _HomeFixture {
           terminalSessionCountListenable: terminals,
           browserSessionCountListenable: browsers,
           terminalSessionsListenable: sessions,
-          onOpenFolder: (_) => calls.add('folder'),
+          onOpenFolder: (folder) {
+            openedFolder = folder;
+            calls.add('folder');
+          },
           onAddFolder: () => calls.add('mount'),
           onCreateWorkspace: () => calls.add('create'),
           onChooseExistingWorkspace: () => calls.add('choose'),

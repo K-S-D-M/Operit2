@@ -513,10 +513,48 @@ impl ChatHistoryManager {
     /// Loads one persisted chat history metadata row.
     #[allow(non_snake_case)]
     pub fn loadChatHistory(&self, chatId: String) -> ChatHistoryManagerResult<Option<ChatHistory>> {
-        Ok(self
-            .chatDao
-            .getChatById(&chatId)?
-            .map(|chatEntity| chatEntity.toChatHistory(Vec::new())))
+        let chat = self.chatDao.getChatById(&chatId)?;
+        if chat.is_some() { self.ensureOutputDirectory(&chatId)?; self.fileDirectoryForChat(&chatId)?; }
+        Ok(chat.map(|chatEntity| chatEntity.toChatHistory(Vec::new())))
+    }
+
+    /// Persists inherited output bindings independently of mutable parent links.
+    pub fn ensureOutputDirectory(&self, chatId: &str) -> ChatHistoryManagerResult<String> {
+        let outputs = crate::ChatOutputStore::ChatOutputStore::new(crate::RuntimeStorageHost::defaultRuntimeStorageHost());
+        let mut chain = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current = chatId.to_string();
+        let mut directory = loop {
+            if !visited.insert(current.clone()) { return Err(ChatHistoryManagerError::IllegalState("Cyclic parent conversations".into())); }
+            if let Some(directory) = outputs.directory(&current).map_err(ChatHistoryManagerError::IllegalState)? { break Some(directory); }
+            let chat = self.chatDao.getChatById(&current)?.ok_or_else(|| ChatHistoryManagerError::IllegalArgument(format!("Chat not found: {current}")))?;
+            let parent = chat.parentChatId.clone();
+            chain.push(chat);
+            match parent { Some(parent) if self.chatDao.getChatById(&parent)?.is_some() => current = parent, _ => break None }
+        };
+        for chat in chain.iter().rev() {
+            directory = Some(outputs.bind(&chat.id, chat.createdAt, directory.as_deref()).map_err(ChatHistoryManagerError::IllegalState)?);
+        }
+        directory.ok_or_else(|| ChatHistoryManagerError::IllegalState("Missing output directory".into()))
+    }
+
+    /// Returns the actual relative-path base without treating outputs as a workspace.
+    pub fn fileDirectoryForChat(&self, chatId: &str) -> ChatHistoryManagerResult<String> {
+        let chat = self.chatDao.getChatById(chatId)?.ok_or_else(|| ChatHistoryManagerError::IllegalArgument("Chat does not exist".into()))?;
+        if let Some(id) = chat.workspaceId.as_deref() {
+            if let Some(workspace) = self.getWorkspace(id)? {
+                let path = workspace.primaryFolder().path.clone();
+                if let Some(relative) = path.strip_prefix("/operitapp/workspaces/").or_else(|| path.strip_prefix("/app/workspaces/")) {
+                    crate::FileSyncPolicy::FileSyncPolicy::ensure(crate::RuntimeStorageHost::defaultRuntimeStorageHost().as_ref(), &format!("workspaces/{relative}"))
+                        .map_err(ChatHistoryManagerError::IllegalState)?;
+                }
+                return Ok(path);
+            }
+        }
+        let directory = self.ensureOutputDirectory(chatId)?;
+        crate::ChatOutputStore::ChatOutputStore::new(crate::RuntimeStorageHost::defaultRuntimeStorageHost()).prepare(chatId)
+            .map_err(ChatHistoryManagerError::IllegalState)?;
+        Ok(directory)
     }
 
     /// Counts all stored chats.
@@ -767,11 +805,43 @@ impl ChatHistoryManager {
         Ok(())
     }
 
+    /// Detaches a conversation from its parent and publishes the canonical metadata change.
+    pub fn promoteChatToRoot(&self, chatId: String) -> ChatHistoryManagerResult<()> {
+        if !self.chatExists(chatId.clone())? {
+            return Err(ChatHistoryManagerError::IllegalArgument(format!(
+                "Chat does not exist: {chatId}"
+            )));
+        }
+        self.ensureOutputDirectory(&chatId)?;
+        self.chatDao.promoteChatToRoot(&chatId, currentTimeMillis())?;
+        self.recordChatMetadata(&chatId)?;
+        Ok(())
+    }
+
+    /// Keeps relative references bound to their saved message revision in every write path.
+    fn bindMessageFileContext(&self, chatId: &str, messageToPersist: &mut ChatMessage) -> ChatHistoryManagerResult<()> {
+        let timestamp = messageToPersist.timestamp;
+        let variantIndex = messageToPersist.selectedVariantIndex;
+        let oldParts = self.database.messagePartDao().getPartsForMessage(chatId, timestamp, variantIndex)?;
+        let oldContext = oldParts.iter().find(|part| part.attributes.contains_key("file_base_path"));
+        let base = oldContext.and_then(|p| p.attributes.get("file_base_path")).cloned()
+            .map(Ok).unwrap_or_else(|| self.fileDirectoryForChat(chatId))?;
+        let node = oldContext.and_then(|p| p.attributes.get("file_node_id")).cloned()
+            .or_else(|| crate::CoreNodeIdentityStore::CoreNodeIdentityStore::localNodeId());
+        for part in &mut messageToPersist.parts {
+            if matches!(part.kind, operit_model::MessagePart::MessagePartKind::Markdown | operit_model::MessagePart::MessagePartKind::Thinking) {
+                part.attributes.entry("file_base_path".into()).or_insert_with(|| base.clone());
+                if let Some(node) = &node { part.attributes.entry("file_node_id".into()).or_insert_with(|| node.clone()); }
+            }
+        }
+        Ok(())
+    }
+
     /// Persists message metadata, revision parts, chat ordering, and sync state atomically.
     fn persistMessageLocked(
         &self,
         chatId: &str,
-        messageToPersist: ChatMessage,
+        mut messageToPersist: ChatMessage,
     ) -> ChatHistoryManagerResult<ChatMessage> {
         if messageToPersist.selectedVariantIndex < 0 {
             return Err(ChatHistoryManagerError::IllegalArgument(
@@ -780,6 +850,7 @@ impl ChatHistoryManager {
         }
         let timestamp = messageToPersist.timestamp;
         let variantIndex = messageToPersist.selectedVariantIndex;
+        self.bindMessageFileContext(chatId, &mut messageToPersist)?;
         let updatedAt = currentTimeMillis();
         self.syncStore.mutateMessage(chatId, timestamp, |transaction| {
             let existing = transaction.queryOne(
@@ -1060,7 +1131,7 @@ impl ChatHistoryManager {
     pub fn commitAssistantMessageSegment(
         &self,
         chatId: String,
-        message: ChatMessage,
+        mut message: ChatMessage,
         chatMetrics: Option<(i64, i64, i64)>,
     ) -> ChatHistoryManagerResult<crate::SyncOperationStore::SyncClock> {
         if message.sender != "ai" {
@@ -1091,6 +1162,7 @@ impl ChatHistoryManager {
             chat.outputTokens = outputTokens;
             chat.currentWindowSize = currentWindowSize;
         }
+        self.bindMessageFileContext(&chatId, &mut message)?;
         let timestamp = message.timestamp;
         let parts = message.parts.clone();
         let messageEntity = MessageEntity::fromChatMessage(
@@ -1283,6 +1355,10 @@ impl ChatHistoryManager {
 
     /// Deletes a chat when deletion policy allows it.
     pub fn deleteChatHistory(&self, chatId: String) -> ChatHistoryManagerResult<bool> {
+        // Freeze child bindings before removing the row from which they inherit.
+        for child in self.chatDao.getAllChatsDirectly()?.iter().filter(|chat| chat.parentChatId.as_deref() == Some(&chatId)) {
+            self.ensureOutputDirectory(&child.id)?;
+        }
         if !self.syncStore.deleteChat(&chatId)? {
             return Ok(false);
         }
@@ -1323,6 +1399,11 @@ impl ChatHistoryManager {
         source: Option<(&str, Option<i64>)>,
     ) -> ChatHistoryManagerResult<ChatHistory> {
         self.syncStore.commitChatDraft(&draft, source)?;
+        let inherited = draft.parentChatId.as_deref().or_else(|| source.map(|(id, _)| id));
+        let directory = inherited.map(|id| self.ensureOutputDirectory(id)).transpose()?;
+        crate::ChatOutputStore::ChatOutputStore::new(crate::RuntimeStorageHost::defaultRuntimeStorageHost())
+            .bind(&draft.id, draft.createdAt.parse().map_err(|_| ChatHistoryManagerError::IllegalArgument("Invalid creation time".into()))?, directory.as_deref())
+            .map_err(ChatHistoryManagerError::IllegalState)?;
         self.createBinding(&draft.id)?;
         self.loadChatHistory(draft.id.clone())?.ok_or_else(|| {
             ChatHistoryManagerError::IllegalState("Committed draft chat was not found".to_string())

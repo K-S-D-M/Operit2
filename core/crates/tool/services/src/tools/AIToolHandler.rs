@@ -184,7 +184,7 @@ impl AIToolHandler {
         let relative = path
             .strip_prefix("runtime/")
             .ok_or("Configuration is outside runtime storage")?;
-        PathMapper::joinVfsPath("/app/data", relative)
+        PathMapper::joinVfsPath("/operitapp/data", relative)
     }
 
     /// Creates persistent local plugin data through the filesystem Host and returns its public VFS path.
@@ -198,7 +198,7 @@ impl AIToolHandler {
             .makeDirectory(&directory.to_string_lossy(), true)
             .map_err(|error| error.to_string())?;
         let relative = path.strip_prefix("runtime/").ok_or("Local plugin data is outside runtime storage")?;
-        PathMapper::joinVfsPath("/app/data", relative)
+        PathMapper::joinVfsPath("/operitapp/data", relative)
     }
 
     fn truncateLogValue(value: &str, maxChars: usize) -> String {
@@ -832,7 +832,9 @@ impl AIToolHandler {
         let context = self.getContext();
         for packageTool in executableTools {
             let toolName = format!("{}:{}", toolPackage.name, packageTool.name);
-            if isMcpPackage {
+            if crate::tools::a2a::A2ARepository::is_a2a_package(&toolPackage) {
+                self.registerAsyncTool(toolName, Box::new(crate::tools::a2a::A2AToolExecutor::A2AToolExecutor::new(context.clone())));
+            } else if isMcpPackage {
                 self.registerAsyncTool(
                     toolName,
                     Box::new(MCPToolExecutor::new(MCPManager::getInstance(
@@ -1032,8 +1034,10 @@ impl AIToolHandler {
             "Runtime storage Host does not expose its workspace root".to_string()
         ))?;
         let mapper = PathMapper::new(runtimeRoot, workspaceRoot, storage.clone());
+        let path = PathMapper::resolveFileToolPath(runtimeContext.workspacePath.as_deref(), path)
+            .map_err(WorkspaceBoundaryError::InvalidRequest)?;
         let resolvedPath = mapper
-            .resolve(path)
+            .resolve(&path)
             .map_err(WorkspaceBoundaryError::InvalidRequest)?;
         for folder in &workspaceFolders {
             let resolvedWorkspace = mapper
@@ -1222,6 +1226,17 @@ impl JsExecutionHost for AIToolHandler {
         let mut host = self.clone();
         host.invocationSnapshot = ToolInvocationContext::capture(self.clone()).snapshot();
         Arc::new(host)
+    }
+
+    /// Exposes only this invocation's captured identity; role interpretation belongs to the v1 adapter.
+    fn toolpkg_caller_context(&self) -> Option<Value> {
+        Some(
+            self.invocationSnapshot.turnSnapshot.as_ref().map(|context| json!({
+                "chatId": context.callerChatId,
+                "participantId": context.callerParticipantId,
+                "extensionOwner": context.extensionOwner,
+            })).unwrap_or_else(|| json!({})),
+        )
     }
 
     /// Authenticates the actual registered container before binding an immutable per-engine owner.
@@ -1481,7 +1496,7 @@ impl JsExecutionHost for AIToolHandler {
         let relative = path
             .strip_prefix("runtime/")
             .ok_or("Configuration is outside runtime storage")?;
-        PathMapper::joinVfsPath("/app/data", relative)
+        PathMapper::joinVfsPath("/operitapp/data", relative)
     }
 
     /// Resolves the executing package owner while keeping arbitrary configuration aliases supported.
@@ -1969,11 +1984,11 @@ mod tests {
         for scope_path in ["device/example/cache.sqlite", "space/example/memory.sqlite"] {
             let relative = format!("plugin_data/{scope_path}");
             let expected = format!("runtime/{relative}");
-            for path in [format!("/app/data/{relative}"), expected.clone(), format!("storage-root/runtime/{relative}")] {
+            for path in [format!("/operitapp/data/{relative}"), expected.clone(), format!("storage-root/runtime/{relative}")] {
                 assert_eq!(crate::tools::defaultTool::standard::StandardStorageTools::resolve_plugin_storage_path(&path, &roots).unwrap(), expected);
             }
         }
-        for path in ["/app/workspaces/example/cache.sqlite", "/app/data/../../escape.sqlite", "storage-root/other/cache.sqlite", "/app/database/cache.sqlite"] {
+        for path in ["/operitapp/workspaces/example/cache.sqlite", "/operitapp/data/../../escape.sqlite", "storage-root/other/cache.sqlite", "/operitapp/database/cache.sqlite"] {
             assert!(crate::tools::defaultTool::standard::StandardStorageTools::resolve_plugin_storage_path(path, &roots).is_err(), "{path}");
         }
     }
@@ -2562,6 +2577,26 @@ mod tests {
         assert_eq!(approvals.load(Ordering::SeqCst), 1);
     }
 
+    /// Neutral SDK identity survives native scheduling without exposing provider execution data.
+    #[tokio::test]
+    async fn sdk_caller_identity_uses_captured_native_turn() {
+        let fixture = PipelineFixture::new();
+        let turn = ToolRuntimeContext {
+            callerChatId: Some("summary-chat".into()), callerParticipantId: Some("opaque-participant".into()),
+            workspacePath: None, workspaceFolders: Vec::new(), toolExposureMode: ToolExposureMode::CLI,
+            extensionOwner: "independent.configuration.provider".into(),
+            executionData: serde_json::from_value(json!({"private":"provider-only"})).unwrap(),
+        };
+        let host = ToolExecutionManager::scopeToolRuntimeContext(turn, async {
+            fixture.handler.capture_tool_invocation_host()
+        }).await;
+        assert_eq!(host.toolpkg_caller_context(), Some(json!({
+            "chatId":"summary-chat", "participantId":"opaque-participant",
+            "extensionOwner":"independent.configuration.provider",
+        })));
+        assert_eq!(fixture.handler.capture_tool_invocation_host().toolpkg_caller_context(), Some(json!({})));
+    }
+
     /// A captured AI turn must not promote direct JS requests into AI admission.
     #[tokio::test]
     async fn js_tools_in_ai_turn_skip_all_lifecycle_and_permissions() {
@@ -3024,7 +3059,7 @@ mod tests {
     fn fullModeDoesNotRequireRuntimeWorkspaceForFilePaths() {
         let result = AIToolHandler::checkWorkspaceBoundary(
             &AiPermissionMode::Full,
-            &pathTool("/mnt/android/sdcard"),
+            &pathTool("/virtual/android/sdcard"),
             &filePathAccessSpec(ToolEffect::READ),
             None,
         );
@@ -3037,13 +3072,13 @@ mod tests {
     fn workspaceScopedModesAllowExternalFileReadsWithoutRuntimeWorkspace() {
         let readOnlyResult = AIToolHandler::checkWorkspaceBoundary(
             &AiPermissionMode::ReadOnly,
-            &pathTool("/mnt/android/sdcard"),
+            &pathTool("/virtual/android/sdcard"),
             &filePathAccessSpec(ToolEffect::READ),
             None,
         );
         let workspaceWriteResult = AIToolHandler::checkWorkspaceBoundary(
             &AiPermissionMode::WorkspaceWrite,
-            &pathTool("/mnt/android/sdcard"),
+            &pathTool("/virtual/android/sdcard"),
             &filePathAccessSpec(ToolEffect::READ),
             None,
         );
@@ -3057,7 +3092,7 @@ mod tests {
     fn workspaceWriteRequiresRuntimeWorkspaceForFileWrites() {
         let result = AIToolHandler::checkWorkspaceBoundary(
             &AiPermissionMode::WorkspaceWrite,
-            &pathTool("/mnt/android/sdcard"),
+            &pathTool("/virtual/android/sdcard"),
             &filePathAccessSpec(ToolEffect::WRITE),
             None,
         );

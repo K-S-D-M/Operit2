@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentInfo {
     pub filePath: String,
+    /// Stable VFS locator paired with the host path used by local media processors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vfsPath: Option<String>,
     /// The CoreNode holding this file; absent for inline content and legacy attachments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodeId: Option<String>,
@@ -16,6 +19,7 @@ impl AttachmentInfo {
     pub fn new(filePath: String, fileName: String, mimeType: String, fileSize: i64) -> Self {
         Self {
             filePath,
+            vfsPath: None,
             nodeId: None,
             fileName,
             mimeType,
@@ -26,17 +30,7 @@ impl AttachmentInfo {
     /// File tools use the same VFS path even when device storage roots differ.
     /// Keep the original host path for local previews and direct media processing.
     pub fn fileToolPath(&self) -> String {
-        let normalized = self.filePath.replace('\\', "/");
-        if let Some((_, relative)) = normalized.rsplit_once("/data/chat_attachments/") {
-            if !relative.is_empty()
-                && relative
-                    .split('/')
-                    .all(|part| !part.is_empty() && part != "." && part != "..")
-            {
-                return format!("/app/data/data/chat_attachments/{relative}");
-            }
-        }
-        self.filePath.clone()
+        self.vfsPath.as_ref().unwrap_or(&self.filePath).clone()
     }
 
     /// Never read a known remote attachment through the current node's file host.
@@ -83,17 +77,25 @@ mod tests {
     }
 
     #[test]
+    fn vfs_attachment_addresses_are_not_rewritten_as_host_paths() {
+        for root in ["/app", "/operitapp", "/mnt", "/virtual"] {
+            let path = format!("{root}/data/data/chat_attachments/chat-a/file.pdf");
+            let attachment = AttachmentInfo::new(path.clone(), "file.pdf".into(), "application/pdf".into(), 3);
+            assert_eq!(attachment.fileToolPath(), path);
+        }
+    }
+
+    #[test]
     fn persistent_file_tool_paths_are_portable_without_changing_host_paths() {
         for path in [
             "/device-b/runtime/data/chat_attachments/chat-a/attachment-a/file.pdf",
             r"C:\runtime\data\chat_attachments\chat-a\attachment-a\file.pdf",
         ] {
-            let attachment =
+            let mut attachment =
                 AttachmentInfo::new(path.into(), "file.pdf".into(), "application/pdf".into(), 3);
-            assert_eq!(
-                attachment.fileToolPath(),
-                "/app/data/data/chat_attachments/chat-a/attachment-a/file.pdf"
-            );
+            assert_eq!(attachment.fileToolPath(), path, "a native path must never invent a VFS locator");
+            attachment.vfsPath = Some("/operitapp/outputs/family/.operit/attachments/id/file.pdf".into());
+            assert_eq!(attachment.fileToolPath(), attachment.vfsPath.as_deref().unwrap());
             assert_eq!(attachment.filePath, path);
         }
         let attachment = AttachmentInfo::new(

@@ -72,6 +72,9 @@ The existing generator appends the handwritten adapters to `js_tools.js` after
 emitting the canonical v2 bindings. Both inline and modular engine bootstrap paths
 therefore install the same code. Adapters capture the canonical functions before
 installing versioned entry points, so v1 cannot recursively invoke itself.
+The generated `Tools` script also owns the internal v1 runtime implementation.
+The engine bootstrap installs that implementation after creating `toolCall`;
+it must not append the runtime source a second time.
 
 ### Global object alias
 
@@ -108,13 +111,13 @@ All functions in the copied v1 `Files` namespace have signature adapters:
 Environment interpretation follows the old API, not the OS running Operit2:
 
 - Omitted environment means the documented v1 `android` environment.
-- Linux absolute paths map to `/mnt/linux`.
+- Linux absolute paths map to `/virtual/linux`.
 - Android `/sdcard` and `/data` use the existing VFS roots.
 - `/storage/emulated/0` maps to `/sdcard`.
-- `/app` and `/mnt` paths returned by current resource/config APIs remain VFS paths.
+- `/operitapp` and `/virtual` paths returned by current resource/config APIs remain VFS paths.
 - Unmapped Android roots and unsupported environment names are explicit errors.
 
-The conditional `v1_runtime` package executes the supported Linux file operations
+The SDK-internal v1 compatibility layer executes the supported Linux file operations
 in the same terminal filesystem used by legacy commands. Other VFS addresses are
 handled by the existing host/VFS implementation. The adapter does not create
 mounts, emulate Android/Linux filesystems, or bypass
@@ -150,6 +153,14 @@ client and provider capability limits. No historical database migration is impli
 API 2.0.0 exposes `getCallerParticipantId()` consistently in the runtime and
 current declarations. Its value belongs to the authenticated configuration
 provider and is not a runtime-wide character-card identity.
+
+`getChatId()` and `getCallerParticipantId()` use the native caller snapshot for
+both API generations, including prompt and summary hooks. Capturing identity
+before scheduling prevents a later chat selection from changing an invocation.
+Summary hooks also receive `chatId` and `metadata.executionContext` for the
+explicit chat being summarized. Outside an AI turn, an event can still carry a
+target chat, but it does not acquire an execution participant. The platform only
+transports neutral identity; character-provider interpretation stays in v1.
 
 For API 1.0.0 and 1.0.1, `getCallerCardId()` projects the execution participant
 only when the authenticated owner is `com.operit.character_cards`. A call without
@@ -196,22 +207,25 @@ Role/model configuration and memory-profile binding adapters are not installed.
 ### Terminal and runtime script packages
 
 `compat/v1/runtime.js` installs after the public structured `toolCall` bridge.
-It uses the existing per-call API dispatcher and the built-in `v1_runtime` script
-package. Rust selects the package state using its host condition capabilities;
+Its implementation is embedded from `compat/v1/internal_runtime.js` inside the
+Rust SDK runtime. It is not a ToolPkg, is not listed in package management, and
+is not a prerequisite of any package. Rust selects the compatibility state using
+its host condition capabilities;
 `platform.ohos` is exposed alongside the other platform booleans.
 
 | Package state | Legacy terminal | Node tool | Package commands |
 | --- | --- | --- | --- |
 | Windows | Existing Git Bash host (`bash`) | Existing PowerShell host | Native; no APK shim |
 | Linux | Native Bash | Native Bash | Native; no APK shim |
-| macOS | Native Bash | Native Bash | Native; no APK shim |
+| macOS | Native Bash / Zsh | Native Bash / Zsh | Native; no APK shim |
 | Android | Existing proot Bash | Existing proot Bash | Explicit apt/apt-get to APK mapping |
 | iOS | Existing iSH shell | Existing iSH shell | Explicit apt/apt-get to APK mapping |
 | OHOS | Existing QEMU-vroot shell | Existing QEMU-vroot shell | Explicit apt/apt-get to APK mapping |
 | Web | Existing Buildroot V86 shell | Existing Buildroot V86 shell | Native; no APK shim |
 
 For API 1.0.0 and 1.0.1, `Tools.System.terminal.create/exec` dispatch to that
-package. These exact historical tool identities also dispatch there:
+internal compatibility layer. These exact historical tool identities also
+dispatch there:
 
 - `super_admin:terminal`
 - `code_runner:run_javascript_node`
@@ -221,8 +235,8 @@ package. These exact historical tool identities also dispatch there:
 The existing v1 runtime adapter also translates the executing container's old
 `/data/user/0/com.ai.assistance.operit/files/toolpkg_cache/<package>-*` namespace
 (and the `/data/data` spelling). Concrete hexadecimal cache suffixes are accepted.
-It reads the already extracted `/app/data/cache/toolpkg` tree through canonical
-Files APIs and imports it through `v1_runtime:file` into the terminal's existing
+It reads the already extracted `/operitapp/data/cache/toolpkg` tree through canonical
+Files APIs and imports it through the internal compatibility file adapter into the terminal's existing
 `/tmp/operit-v1/toolpkg` directory. File calls using these legacy addresses and
 terminal commands then access that same copy. No host bindings or mounts are added.
 

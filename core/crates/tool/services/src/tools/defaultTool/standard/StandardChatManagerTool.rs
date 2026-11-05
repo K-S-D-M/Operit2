@@ -56,6 +56,7 @@ pub enum ChatManagerToolOperation {
     UpdateChatGroup,
     UpdateChatPinned,
     UpdateChatLocked,
+    PromoteChatToRoot,
     ReorderChats,
     DeleteChat,
     SendMessageToAi,
@@ -334,6 +335,26 @@ impl StandardChatManagerTool {
                 }),
             ),
             Err(error) => toolError(tool, format!("Error updating chat title: {error}")),
+        }
+    }
+
+    /// Clears only the parent relationship through the canonical history repository.
+    #[allow(non_snake_case)]
+    pub fn promoteChatToRoot(&self, tool: &AITool) -> ToolResult {
+        if let Err(error) = validateChatParameterNames(tool, &["chat_id"]) {
+            return toolError(tool, error);
+        }
+        let chatId = parameterValue(tool, "chat_id");
+        if let Err(error) = requireExactIdentifier(&chatId) {
+            return toolError(tool, error);
+        }
+        let manager = match ChatHistoryManager::default() {
+            Ok(manager) => manager,
+            Err(error) => return toolError(tool, error.to_string()),
+        };
+        match manager.promoteChatToRoot(chatId) {
+            Ok(()) => successData(tool, stringResultData("Conversation promoted to root".to_string())),
+            Err(error) => toolError(tool, error.to_string()),
         }
     }
 
@@ -754,6 +775,7 @@ impl AsyncToolExecutor for ChatManagerToolExecutor {
             | ChatManagerToolOperation::UpdateChatGroup
             | ChatManagerToolOperation::UpdateChatPinned
             | ChatManagerToolOperation::UpdateChatLocked
+            | ChatManagerToolOperation::PromoteChatToRoot
             | ChatManagerToolOperation::ReorderChats
             | ChatManagerToolOperation::DeleteChat
             | ChatManagerToolOperation::SendMessageToAi
@@ -793,6 +815,7 @@ impl AsyncToolExecutor for ChatManagerToolExecutor {
                             ChatManagerToolOperation::UpdateChatGroup => tools.updateChatGroup(&tool),
                             ChatManagerToolOperation::UpdateChatPinned => tools.updateChatFlag(&tool, true),
                             ChatManagerToolOperation::UpdateChatLocked => tools.updateChatFlag(&tool, false),
+                            ChatManagerToolOperation::PromoteChatToRoot => tools.promoteChatToRoot(&tool),
                             ChatManagerToolOperation::ReorderChats => tools.reorderChats(&tool),
                             ChatManagerToolOperation::DeleteChat => tools.deleteChat(&tool),
                             ChatManagerToolOperation::SendMessageToAi => tools.sendMessageToAi(&tool).await,
@@ -844,6 +867,7 @@ fn validateChatTool(operation: ChatManagerToolOperation, tool: &AITool) -> ToolV
         | ChatManagerToolOperation::UpdateChatTitle
         | ChatManagerToolOperation::UpdateChatPinned
         | ChatManagerToolOperation::UpdateChatLocked
+        | ChatManagerToolOperation::PromoteChatToRoot
         | ChatManagerToolOperation::DeleteChat
         | ChatManagerToolOperation::GetChatMessages => {
             if parameterValue(tool, "chat_id").trim().is_empty() {
@@ -1261,6 +1285,7 @@ fn parseSendAttachments(tool: &AITool) -> Result<Vec<AttachmentInfo>, String> {
             let records: Vec<ChatSendAttachment> = serde_json::from_str(&value)
                 .map_err(|error| format!("attachments must be a complete attachment array: {error}"))?;
             Ok(records.into_iter().map(|record| AttachmentInfo {
+                vfsPath: record.vfsPath.as_value().cloned(),
                 filePath: record.filePath, nodeId: record.nodeId.as_value().cloned(), fileName: record.fileName,
                 mimeType: record.mimeType, fileSize: record.fileSize, content: record.content,
             }).collect())
@@ -1295,6 +1320,7 @@ fn parseTurnOptions(tool: &AITool) -> Result<ChatTurnOptions, String> {
         disableWarning: match parseOptionalBoolean(tool, "disable_warning")? { Some(value) => value, None => false },
         continuation: parseContinuation(tool)?,
         chatInputSubmitRequestedHandled: false,
+        chatInputSubmittedHandled: false,
         nativeExecutionId: None,
         outputObserver: None,
         deferSequenceCompletion: false,

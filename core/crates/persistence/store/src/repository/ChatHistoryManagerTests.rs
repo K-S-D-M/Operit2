@@ -57,7 +57,7 @@ fn workspaceMetadataFixture(name: &str) -> (ChatHistoryManager, Arc<AppDatabase>
         name: "Project".to_string(),
         folders: vec![WorkspaceFolder {
             name: "project".to_string(),
-            path: "/app/workspaces/project".to_string(),
+            path: "/operitapp/workspaces/project".to_string(),
         }],
         createdAt: 1,
         updatedAt: 1,
@@ -96,19 +96,19 @@ fn workspace_preferences_refresh_chat_metadata_without_sql_changes() {
     assert_eq!(arrived.workspaceName.as_deref(), Some("Project"));
     assert_eq!(
         arrived.workspacePrimaryPath.as_deref(),
-        Some("/app/workspaces/project")
+        Some("/operitapp/workspaces/project")
     );
     assert_eq!(arrived, manager.loadChatHistories().unwrap().remove(0));
 
     workspace.name = "Renamed project".to_string();
-    workspace.folders[0].path = "/app/workspaces/renamed".to_string();
+    workspace.folders[0].path = "/operitapp/workspaces/renamed".to_string();
     workspace.updatedAt = 2;
     manager.workspaceStore.upsert(workspace).unwrap();
     let renamed = receiveWorkspaceChat(&receiver);
     assert_eq!(renamed.workspaceName.as_deref(), Some("Renamed project"));
     assert_eq!(
         renamed.workspacePrimaryPath.as_deref(),
-        Some("/app/workspaces/renamed")
+        Some("/operitapp/workspaces/renamed")
     );
     assert_eq!(renamed, manager.loadChatHistories().unwrap().remove(0));
     assert_eq!(
@@ -499,6 +499,50 @@ fn chatOrderFixture(name: &str) -> (ChatHistoryManager, Arc<AppDatabase>) {
         database.chatDao().insertChat(chat).unwrap();
     }
     (manager, database)
+}
+
+/// Detaches one branch while retaining its messages, descendants, and all other metadata.
+#[test]
+fn promote_chat_to_root_preserves_contents_and_publishes_metadata() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = chatOrderFixture("promote-chat-to-root");
+    database.store().execute(
+        "UPDATE chats SET parentChatId = 'pinned', workspaceId = 'workspace', locked = 1, pinned = 1, \"group\" = 'folder' WHERE id = 'recent'",
+        sqliteParams![],
+    ).unwrap();
+    database.store().execute(
+        "UPDATE chats SET parentChatId = 'recent' WHERE id = 'older'",
+        sqliteParams![],
+    ).unwrap();
+    manager.addMessage("recent".to_string(), ChatMessage::new_with_markdown_timestamp(
+        "user".to_string(), "retained message".to_string(), 100,
+    )).unwrap();
+    let mut expected = database.chatDao().getChatById("recent").unwrap().unwrap();
+    let parent = database.chatDao().getChatById("pinned").unwrap();
+    let child = database.chatDao().getChatById("older").unwrap();
+    let messages = manager.loadChatMessages("recent").unwrap();
+    let clock = manager.syncClock().unwrap();
+    let histories = manager.chatHistoriesFlow().unwrap();
+
+    manager.promoteChatToRoot("recent".to_string()).unwrap();
+
+    let promoted = database.chatDao().getChatById("recent").unwrap().unwrap();
+    expected.parentChatId = None;
+    expected.updatedAt = promoted.updatedAt;
+    assert_eq!(promoted, expected);
+    assert_eq!(database.chatDao().getChatById("pinned").unwrap(), parent);
+    assert_eq!(database.chatDao().getChatById("older").unwrap(), child);
+    assert_eq!(manager.loadChatMessages("recent").unwrap(), messages);
+    assert!(manager.getBranches("pinned".to_string()).unwrap().is_empty());
+    assert_eq!(manager.getBranches("recent".to_string()).unwrap()[0].id, "older");
+    assert_eq!(histories.value().into_iter().find(|chat| chat.id == "recent").unwrap().parentChatId, None);
+    assert_ne!(manager.syncClock().unwrap(), clock);
+    let synced: i64 = database.store().queryScalar(
+        "SELECT COUNT(*) FROM sync_sql_chat_rows WHERE id = 'recent' AND parentChatId IS NULL",
+        sqliteParams![],
+    ).unwrap();
+    assert_eq!(synced, 1);
+    assert!(manager.promoteChatToRoot("missing".to_string()).is_err());
 }
 
 /// Verifies canonical chat persistence using real SQLite-backed repository operations.

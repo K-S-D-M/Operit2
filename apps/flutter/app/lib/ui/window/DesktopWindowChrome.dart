@@ -167,23 +167,40 @@ class DesktopContentPanel extends StatelessWidget {
 
   final Widget child;
 
+  static const EdgeInsets margin = EdgeInsets.fromLTRB(0, 6, 8, 8);
+  static const double borderWidth = 1;
+
+  /// Aligns neighboring navigation with the actual interior of the panel.
+  static EdgeInsets get contentInsets => usesDesktopWindowChrome
+      ? margin + const EdgeInsets.all(borderWidth)
+      : EdgeInsets.zero;
+
   @override
   Widget build(BuildContext context) {
     if (!usesDesktopWindowChrome) return child;
     const radius = BorderRadius.all(Radius.circular(14));
     return Padding(
-      padding: const EdgeInsets.fromLTRB(0, 6, 8, 8),
+      padding: margin,
       child: DecoratedBox(
         decoration: BoxDecoration(
           borderRadius: radius,
           border: Border.all(
+            width: borderWidth,
             color: Theme.of(
               context,
             ).colorScheme.outlineVariant.withValues(alpha: 0.45),
           ),
         ),
-        position: DecorationPosition.foreground,
-        child: ClipRRect(borderRadius: radius, child: child),
+        // AppKit excludes Flutter foreground paint bounds from native hit
+        // testing, including the empty interior of a stroked border. Paint the
+        // frame below the platform view and expose it through a one-pixel inset.
+        child: Padding(
+          padding: const EdgeInsets.all(borderWidth),
+          child: ClipRRect(
+            borderRadius: const BorderRadius.all(Radius.circular(13)),
+            child: child,
+          ),
+        ),
       ),
     );
   }

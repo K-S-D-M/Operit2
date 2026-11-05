@@ -20,9 +20,34 @@ operit-edge-sdk = { path = "../../sdk", features = ["space"] }
 
 `device`、`contract`、`proxy`、`host`、`link`、`runtime`、`storage` 为共享实现的命名入口。产品首先使用 SDK 装配接口；底层模块用于需要精细配置的场景。内部子 crate 继续复用 Core 的协议、存储与权限实现，避免维护两套配对协议。
 
+普通产品使用 `SpaceDevice::assemble`；该方法同步初始化 Space。ESP32 固件将这一步放在
+受限的 Host 后台任务栈执行，并保留失败重试，因此使用上述底层命名入口装配共享服务。
+模拟器保留分阶段初始化与相同的资源限制。调整装配方式时必须同时验证任务栈与堆预算，
+不能只以普通桌面进程启动成功作为依据。
+
+网络 `PeerListener::localAddress()` 返回 `Option<String>`，网络监听器必须返回实际绑定
+地址，串口等非网络传输可以返回 `None`。自动端口应读取持久化配置中的实际端口；不要
+在客户端写死 `8765`。需要生成连接码时，Host 还须实现 `ServiceDiscoveryHost::localAddresses`，
+该查询独立于 mDNS 广播和浏览。ESP32 当前支持广播及活动 Wi-Fi IPv4 地址查询，不提供
+主动浏览其他设备的功能。连接码仍须经过验证码确认和独立的 Space 审批。
+
+从仓库根目录执行 SDK 测试和依赖检查：
+
 ```sh
-cargo test --manifest-path edge/sdk/Cargo.toml --workspace --all-features
+cargo test --locked --manifest-path edge/sdk/Cargo.toml --workspace --all-features
 python3 edge/tools/check-sdk-dependencies.py
+# 依次检查默认、每个可选功能及所有功能组合。
 ```
+
+Windows PowerShell 可将第二条命令替换为：
+
+```powershell
+python -X utf8 edge/tools/check-sdk-dependencies.py
+```
+
+依赖脚本分别检查默认、`space`、`http-agent` 和 `scene` 的正常及构建依赖，
+确认默认入口没有外部依赖，并阻止完整 Core、SQL 和模型引擎等依赖进入设备侧。
+这些检查覆盖 SDK 测试和依赖边界；ESP32 产品的堆栈预算、固件和端到端场景使用
+[Edge 首页](../README.md)中的产品验收入口。
 
 这不是 `no_std` SDK。启用空间接入需要 Rust `std`、持久化、熵源和异步 Host；ESP32 产品使用 ESP-IDF。默认零依赖不意味着启用网络与认证也零成本。见 [厂商指南](../docs/manufacturer-guide.md)。

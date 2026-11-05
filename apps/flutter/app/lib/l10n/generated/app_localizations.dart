@@ -98,6 +98,12 @@ abstract class AppLocalizations {
     Locale('zh'),
   ];
 
+  /// No description provided for @chatPromoteToRoot.
+  ///
+  /// In en, this message translates to:
+  /// **'Promote to main conversation'**
+  String get chatPromoteToRoot;
+
   /// No description provided for @workspaceUnsavedChangesTitle.
   ///
   /// In en, this message translates to:
@@ -8033,8 +8039,20 @@ abstract class AppLocalizations {
   /// No description provided for @peerQrTrustHint.
   ///
   /// In en, this message translates to:
-  /// **'The code shares connection addresses only. Pairing still requires the code shown on the other device; joining a space still requires approval.'**
+  /// **'This QR code is valid for 5 minutes. Share it only with trusted devices. Confirming joins directly; this device automatically approves when it has administrator approval permissions.'**
   String get peerQrTrustHint;
+
+  /// No description provided for @peerQrConfirmJoin.
+  ///
+  /// In en, this message translates to:
+  /// **'Confirm join'**
+  String get peerQrConfirmJoin;
+
+  /// No description provided for @peerQrConfirmJoinHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Join this device’s space? Confirm to connect and submit the join request without entering a pairing code.'**
+  String get peerQrConfirmJoinHint;
 
   /// No description provided for @peerQrListenerRequired.
   ///

@@ -1,34 +1,23 @@
-/**
- * Installs the existing v1 dispatch family over the conditional runtime script package.
- * @param {Record<string, any>} runtime
- */
+/** Installs the v1 compatibility surface as an SDK-internal adapter. */
 function __operitInstallV1Runtime(runtime) {
     var api = runtime.__operitToolPkgApi;
     var canonical = runtime.__operitCanonicalTools;
     var originalToolCall = runtime.toolCall;
+    var internal = runtime.__operitV1InternalRuntime;
+    if (!internal) throw new Error('Internal V1 runtime implementation is unavailable');
+    runtime.__operitV1CanonicalTools = canonical;
     var routes = Object.freeze({
-        'super_admin:terminal': 'v1_runtime:terminal',
-        'code_runner:run_javascript_node': 'v1_runtime:run_javascript_node',
-        'ffmpeg:ffmpeg_execute': 'v1_runtime:ffmpeg_execute',
-        'ffmpeg:ffmpeg_info': 'v1_runtime:ffmpeg_info',
+        'super_admin:terminal': 'terminal',
+        'code_runner:run_javascript_node': 'run_javascript_node',
+        'ffmpeg:ffmpeg_execute': 'ffmpeg_execute',
+        'ffmpeg:ffmpeg_info': 'ffmpeg_info',
     });
 
-    /** Decodes the script-package executor's JSON text without hiding provider failures.
-     * @param {unknown} value
-     * @returns {any}
-     */
-    function decoded(value) {
-        if (typeof value !== 'string') throw new TypeError('V1 runtime package must return serialized JSON');
-        return JSON.parse(value);
-    }
-
-    /** Calls one exact runtime tool through the original structured host transport.
-     * @param {string} method
-     * @param {Record<string, any>} params
-     * @returns {Promise<any>}
-     */
+    /** Calls the internal implementation without publishing a package tool identity. */
     function invoke(method, params) {
-        return originalToolCall('v1_runtime:' + method, params).then(decoded);
+        var implementation = internal[method];
+        if (typeof implementation !== 'function') throw new Error('Unknown internal V1 runtime method: ' + method);
+        return Promise.resolve().then(function() { return implementation(params || {}); });
     }
 
     // Both legacy file calls and shell commands use this existing managed filesystem.
@@ -48,7 +37,7 @@ function __operitInstallV1Runtime(runtime) {
         var directory = owner + '-' + (hash >>> 0).toString(16);
         var escaped = owner.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         return {
-            source: '/app/data/cache/toolpkg/' + directory,
+            source: '/operitapp/data/cache/toolpkg/' + directory,
             destination: '/tmp/operit-v1/toolpkg/' + directory,
             pattern: new RegExp('/data/(?:user/0|data)/com\\.ai\\.assistance\\.operit/files/toolpkg_cache/' +
                 escaped + '-(?:\\*|[a-fA-F0-9]+)(?=/|$|[\\s\\x22\\x27;|&<>)])', 'g')
@@ -136,18 +125,15 @@ function __operitInstallV1Runtime(runtime) {
         }
         if (type === 'default' && Object.prototype.hasOwnProperty.call(routes, name)) {
             var target = routes[/** @type {keyof typeof routes} */ (name)];
-            if (args[0] !== null && typeof args[0] === 'object') rewritten[0] = Object.assign({}, args[0], { name: target });
-            else rewritten[index] = target;
+            var objectCall = args[0] !== null && typeof args[0] === 'object';
+            var parameters = objectCall ? (args[0].params || {}) : (args[index + 1] || {});
             if (name === 'super_admin:terminal') {
-                var objectCall = args[0] !== null && typeof args[0] === 'object';
-                var parameters = objectCall ? args[0].params : args[index + 1];
                 if (parameters && typeof parameters.command === 'string') {
                     var mapped = Object.assign({}, parameters, { command: await cachePath(parameters.command) });
-                    if (objectCall) rewritten[0].params = mapped;
-                    else rewritten[index + 1] = mapped;
+                    parameters = mapped;
                 }
             }
-            return originalToolCall.apply(runtime, rewritten).then(decoded);
+            return invoke(target, parameters);
         }
         return originalToolCall.apply(runtime, args);
     }
@@ -198,14 +184,14 @@ function __operitInstallV1Runtime(runtime) {
      * @param {unknown} path
      * @returns {path is string}
      */
-    function isLinux(path) { return typeof path === 'string' && (path === '/mnt/linux' || path.startsWith('/mnt/linux/')); }
+    function isLinux(path) { return typeof path === 'string' && (path === '/virtual/linux' || path.startsWith('/virtual/linux/') || path === '/mnt/linux' || path.startsWith('/mnt/linux/')); }
 
     /** Converts one explicit Linux VFS address into the selected runtime's absolute path.
      * @param {string} path
      */
     function linuxPath(path) {
         if (!isLinux(path)) throw new Error('V1 runtime file operation requires a Linux VFS address');
-        var suffix = path.slice('/mnt/linux'.length);
+        var suffix = path.slice(path.startsWith('/virtual/linux') ? '/virtual/linux'.length : '/mnt/linux'.length);
         return suffix === '' ? '/' : suffix;
     }
 
@@ -216,7 +202,7 @@ function __operitInstallV1Runtime(runtime) {
      */
     async function file(operation, args) {
         var value = await invoke('file', { operation: operation, args: args });
-        value.path = '/mnt/linux' + (value.path === '/' ? '' : value.path);
+        value.path = '/virtual/linux' + (value.path === '/' ? '' : value.path);
         // The managed runtime returns a flat receipt; the canonical text-write contract wraps it.
         if (operation === 'write') return { operation: value, aiDiffInstructions: '' };
         return value;
@@ -235,12 +221,12 @@ function __operitInstallV1Runtime(runtime) {
                 var originalPath = path;
                 var mappedPath = await cachePath(path);
                 if (mappedPath !== path) {
-                    path = '/mnt/linux' + mappedPath;
+                    path = '/virtual/linux' + mappedPath;
                     args[0] = typeof args[0] === 'object' ? Object.assign({}, args[0], { path: path }) : path;
                 }
                 if (['move', 'copy', 'unzip'].includes(name)) {
                     var mappedDestination = await cachePath(args[1]);
-                    if (mappedDestination !== args[1]) args[1] = '/mnt/linux' + mappedDestination;
+                    if (mappedDestination !== args[1]) args[1] = '/virtual/linux' + mappedDestination;
                 }
                 var sourceLinux = isLinux(path);
                 var hasDestination = name === 'move' || name === 'copy' || name === 'unzip';

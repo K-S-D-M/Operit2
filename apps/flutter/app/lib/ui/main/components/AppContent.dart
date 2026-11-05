@@ -138,8 +138,7 @@ class _AppContentState extends State<AppContent> {
 
   /// Resolves the page identity used by both caching and snapshot ownership.
   String get _currentScreenKey {
-    return widget.currentScreen.stableScreenKey() ??
-        widget.currentRouteEntry.instanceId;
+    return widget.currentScreen.pageKey(widget.currentRouteEntry);
   }
 
   /// Retains each page widget independently of its visibility in the stack.
@@ -269,14 +268,11 @@ class _AppContentState extends State<AppContent> {
               builder: (context, _) {
                 final titleContent = widget.topBarController.titleContent;
                 final actions = widget.topBarController.actions;
-                final showNavigationIcon = widget.canGoBack ||
-                    !widget.useTabletLayout ||
-                    !widget.isTabletSidebarExpanded;
                 final navigationIcon = widget.canGoBack
                     ? Icons.arrow_back
-                    : showNavigationIcon
-                    ? Icons.segment
-                    : null;
+                    : widget.useTabletLayout
+                    ? null
+                    : Icons.segment;
                 final shouldFlipNavigationIcon =
                     !widget.canGoBack && !widget.useTabletLayout;
                 return ThemeTopBarChrome(
@@ -287,9 +283,7 @@ class _AppContentState extends State<AppContent> {
                         contentColor: appBarContentColor,
                       ),
                   navigationIcon: navigationIcon,
-                  navigationTooltip: widget.canGoBack
-                      ? 'Back'
-                      : 'Navigation',
+                  navigationTooltip: widget.canGoBack ? 'Back' : 'Navigation',
                   onNavigationPressed: widget.canGoBack
                       ? widget.onGoBack
                       : widget.onNavigationButtonPressed,

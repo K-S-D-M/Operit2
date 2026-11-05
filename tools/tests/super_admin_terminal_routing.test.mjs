@@ -42,7 +42,7 @@ function fixture({ platform = 'android', defaultType = 'bash', implementations =
   };
   const context = vm.createContext({
     exports: {},
-    OPERIT_CLEAN_ON_EXIT_DIR: '/app/data/temp/clean_on_exit',
+    OPERIT_CLEAN_ON_EXIT_DIR: '/operitapp/data/temp/clean_on_exit',
     /** Supplies the active chat identity without a platform-dependent branch. */
     getChatId() { return chatId; },
     console: {
@@ -187,9 +187,30 @@ test('Windows tools explicitly select PowerShell and Git Bash with separate sess
   assert.notEqual(powershell.sessionId, bash.sessionId);
 });
 
+/** Exercises the advertised macOS tools and keeps ARM64 shell sessions separate from native shells. */
+test('macOS advertises shell and routes it to ARM64 alongside native Bash and Zsh', async () => {
+  const metadata = JSON.parse(source('plugins/packages/buildin/super_admin.ts').match(/\/\* METADATA\s*([\s\S]*?)\*\//)[1]);
+  const macos = metadata.states.find(state => state.id === 'macos');
+  assert.equal(macos.condition, 'platform.macos');
+  assert.equal(macos.inheritTools, true);
+  assert.deepEqual(macos.tools.map(tool => tool.name).sort(), ['bash', 'shell', 'zsh']);
+  const f = fixture({ platform: 'macos', defaultType: 'zsh', implementations: { bash: 'native', zsh: 'native', shell: 'arm64' } });
+  const sessions = new Set();
+  for (const tool of macos.tools) {
+    const result = await f.tools[tool.name]({ command: 'pwd' });
+    assertEnvironment(result, 'macos', tool.name === 'shell' ? 'arm64' : 'native', tool.name);
+    sessions.add(result.sessionId);
+  }
+  assert.equal(sessions.size, 3);
+  const first = await f.tools.shell({ command: 'cd /tmp' });
+  const second = await f.tools.shell({ command: 'pwd' });
+  assert.equal(first.sessionId, second.sessionId);
+  assertEnvironment(second, 'macos', 'arm64', 'shell');
+});
+
 /** Ensures shell-only hosts use their advertised interpreter without plugin platform branches. */
 test('shell-only hosts keep their configured backend and report the selected environment', async () => {
-  for (const [platform, terminal] of [['ios', 'ish'], ['ohos', 'qemu-vroot'], ['web', 'v86']]) {
+  for (const [platform, terminal] of [['ios', 'arm64'], ['ohos', 'qemu-vroot'], ['web', 'v86']]) {
     const f = fixture({ platform, defaultType: 'shell', implementations: { shell: terminal } });
     const result = await f.tools.shell({ command: 'pwd' });
     assertEnvironment(result, platform, terminal, 'shell');
@@ -198,6 +219,28 @@ test('shell-only hosts keep their configured backend and report the selected env
     const f = fixture({ platform, implementations: { bash: 'native' } });
     assertEnvironment(await f.tools.bash({ command: 'pwd' }), platform, 'native', 'bash');
   }
+});
+
+test('terminal descriptions match platform backends and explain workspace-independent paths', async () => {
+  const metadata = JSON.parse(source('plugins/packages/buildin/super_admin.ts').match(/\/\* METADATA\s*([\s\S]*?)\*\//)[1]);
+  for (const language of ['zh', 'en']) {
+    assert.match(metadata.description[language], /VFS/);
+    assert.match(metadata.description[language], language === 'zh' ? /未绑定/ : /without one/);
+    assert.match(metadata.description[language], language === 'zh' ? /失败会报错/ : /reports failures/);
+  }
+  const state = id => metadata.states.find(item => item.id === id);
+  const tool = (id, name) => state(id).tools.find(item => item.name === name);
+  assert.match(tool('ios', 'shell').description.en, /ARM64 Linux/);
+  assert.doesNotMatch(tool('ios', 'shell').description.en, /iSH/);
+  assert.match(tool('android', 'shell').description.en, /not adb shell privileges/);
+  assert.match(tool('android', 'bash').description.en, /proot Linux/);
+  assert.match(tool('web', 'shell').description.en, /not a host terminal/);
+  assert.equal(state('ohos').condition, 'platform.ohos');
+  assert.equal(state('ohos').inheritTools, true);
+  assert.match(tool('ohos', 'shell').description.en, /QEMU-vroot/);
+  assert.match(tool('ohos', 'shell').description.en, /cannot be selected/);
+  const f = fixture({ platform: 'ohos', defaultType: 'shell', implementations: { shell: 'qemu-vroot' } });
+  assertEnvironment(await f.tools[tool('ohos', 'shell').name]({ command: 'pwd' }), 'ohos', 'qemu-vroot', 'shell');
 });
 
 /** Ensures timeout handling preserves interpreter identity and the reusable chat session. */
