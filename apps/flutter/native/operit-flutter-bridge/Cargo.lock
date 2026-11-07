@@ -2163,10 +2163,12 @@ dependencies = [
  "axum",
  "base64",
  "console_error_panic_hook",
+ "fs2",
  "futures-util",
  "hmac",
  "jni",
  "js-sys",
+ "libc",
  "mdns-sd",
  "operit-core-application",
  "operit-data-rescue",
@@ -2596,6 +2598,7 @@ dependencies = [
  "operit-plugin-sdk-codegen",
  "operit-plugin-sdk-macros",
  "operit-plugin-theme",
+ "operit-util",
  "regex",
  "serde",
  "serde_bytes",
@@ -2671,6 +2674,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "getrandom 0.2.17",
+ "http",
  "json5",
  "operit-host-api",
  "operit-link",
@@ -2680,7 +2684,6 @@ dependencies = [
  "operit-tools",
  "operit-util",
  "regex",
- "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -2787,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "operit-runtime"
-version = "2.0.0-preview.26"
+version = "2.0.0-preview.28"
 dependencies = [
  "aes",
  "async-trait",

@@ -278,6 +278,7 @@ class _MarketPaneState extends State<MarketPane> {
     );
   }
 
+  /// Keeps action labels only when the filter row has room for the tabs.
   Widget _buildFilterBar(BuildContext context, {required bool searching}) {
     final kind = _kind;
     return LayoutBuilder(
@@ -286,6 +287,11 @@ class _MarketPaneState extends State<MarketPane> {
           constraints.maxWidth,
           gutter: constraints.maxWidth < 600 ? 16 : 24,
         );
+        final showSort = kind != null && !searching;
+        final compactActions =
+            showSort &&
+            constraints.maxWidth - padding.horizontal <
+                600 * storeTextScale(context);
         return Padding(
           padding: EdgeInsets.fromLTRB(padding.left, 8, padding.right, 8),
           child: Row(
@@ -316,13 +322,14 @@ class _MarketPaneState extends State<MarketPane> {
                   ),
                 ),
               ),
-              if (kind != null && !searching)
+              if (showSort)
                 MarketSortMenu(
                   sort: _kindSort,
+                  compact: compactActions,
                   onChanged: (sort) => setState(() => _kindSort = sort),
                 ),
               const SizedBox(width: 4),
-              _CreatorEntry(account: _account),
+              _CreatorEntry(account: _account, compact: compactActions),
             ],
           ),
         );
@@ -436,24 +443,17 @@ class _MarketPaneState extends State<MarketPane> {
                   _section(
                     padding: padding,
                     title: '按分类浏览',
-                    child: Wrap(
-                      spacing: 10,
-                      runSpacing: 10,
-                      children: <Widget>[
-                        for (final category in _categories)
-                          _CategoryTile(
-                            category: category,
-                            onTap: () => openMarketBrowse(
-                              heading: marketCategoryText(
-                                category,
-                                languageCode: Localizations.localeOf(
-                                  context,
-                                ).languageCode,
-                              ).name,
-                              categoryId: category.id,
-                            ),
-                          ),
-                      ],
+                    child: _CategoryGrid(
+                      categories: _categories,
+                      onTap: (category) => openMarketBrowse(
+                        heading: marketCategoryText(
+                          category,
+                          languageCode: Localizations.localeOf(
+                            context,
+                          ).languageCode,
+                        ).name,
+                        categoryId: category.id,
+                      ),
                     ),
                   ),
               ],
@@ -853,6 +853,55 @@ class _FeaturedCarouselState extends State<_FeaturedCarousel> {
   }
 }
 
+/// Shares each row's available width, including an incomplete final row.
+class _CategoryGrid extends StatelessWidget {
+  const _CategoryGrid({required this.categories, required this.onTap});
+
+  final List<core_proxy.MarketCategoryInfo> categories;
+  final ValueChanged<core_proxy.MarketCategoryInfo> onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    if (categories.isEmpty) return const SizedBox.shrink();
+    final textScale = storeTextScale(context);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        const spacing = 10.0;
+        final columns = math.min(
+          categories.length,
+          math.max(1, (constraints.maxWidth / (176 * textScale)).round()),
+        );
+        return Column(
+          children: <Widget>[
+            for (var start = 0; start < categories.length; start += columns)
+              Padding(
+                padding: EdgeInsets.only(top: start == 0 ? 0 : spacing),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    for (
+                      var index = start;
+                      index < math.min(start + columns, categories.length);
+                      index++
+                    ) ...<Widget>[
+                      if (index > start) const SizedBox(width: spacing),
+                      Expanded(
+                        child: _CategoryTile(
+                          category: categories[index],
+                          onTap: () => onTap(categories[index]),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}
+
 /// Category in its own tonal colors, its first character as quiet artwork.
 class _CategoryTile extends StatelessWidget {
   const _CategoryTile({required this.category, required this.onTap});
@@ -875,11 +924,7 @@ class _CategoryTile extends StatelessWidget {
     );
     final description = text.description;
     return ConstrainedBox(
-      constraints: const BoxConstraints(
-        minWidth: 176,
-        maxWidth: 176,
-        minHeight: 80,
-      ),
+      constraints: BoxConstraints(minHeight: 80 * storeTextScale(context)),
       child: DecoratedBox(
         decoration: BoxDecoration(
           borderRadius: storeCardRadius,
@@ -988,26 +1033,32 @@ class _HomeSkeleton extends StatelessWidget {
 
 /// Way into the creator center; wears the signed-in GitHub profile picture.
 class _CreatorEntry extends StatelessWidget {
-  const _CreatorEntry({required this.account});
+  const _CreatorEntry({required this.account, required this.compact});
 
   final GitHubAccountState account;
+  final bool compact;
 
+  /// Keeps the account avatar and accessible label in either presentation.
   @override
   Widget build(BuildContext context) {
     final user = account.user;
+    final icon = user != null
+        ? StoreAvatar(name: user.login, url: user.avatarUrl, radius: 10)
+        : const Icon(Icons.badge_outlined, size: 18);
+    if (compact) {
+      return IconButton(
+        tooltip: '创作者中心',
+        onPressed: openMarketCreator,
+        color: Theme.of(context).colorScheme.primary,
+        icon: icon,
+      );
+    }
     return TextButton(
       onPressed: openMarketCreator,
       style: SettingsControlStyles.sectionTextButton(),
       child: Row(
         mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          if (user != null)
-            StoreAvatar(name: user.login, url: user.avatarUrl, radius: 10)
-          else
-            const Icon(Icons.badge_outlined, size: 18),
-          const SizedBox(width: 6),
-          const Text('创作者中心'),
-        ],
+        children: <Widget>[icon, const SizedBox(width: 6), const Text('创作者中心')],
       ),
     );
   }

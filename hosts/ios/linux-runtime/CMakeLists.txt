@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(OperitArm64Runtime VERSION 0.1.0 LANGUAGES C CXX ASM)
 
+option(OPERIT_ARM64_WASM "Enable the Apple WebKit Wasm execution backend" OFF)
+
 option(OPERIT_EXECUTION_DIAGNOSTICS "Collect static executor handler, path and sampled cursor diagnostics" OFF)
 
 option(OPERIT_ARM64_LTO "Optimize Release builds across execution compiler module boundaries" ON)
@@ -44,6 +46,8 @@ add_library(operit_arm64 STATIC
     src/cpu/aarch64/memory_effects.cpp
     src/cpu/aarch64/optimizer.cpp
     src/cpu/aarch64/static_lowering.cpp
+    src/cpu/aarch64/wasm_region.cpp
+    src/cpu/aarch64/wasm_executor.cpp
     src/cpu/aarch64/execution_engine.cpp
     src/cpu/aarch64/execution_diagnostics.cpp
     src/cpu/aarch64/static_executor.S
@@ -160,8 +164,16 @@ add_library(operit_arm64 STATIC
     src/runtime/tasks/executor.cpp
 )
 target_compile_definitions(operit_arm64 PUBLIC OPERIT_EXECUTION_DIAGNOSTICS=$<BOOL:${OPERIT_EXECUTION_DIAGNOSTICS}>)
+target_compile_definitions(operit_arm64 PRIVATE OPERIT_ARM64_WASM=$<BOOL:${OPERIT_ARM64_WASM}>)
 target_compile_features(operit_arm64 PRIVATE cxx_std_17)
 target_include_directories(operit_arm64 PUBLIC include PRIVATE src "${OPERIT_EXECUTOR_GENERATED}")
+if(APPLE AND OPERIT_ARM64_WASM)
+    enable_language(OBJCXX)
+    target_sources(operit_arm64 PRIVATE src/cpu/aarch64/wasm_webkit.mm)
+    set_source_files_properties(src/cpu/aarch64/wasm_webkit.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc" COMPILE_FLAGS "-std=c++17")
+    target_compile_definitions(operit_arm64 PRIVATE OPERIT_WASM_WEBKIT=1)
+    target_link_libraries(operit_arm64 PRIVATE "-framework Foundation" "-framework WebKit")
+endif()
 target_compile_options(operit_arm64 PRIVATE -Wall -Wextra -Werror)
 set_target_properties(operit_arm64 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 find_package(Threads REQUIRED)
@@ -179,6 +191,17 @@ endif()
 
 option(BUILD_TESTING "Build runtime regression tests" ON)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    if(APPLE AND OPERIT_ARM64_WASM)
+        add_library(operit-wasm-cli OBJECT cli/main.cpp)
+        target_compile_features(operit-wasm-cli PRIVATE cxx_std_17)
+        target_include_directories(operit-wasm-cli PRIVATE include)
+        target_compile_definitions(operit-wasm-cli PRIVATE main=operit_wasm_cli_main)
+        add_executable(operit-arm64-wasm tools/wasm_region/integration.mm $<TARGET_OBJECTS:operit-wasm-cli>)
+        target_compile_features(operit-arm64-wasm PRIVATE cxx_std_17)
+        target_include_directories(operit-arm64-wasm PRIVATE src)
+        target_compile_options(operit-arm64-wasm PRIVATE -fobjc-arc)
+        target_link_libraries(operit-arm64-wasm PRIVATE operit_arm64 "-framework Cocoa")
+    endif()
     add_executable(operit-arm64 cli/main.cpp)
     target_compile_features(operit-arm64 PRIVATE cxx_std_17)
     target_link_libraries(operit-arm64 PRIVATE operit_arm64)
@@ -190,6 +213,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_compile_options(operit-arm64-execution-bench PRIVATE -Wall -Wextra -Werror)
     include(CTest)
     if(BUILD_TESTING)
+        if(APPLE AND OPERIT_ARM64_WASM)
+            add_test(NAME arm64-wasm COMMAND operit-arm64-wasm)
+            set_tests_properties(arm64-wasm PROPERTIES TIMEOUT 60)
+        endif()
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         function(add_runtime_test target source test_name)
             add_executable(${target} ${source})
@@ -219,6 +246,12 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_runtime_test(operit-arm64-execution-tests tests/execution_backend.cpp arm64-execution)
         add_runtime_test(operit-arm64-memory-code-validation-tests tests/memory_code_validation.cpp arm64-memory-code-validation)
         add_runtime_test(operit-arm64-filesystem-tests tests/filesystem.cpp arm64-filesystem)
+        if(APPLE)
+            add_test(NAME arm64-bind-sandbox
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bind_sandbox.py"
+                --fixture "$<TARGET_FILE:operit-arm64-filesystem-tests>")
+            set_tests_properties(arm64-bind-sandbox PROPERTIES TIMEOUT 30)
+        endif()
         add_runtime_test(operit-arm64-vfs-tests tests/virtual_filesystem.cpp arm64-virtual-filesystem)
         add_runtime_test(operit-arm64-inotify-tests tests/inotify.cpp arm64-inotify)
         add_runtime_test(operit-arm64-network-tests tests/network.cpp arm64-network)

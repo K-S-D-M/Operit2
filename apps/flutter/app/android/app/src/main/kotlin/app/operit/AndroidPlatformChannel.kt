@@ -8,7 +8,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.os.PowerManager
 import android.os.Process
 import android.provider.Settings
@@ -25,6 +24,7 @@ class AndroidPlatformChannel(
     private val activity: MainActivity,
     private val runtimeHost: AndroidRuntimeHost,
 ) {
+    private val storageAccess = AndroidStorageAccess(activity)
     private var pendingPermissionResult: MethodChannel.Result? = null
     private var pendingShizukuAuthorizationResult: MethodChannel.Result? = null
     private var pendingShizukuAuthorizationListener: Shizuku.OnRequestPermissionResultListener? = null
@@ -229,6 +229,22 @@ class AndroidPlatformChannel(
     private fun setLocalRuntimeStorage(call: MethodCall, result: MethodChannel.Result) {
         val runtimeRoot = call.argument<String>("runtimeRoot")
         val workspaceRoot = call.argument<String>("workspaceRoot")
+        try {
+            require(!runtimeRoot.isNullOrBlank() && !workspaceRoot.isNullOrBlank()) { "Storage roots are required" }
+            storageAccess.ensureRoots(runtimeRoot, workspaceRoot) { granted ->
+                if (granted) {
+                    applyLocalRuntimeStorage(runtimeRoot, workspaceRoot, result)
+                } else {
+                    result.error("STORAGE_PERMISSION_REQUIRED", "请授予文件管理权限后，再确认存储目录。", null)
+                }
+            }
+        } catch (error: Throwable) {
+            result.error("RUNTIME_STORAGE_SET_ERROR", error.message, null)
+        }
+    }
+
+    /** Applies roots after the required storage authorization has completed. */
+    private fun applyLocalRuntimeStorage(runtimeRoot: String, workspaceRoot: String, result: MethodChannel.Result) {
         runtimeHost.runBackground {
             try {
                 runtimeHost.setStorageRoots(runtimeRoot, workspaceRoot)
@@ -282,7 +298,7 @@ class AndroidPlatformChannel(
         return mapOf(
             "android.fileManagement" to requirement(
                 "android.fileManagement",
-                hasFileManagementPermission(),
+                activity.isExternalRuntime || storageAccess.isGranted(),
             ),
             "android.notifications" to requirement(
                 "android.notifications",
@@ -311,18 +327,22 @@ class AndroidPlatformChannel(
             "android.overlay" to requirement("android.overlay", canDrawOverlays()),
             "android.batteryOptimization" to requirement(
                 "android.batteryOptimization",
-                isIgnoringBatteryOptimizations(),
+                activity.isExternalRuntime || isIgnoringBatteryOptimizations(),
             ),
-            "android.shizuku" to shizukuAuthorizationRequirement(),
+            "android.shizuku" to if (activity.isExternalRuntime) requirement("android.shizuku", true) else shizukuAuthorizationRequirement(),
             "android.root" to requirement(
                 "android.root",
-                AndroidPrivilegeAuthorization.isRootAuthorized(activity),
+                activity.isExternalRuntime || AndroidPrivilegeAuthorization.isRootAuthorized(activity),
             ),
         )
     }
 
     /** Routes an Android onboarding authorization request to its native implementation. */
     private fun onboardingRequestPermission(call: MethodCall, result: MethodChannel.Result) {
+        if (activity.isExternalRuntime && call.argument<String>("requirementId") in MODULE_GRANTED_REQUIREMENTS) {
+            result.success(null)
+            return
+        }
         when (call.argument<String>("requirementId")) {
             "android.fileManagement" -> requestFileManagementPermission(result)
             "android.notifications" -> requestNotificationPermission(result)
@@ -458,27 +478,15 @@ class AndroidPlatformChannel(
 
     /** Requests broad shared-storage access for Android file tools. */
     private fun requestFileManagementPermission(result: MethodChannel.Result) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val intent =
-                Intent(
-                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                    Uri.parse("package:${activity.packageName}"),
-                )
-            activity.startActivity(intent)
-            result.success(null)
-            return
+        try {
+            storageAccess.request { result.success(null) }
+        } catch (error: Throwable) {
+            result.error("STORAGE_PERMISSION_REQUEST_ERROR", error.message, null)
         }
-        val permissions =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
-            } else {
-                arrayOf(
-                    Manifest.permission.READ_EXTERNAL_STORAGE,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE,
-                )
-            }
-        requestRuntimePermissions(permissions, result)
     }
+
+    /** Routes settings completion to the pending install or file-management permission slot. */
+    fun onActivityResult(requestCode: Int): Boolean = storageAccess.onActivityResult(requestCode)
 
     /** Requests notification posting access required by Android task status surfaces. */
     private fun requestNotificationPermission(result: MethodChannel.Result) {
@@ -499,6 +507,7 @@ class AndroidPlatformChannel(
         permissions: Array<out String>,
         grantResults: IntArray,
     ): Boolean {
+        if (storageAccess.onRequestPermissionsResult(requestCode)) return true
         if (requestCode != ONBOARDING_PERMISSION_REQUEST_CODE) {
             return false
         }
@@ -593,18 +602,6 @@ class AndroidPlatformChannel(
         return hasPermission(Manifest.permission.BLUETOOTH_SCAN)
     }
 
-    /** Returns whether Android shared-storage access is available to file tools. */
-    private fun hasFileManagementPermission(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            return Environment.isExternalStorageManager()
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            return hasPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
-        }
-        return hasPermission(Manifest.permission.READ_EXTERNAL_STORAGE) &&
-            hasPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-    }
-
     /** Returns whether Android notification posting access is available. */
     private fun hasNotificationPermission(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
@@ -688,6 +685,9 @@ class AndroidPlatformChannel(
     }
 
     private companion object {
+        private val MODULE_GRANTED_REQUIREMENTS = setOf(
+            "android.fileManagement", "android.root", "android.shizuku", "android.batteryOptimization",
+        )
         private const val ONBOARDING_PERMISSION_REQUEST_CODE = 2407
         private const val SHIZUKU_PERMISSION_REQUEST_CODE = 2408
         private const val ROOT_AUTHORIZATION_TIMEOUT_MS = 30_000L
