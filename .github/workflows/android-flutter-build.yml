@@ -328,6 +328,15 @@ jobs:
           }
           Write-Host "TypeScript and pnpm dependencies prepared"
 
+      # build.rs 读取 assets/plugins/{buildin,external} 来生成内嵌 ToolPkg 归档；
+      # 这两个目录被 .gitignore 忽略，必须由 sync_plugin_packages.py 在构建前生成。
+      # 缺少时 build.rs 会 panic：package example has no embedded archive。
+      - name: Sync plugin package assets
+        shell: pwsh
+        run: |
+          python plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload
+          if ($LASTEXITCODE -ne 0) { throw "sync_plugin_packages.py failed" }
+
       - name: Build and package Android app
         shell: pwsh
         run: |
