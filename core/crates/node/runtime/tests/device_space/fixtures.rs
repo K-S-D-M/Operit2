@@ -10,6 +10,7 @@ fn approvalService(node: &str) -> (CoreNodeRouter, RuntimeRemoteLinkService) {
         .spaceStore
         .writeLocalDeviceProfile(node.into(), "test".into(), "test".into(), "1".into(), Some(incarnation))
         .unwrap();
+    router.spaceStore.writeLocalProtocol(crate::PeerProtocol::VERSION).unwrap();
     router.networkControlStore.initializeCurrentSpace().unwrap();
     let service =
         RuntimeRemoteLinkService::newWithRouter((*router.localCore).clone(), router.clone());
@@ -116,14 +117,14 @@ impl RuntimePeerService for ApprovalMeshPeer {
         if !self.active.lock().unwrap().contains(node) {
             return CoreCallResponse::err(
                 id,
-                CoreLinkError::new("TEST_OFFLINE", "Offline mesh link"),
+                CoreLinkError::new("PEER_LINK_CLOSED", "Offline mesh link"),
             );
         }
         let fault = self.faults.lock().unwrap().remove(&method);
         if matches!(fault, Some(CallFault::BeforeDelivery)) {
             return CoreCallResponse::err(
                 id,
-                CoreLinkError::new("TEST_BEFORE_DELIVERY", "Request not delivered"),
+                CoreLinkError::new("PEER_SEND_FAILED", "Request not delivered"),
             );
         }
         if matches!(fault, Some(CallFault::MethodDenied)) {
@@ -140,7 +141,7 @@ impl RuntimePeerService for ApprovalMeshPeer {
         match fault {
             Some(CallFault::AfterDelivery) => CoreCallResponse::err(
                 id,
-                CoreLinkError::new("TEST_LOST_RESPONSE", "Receiver committed; response lost"),
+                CoreLinkError::new("PEER_RESPONSE_CLOSED", "Receiver committed; response lost"),
             ),
             Some(CallFault::PausedResponse { arrived, release }) => {
                 arrived

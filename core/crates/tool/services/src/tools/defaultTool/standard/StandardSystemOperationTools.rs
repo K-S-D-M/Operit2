@@ -208,6 +208,9 @@ impl StandardSystemOperationTools {
         if packageName.is_empty() {
             return toolError(tool, "Must provide package_name parameter".to_string());
         }
+        if parseBoolean(optionalParameterValue(tool, "keep_data").as_deref()) {
+            return toolError(tool, "This host contract cannot guarantee keep_data. Use the platform/vendor uninstaller's data retention option.".to_string());
+        }
         match self.host().and_then(|host| host.uninstallApp(&packageName)) {
             Ok(data) => toolSuccessData(
                 tool,
@@ -244,7 +247,13 @@ impl StandardSystemOperationTools {
         if packageName.is_empty() {
             return toolError(tool, "Must provide package_name parameter".to_string());
         }
-        match self.host().and_then(|host| host.startApp(&packageName)) {
+        let activity = optionalParameterValue(tool, "activity");
+        match self.host().and_then(|host| {
+            host.startAppWithActivity(
+                &packageName,
+                activity.as_deref().filter(|value| !value.is_empty()),
+            )
+        }) {
             Ok(data) => toolSuccessData(
                 tool,
                 ToolResultData::AppOperationData(appOperationData(data)),
@@ -604,6 +613,7 @@ fn systemSettingData(data: HostSystemSettingData) -> SystemSettingData {
 #[allow(non_snake_case)]
 fn appOperationData(data: HostAppOperationData) -> AppOperationData {
     AppOperationData {
+        installState: data.installState.map(|state| state.as_str().to_string()),
         operationType: data.operationType,
         packageName: data.packageName,
         success: data.success,
@@ -708,7 +718,7 @@ fn systemSettingDataToString(data: &SystemSettingData) -> String {
 fn appOperationDataToString(data: &AppOperationData) -> String {
     match data.operationType.as_str() {
         "install" => format!(
-            "Successfully installed app: {} {}",
+            "App installation request: {} {}",
             data.packageName, data.details
         ),
         "uninstall" => format!(

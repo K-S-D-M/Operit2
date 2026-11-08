@@ -1,3 +1,6 @@
+use crate::core::application::ApplicationUpdate::{
+    ApplicationUpdateInfo, ApplicationUpdateInstallResult, ApplicationUpdateProgress,
+};
 use crate::data::backup::CharacterPluginMigration::{
     isRetiredCharacterOperation, isRetiredCharacterPreferenceKey,
 };
@@ -125,6 +128,7 @@ pub struct OperitApplication {
     pub toolPkgBridgeRuntime: ToolPkgBridgeRuntime,
     pub providerRuntimeContext: ProviderRuntimeContext,
     pub initialized: bool,
+    pub(super) applicationUpdate: super::ApplicationUpdate::ApplicationUpdateManager,
     extensionChanges: Option<operit_store::SyncAppliedChanges::SyncAppliedSubscription>,
     hostRuntimeEventRegistration: Option<Arc<Mutex<Box<dyn HostRuntimeEventRegistration>>>>,
 }
@@ -251,6 +255,7 @@ impl OperitApplication {
             .try_lock()
             .expect("new chat runtime holder must be unlocked") = initializedChatRuntimeHolder;
         Self {
+            applicationUpdate: super::ApplicationUpdate::ApplicationUpdateManager::new(),
             appStartupTimeMs: 0,
             hostManager,
             chatRuntimeHolder,
@@ -269,6 +274,7 @@ impl OperitApplication {
     #[allow(non_snake_case)]
     pub fn sharedCoreCommandRuntime(&self) -> Self {
         Self {
+            applicationUpdate: self.applicationUpdate.clone(),
             appStartupTimeMs: self.appStartupTimeMs,
             hostManager: self.hostManager.clone(),
             chatRuntimeHolder: self.chatRuntimeHolder.clone(),
@@ -836,6 +842,42 @@ impl OperitApplication {
         }
     }
 
+    /// Checks the installed client using shared Rust release/channel/target rules.
+    pub fn checkApplicationUpdate(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<ApplicationUpdateInfo>, String>> + 'static {
+        let manager = self.applicationUpdate.clone();
+        async move { manager.check().await }
+    }
+
+    /// Observes host download progress without exposing URLs or native file paths.
+    pub fn applicationUpdateProgressFlow(&self) -> StateFlow<ApplicationUpdateProgress> {
+        self.applicationUpdate.progress()
+    }
+
+    /// Downloads the selected release and returns an opaque native receipt.
+    pub fn downloadApplicationUpdate(
+        &self,
+        version: String,
+    ) -> impl std::future::Future<Output = Result<String, String>> + 'static {
+        let manager = self.applicationUpdate.clone();
+        async move { manager.download(version).await }
+    }
+
+    pub fn cancelApplicationUpdateDownload(&self) {
+        self.applicationUpdate.cancel();
+    }
+
+    /// Resolves the receipt inside core and calls the existing install_app pipeline.
+    pub fn installApplicationUpdate(
+        &self,
+        receipt: String,
+    ) -> impl std::future::Future<Output = Result<ApplicationUpdateInstallResult, String>> + 'static {
+        let manager = self.applicationUpdate.clone();
+        let tools = self.toolHandler.clone();
+        async move { manager.install(receipt, tools).await }
+    }
+
     /// Returns the Cargo package version compiled into the runtime crate.
     #[allow(non_snake_case)]
     pub fn coreVersion(&self) -> String {
@@ -958,7 +1000,7 @@ impl OperitApplication {
         }
         let mut result = serde_json::to_value(receipt).map_err(|error| error.to_string())?;
         result["protocolVersion"] = serde_json::json!(1);
-        result["consistencyVersion"] = serde_json::json!(6);
+        result["consistencyVersion"] = serde_json::json!(7);
         result["stateSummary"] = serde_json::json!(format!("digest:{summary}"));
         result["pending"] = serde_json::json!(pending.len());
         result["pendingOperationIds"] = serde_json::json!(pending.into_iter().map(|op|op.opId).collect::<Vec<_>>());
@@ -1225,7 +1267,7 @@ impl OperitApplication {
         })).map_err(|error| error.to_string())
     }
 
-    /// Verifies a page of local blobs, retaining each file's independent failure.
+    /// Checks local blob presence without reading contents, retaining independent failures.
     /// Keep the per-file Result envelopes in JSON: nested Results are not proxyable return types.
     #[allow(non_snake_case)]
     pub fn syncBlobExists(&self, references: serde_json::Value) -> Result<serde_json::Value, String> {

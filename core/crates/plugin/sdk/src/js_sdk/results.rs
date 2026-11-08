@@ -976,6 +976,9 @@ pub struct SystemSettingData {
 #[derive(Clone, Serialize, Deserialize)]
 /// Reports the outcome of installing, uninstalling, starting, or stopping an application package.
 pub struct AppOperationData {
+    /// permission_required, installer_opened, restart_required, or completed.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "installState")]
+    pub installState: Option<String>,
     #[serde(rename = "operationType")]
     pub operationType: String,
     #[serde(rename = "packageName")]
@@ -1573,7 +1576,7 @@ pub struct TerminalCommandResultData {
     ///Actual terminal type used for execution
     #[serde(rename = "terminalType")]
     pub terminalType: TerminalType,
-    ///Whether this execution ended due to timeout. On timeout, the current command is cancelled and the terminal session is kept.
+    ///Whether foreground waiting expired while the original command continues in its session.
     #[serde(rename = "timedOut")]
     pub timedOut: bool,
 }
@@ -2231,25 +2234,25 @@ impl AppOperationData {
         match self.operationType.as_str() {
             "install" => {
                 format!(
-                    "Successfully installed app: {} {}",
+                    "App installation request: {} {}",
                     self.packageName, self.details
                 )
             }
             "uninstall" => {
                 format!(
-                    "Successfully uninstalled app: {} {}",
+                    "App uninstall request: {} {}",
                     self.packageName, self.details
                 )
             }
             "start" => {
                 format!(
-                    "Successfully started app: {} {}",
+                    "App launch request: {} {}",
                     self.packageName, self.details
                 )
             }
             "stop" => {
                 format!(
-                    "Successfully stopped app: {} {}",
+                    "App stop request: {} {}",
                     self.packageName, self.details
                 )
             }
@@ -2515,7 +2518,7 @@ impl TerminalCommandResultData {
         sb.push_str(&format!("Terminal Type: {}\n", self.terminalType));
         sb.push_str(&format!("Exit Code: {}\n", self.exitCode));
         if self.timedOut {
-            sb.push_str("Timed Out: true\n");
+            sb.push_str("Background: true\nCommand is still running and was not canceled. The next command uses a new available session. Use Tools.System.terminal.wait(sessionId, 20000), Tools.System.terminal.screen(sessionId), Tools.System.terminal.input(sessionId, options), or Tools.System.terminal.close(sessionId) to manage this session.\n");
         }
         sb.push_str("\nOutput:\n");
         sb.push_str(&self.output);
@@ -3055,6 +3058,7 @@ pub struct EdgePortResultData {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TerminalObservationResultData {
+    Run { result: TerminalCommandResultData },
     Open { handle: String },
     Next { event: JsNullable<super::system::TerminalExecEvent> },
     Close {},

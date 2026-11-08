@@ -464,6 +464,9 @@ interface LinuxVmSession {
   progressVisible: boolean;
   activeCommand: LinuxVmCommand | null;
   pendingCommands: LinuxVmCommand[];
+  managedExecution: { output: number[]; result: LinuxVmCommandResult | null; error: string | null } | null;
+  screen: number[];
+  workingDir: string;
 }
 
 interface LinuxVmCommandResult {
@@ -3456,13 +3459,16 @@ self.onmessage = (event) => {
     return session;
   }
 
-  /** Adds bytes to one session's terminal output buffer without dropping data. */
+  /** Retains bounded output tails independently for the renderer and screen snapshots. */
   function appendLinuxVmOutput(session: LinuxVmSession, bytes: Uint8Array): void {
-    const requiredLength = session.outputLength + bytes.length;
-    if (requiredLength > linuxVmOutputLimit) {
-      failLinuxVmSession(session, new Error("Linux VM terminal output exceeded 4 MiB"));
-      return;
+    for (const byte of bytes) session.screen.push(byte);
+    if (session.screen.length > 65536) session.screen.splice(0, 32768);
+    if (session.outputLength + bytes.length > linuxVmOutputLimit) {
+      const drop = Math.max(linuxVmOutputLimit / 2, session.outputLength + bytes.length - linuxVmOutputLimit);
+      session.output.copyWithin(0, drop, session.outputLength);
+      session.outputLength -= drop;
     }
+    const requiredLength = session.outputLength + bytes.length;
     if (requiredLength > session.output.length) {
       const nextLength = Math.min(
         linuxVmOutputLimit,
@@ -3478,10 +3484,11 @@ self.onmessage = (event) => {
 
   /** Appends one command-output byte while enforcing the terminal output limit. */
   function appendLinuxVmCommandOutput(command: LinuxVmCommand, byte: number): void {
-    const requiredLength = command.outputLength + 1;
-    if (requiredLength > linuxVmOutputLimit) {
-      throw new Error("Linux VM command output exceeded 4 MiB");
+    if (command.outputLength === linuxVmOutputLimit) {
+      command.output.copyWithin(0, linuxVmOutputLimit / 2);
+      command.outputLength = linuxVmOutputLimit / 2;
     }
+    const requiredLength = command.outputLength + 1;
     if (requiredLength > command.output.length) {
       const expanded = new Uint8Array(Math.min(
         linuxVmOutputLimit,
@@ -3503,6 +3510,11 @@ self.onmessage = (event) => {
     appendLinuxVmOutput(session, Uint8Array.of(byte));
     if (command.collectingOutput) {
       appendLinuxVmCommandOutput(command, byte);
+      const execution = session.managedExecution;
+      if (execution !== null) {
+        execution.output.push(byte);
+        if (execution.output.length >= 1048576) execution.output.splice(0, 524288);
+      }
     }
   }
 
@@ -3546,6 +3558,7 @@ self.onmessage = (event) => {
     }
     clearTimeout(command.timeoutHandle);
     session.activeCommand = null;
+    session.workingDir = result.workingDir;
     command.resolve(result);
     startNextLinuxVmCommand(session);
   }
@@ -3661,8 +3674,8 @@ self.onmessage = (event) => {
     if (typeof command !== "string" || command.trim().length === 0) {
       throw new Error("Linux VM terminal command must not be blank");
     }
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
-      throw new Error("Linux VM terminal timeout must be a positive integer");
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+      throw new Error("Linux VM terminal timeout must be a nonnegative integer");
     }
     if (session.state === "failed" || session.state === "closed") {
       throw new Error(`Linux VM terminal is not running: ${sessionId}`);
@@ -3672,7 +3685,7 @@ self.onmessage = (event) => {
       const commandState: LinuxVmCommand = {
         token,
         command,
-        timeoutHandle: globalThis.setTimeout(() => {
+        timeoutHandle: timeoutMs === 0 ? 0 : globalThis.setTimeout(() => {
           if (session.activeCommand !== commandState) {
             return;
           }
@@ -3887,6 +3900,9 @@ self.onmessage = (event) => {
       progressVisible: false,
       activeCommand: null,
       pendingCommands: [],
+      managedExecution: null,
+      screen: [],
+      workingDir: "/",
     };
     linuxVmSessions.set(sessionId, session);
     void startLinuxVm(session);
@@ -4015,6 +4031,31 @@ self.onmessage = (event) => {
         timeoutMs: number,
       ): Promise<LinuxVmCommandResult> {
         return executeLinuxVmCommand(sessionId, command, timeoutMs);
+      },
+      /** Starts a command without holding the synchronous Rust bridge until completion. */
+      startPtyCommand(sessionId: string, command: string): void {
+        const session = linuxVmSession(sessionId);
+        if (session.activeCommand !== null || session.pendingCommands.length > 0) throw new Error("Terminal session is busy");
+        const execution = { output: [] as number[], result: null as LinuxVmCommandResult | null, error: null as string | null };
+        session.managedExecution = execution;
+        void executeLinuxVmCommand(sessionId, command, 0).then(
+          result => { execution.result = result; },
+          error => { execution.error = String(error); },
+        );
+      },
+      /** Drains command output and reads its original receipt without sending terminal input. */
+      pollPtyCommand(sessionId: string) {
+        const session = linuxVmSession(sessionId);
+        const execution = session.managedExecution;
+        if (execution === null) throw new Error("Terminal has no managed command");
+        const output = Uint8Array.from(execution.output.splice(0, 65536));
+        return { output, result: execution.output.length === 0 ? execution.result : null, error: execution.error };
+      },
+      /** Exposes current session activity and retained visible output independently of PTY drains. */
+      sessionState(sessionId: string) {
+        const session = linuxVmSession(sessionId);
+        return { commandRunning: session.activeCommand !== null || session.pendingCommands.length > 0,
+          workingDir: session.workingDir, content: textDecoder.decode(Uint8Array.from(session.screen)) };
       },
       /** Records terminal dimensions requested for one browser-local Linux VM terminal. */
       resizePty(sessionId: string, rows: number, cols: number): void {
@@ -4626,40 +4667,26 @@ self.onmessage = (event) => {
       getSystemSetting(namespace: string, setting: string) {
         return { namespace, setting, value: "" };
       },
-      installApp(path: string) {
-        return { operationType: "install", packageName: path, success: false, details: "" };
+      installApp(_path: string) {
+        throw new Error("Browser security does not allow installing native application packages. Download the package and use your system installer.");
       },
-      uninstallApp(packageName: string) {
-        return { operationType: "uninstall", packageName, success: false, details: "" };
+      uninstallApp(_packageName: string) {
+        throw new Error("Browser security does not allow uninstalling native applications. Use your system application settings.");
       },
-      listInstalledApps(includeSystemApps: boolean) {
-        return { includesSystemApps: includeSystemApps, packages: [] as string[] };
+      listInstalledApps(_includeSystemApps: boolean) {
+        throw new Error("Browsers cannot enumerate installed native applications.");
       },
-      startApp(packageName: string) {
-        return { operationType: "start", packageName, success: false, details: "" };
+      startApp(_packageName: string) {
+        throw new Error("Browsers cannot launch arbitrary native application identifiers.");
       },
-      stopApp(packageName: string) {
-        return { operationType: "stop", packageName, success: false, details: "" };
+      stopApp(_packageName: string) {
+        throw new Error("Browsers cannot stop native application processes.");
       },
-      /** Rejects notification history that browsers do not expose to applications. */
       getNotifications() {
         throw new Error("Browsers do not expose other applications' system notifications");
       },
-      getAppUsageTime(
-        packageName: string,
-        sinceHours: number,
-        limit: number,
-        includeSystemApps: boolean,
-      ) {
-        return {
-          startTime: Date.now(),
-          endTime: Date.now(),
-          sinceHours,
-          requestedPackageName: packageName,
-          includesSystemApps: includeSystemApps,
-          totalEntries: 0,
-          entries: [] as string[],
-        };
+      getAppUsageTime(_packageName: string, _sinceHours: number, _limit: number, _includeSystemApps: boolean) {
+        throw new Error("Browsers do not expose native application foreground usage history.");
       },
       /** Acquires a current user-authorized position from the browser. */
       getDeviceLocation(timeout: number, highAccuracy: boolean, includeAddress: boolean) {

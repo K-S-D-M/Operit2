@@ -2205,6 +2205,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "spake2",
  "syn 2.0.117",
  "tokio",
@@ -2456,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "operit-runtime"
-version = "2.0.0-preview.28"
+version = "2.0.0-preview.29"
 dependencies = [
  "aes",
  "async-trait",
@@ -2564,6 +2565,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sha2",
+ "syn 2.0.117",
  "thiserror 1.0.69",
  "tokio",
  "url",

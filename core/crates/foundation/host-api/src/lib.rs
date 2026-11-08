@@ -1745,6 +1745,11 @@ pub struct TerminalInfo {
     pub types: Vec<TerminalTypeInfo>,
 }
 
+/// Receives output frames, including one final decoder-flush frame.
+pub type TerminalOutputCallback = Box<dyn FnMut(&[u8], bool) -> HostResult<()> + Send>;
+/// Receives the original command receipt after its host execution finishes.
+pub type TerminalCompletionCallback = Box<dyn FnOnce(HostResult<TerminalCommandOutput>) + Send>;
+
 pub trait TerminalHost: Send + Sync {
     /// Resolves a working directory in the exact selected terminal filesystem.
     fn resolveWorkingDirectory(
@@ -1787,6 +1792,7 @@ pub trait TerminalHost: Send + Sync {
     /// Executes in the same session while forwarding raw PTY bytes before completion.
     /// Empty frames allow cancellation checks during quiet commands. A callback error
     /// interrupts the command and leaves the session available for subsequent work.
+    /// A zero timeout disables the execution deadline; callers may stop waiting independently.
     fn executeInSessionStreaming(
         &self,
         _sessionId: &str,
@@ -1795,6 +1801,24 @@ pub trait TerminalHost: Send + Sync {
         _onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
     ) -> HostResult<TerminalCommandOutput> {
         Err(HostError::new("Terminal output streaming is not supported by this host"))
+    }
+    /// Schedules native PTY work independently of the caller's foreground wait.
+    /// Event-loop hosts override this operation to poll without blocking their runtime worker.
+    fn scheduleInSessionStreaming(
+        self: Arc<Self>,
+        scheduler: Arc<dyn HostRuntimeTaskSchedulerHost>,
+        sessionId: String,
+        command: String,
+        timeoutMs: u64,
+        mut onOutput: TerminalOutputCallback,
+        onComplete: TerminalCompletionCallback,
+    ) -> HostResult<()> where Self: 'static {
+        scheduler.scheduleHostRuntimeTask("terminal-command-stream", Box::new(move || {
+            let result = self.executeInSessionStreaming(
+                &sessionId, &command, timeoutMs, &mut |data| onOutput(data, false),
+            ).and_then(|receipt| { onOutput(&[], true)?; Ok(receipt) });
+            onComplete(result);
+        }))
     }
     fn executeHiddenCommand(
         &self,
@@ -2343,15 +2367,38 @@ pub struct SystemSettingData {
     pub value: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Installation request progress; opening an installer does not mean installation completed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppInstallState {
+    PermissionRequired,
+    InstallerOpened,
+    RestartRequired,
+    Completed,
+}
+
+impl AppInstallState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PermissionRequired => "permission_required",
+            Self::InstallerOpened => "installer_opened",
+            Self::RestartRequired => "restart_required",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppOperationData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installState: Option<AppInstallState>,
     pub operationType: String,
     pub packageName: String,
     pub success: bool,
     pub details: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppListData {
     pub includesSystemApps: bool,
     pub packages: Vec<String>,
@@ -2370,7 +2417,7 @@ pub struct NotificationData {
     pub timestamp: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppUsageTimeEntry {
     pub packageName: String,
     pub appName: String,
@@ -2379,7 +2426,7 @@ pub struct AppUsageTimeEntry {
     pub isSystemApp: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppUsageTimeResultData {
     pub startTime: i64,
     pub endTime: i64,
@@ -2975,6 +3022,12 @@ pub trait SystemOperationHost: Send + Sync {
     fn uninstallApp(&self, packageName: &str) -> HostResult<AppOperationData>;
     fn listInstalledApps(&self, includeSystemApps: bool) -> HostResult<AppListData>;
     fn startApp(&self, packageName: &str) -> HostResult<AppOperationData>;
+    fn startAppWithActivity(&self, packageName: &str, activity: Option<&str>) -> HostResult<AppOperationData> {
+        if activity.is_some() {
+            return Err(HostError::new("Starting a specific activity is not supported by this host"));
+        }
+        self.startApp(packageName)
+    }
     fn stopApp(&self, packageName: &str) -> HostResult<AppOperationData>;
     fn getNotifications(&self, limit: i32, includeOngoing: bool) -> HostResult<NotificationData>;
     fn getAppUsageTime(
@@ -3057,6 +3110,21 @@ pub trait FileSystemHost: Send + Sync {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn installation_state_is_optional_for_legacy_results() {
+        let legacy=serde_json::json!({"operationType":"install","packageName":"example","success":true,"details":"requested"});
+        let data: AppOperationData = serde_json::from_value(legacy).unwrap();
+        assert_eq!(data.installState, None);
+        for state in [
+            AppInstallState::PermissionRequired,
+            AppInstallState::InstallerOpened,
+            AppInstallState::RestartRequired,
+            AppInstallState::Completed,
+        ] {
+            assert_eq!(serde_json::to_value(&state).unwrap(), state.as_str());
+        }
+    }
 
     /// Builds a sorted id set from borrowed string ids.
     fn idSet(ids: &[&str]) -> BTreeSet<String> {

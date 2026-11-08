@@ -1149,6 +1149,9 @@ pub struct Snapshot {
     pub data: Data,
     pub covered: BTreeSet<String>,
     pub generation: u64,
+    /// Opaque evidence of corrupt local state participates in CAS, never in source authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub damage: Option<String>,
 }
 
 impl Snapshot {
@@ -1163,6 +1166,9 @@ impl Snapshot {
     pub fn projected_content_digest(&self, project: impl Fn(&str, &Value) -> Result<Option<Value>>) -> Result<String> {
         use std::borrow::Cow;
         let values = self.data.values.iter().map(|(name, value)| {
+            if self.data.owner.backend == Backend::Sql && value["columns"].as_array().is_none_or(Vec::is_empty) {
+                return Err(format!("Missing synchronized SQL table: {name}"));
+            }
             let content = match project(name, value)? {
                 Some(projected) => Cow::Owned(projected),
                 None => Cow::Borrowed(value),
@@ -1174,6 +1180,7 @@ impl Snapshot {
 
     /// Installs authoritative data without allocating a business revision.
     pub fn replace(&mut self, expected: &str, source: &Self) -> Result<bool> {
+        if source.damage.is_some() { return Err("A damaged snapshot cannot be authoritative".into()); }
         if self.token()? != expected {
             return Ok(false);
         }
@@ -1185,6 +1192,7 @@ impl Snapshot {
             .checked_add(1)
             .ok_or("Snapshot generation overflow")?;
         self.data = source.data.clone();
+        self.damage = source.damage.clone();
         self.covered.extend(source.covered.iter().cloned());
         self.generation = generation;
         Ok(true)
@@ -1211,6 +1219,8 @@ pub struct Manifest {
     pub revision: Option<Revision>,
     pub token: String,
     pub digest: String,
+    #[serde(default)]
+    pub damaged: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1223,6 +1233,12 @@ pub enum Source {
 pub fn compare_manifests(local: &Manifest, remote: &Manifest) -> Result<Source> {
     if local.owner != remote.owner {
         return Err("Snapshots are not at the same format/layout".into());
+    }
+    match (local.damaged, remote.damaged) {
+        (true, false) => return Ok(Source::Remote),
+        (false, true) => return Ok(Source::Local),
+        (true, true) => return Err(format!("Neither peer has a complete synchronized file: {}", local.owner.path)),
+        _ => {},
     }
     if local.digest == remote.digest {
         return Ok(Source::Equal);
@@ -1249,6 +1265,7 @@ impl Snapshot {
             revision: self.data.revision.clone(),
             token: self.token()?,
             digest,
+            damaged: self.damage.is_some(),
         })
     }
 }
@@ -1289,7 +1306,7 @@ pub mod preference;
 
 #[cfg(feature = "full")]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-enum Cell {
+pub(crate) enum Cell {
     Null,
     Integer(i64),
     Real(u64),
@@ -1323,9 +1340,9 @@ impl From<Cell> for crate::SqliteStore::SqliteValue {
 }
 #[cfg(feature = "full")]
 #[derive(Serialize, Deserialize)]
-struct Table {
-    columns: Vec<String>,
-    rows: Vec<Vec<Cell>>,
+pub(crate) struct Table {
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<Cell>>,
 }
 
 /// Projects explicitly declared local columns and identity-only rows out of SQL content comparisons.
@@ -1367,10 +1384,12 @@ pub struct SqlDataset<'a> {
     /// Returns immutable operation identity, business time, origin, sequence in that order.
     pub revisions: &'a str,
     pub cleanup: &'a str,
+    /// Restores an owner-validated declaration inside the same transaction as its rows.
+    pub restore_schema: Option<fn(&mut crate::SqliteStore::SqliteTransaction<'_>, &Value) -> std::result::Result<(Vec<String>, bool), crate::SqliteStore::SqliteStoreError>>,
 }
 
 #[cfg(feature = "full")]
-fn sql_identifier(name: &str) -> String {
+pub(crate) fn sql_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -1418,22 +1437,28 @@ impl SqlDataset<'_> {
         let mut data = Data::empty(self.owner.clone());
         let mut covered = BTreeSet::new();
         let generation = 0;
-        if let Some(operation) = compaction::initialization(tx)? {
-            let previous = compaction::Initialization::decode(&operation).map_err(sql_error)?.ok_or_else(||sql_error("Missing initialization"))?;
-            data.revision = previous.data.revision;
-            covered = previous.covered;
-            covered.insert(operation.opId);
+        let mut damage = None;
+        if let Some(row) = tx.queryOne("SELECT operation_id,original FROM _operit_transaction_initialization WHERE id=1", vec![])? {
+            let original: String = row.get(1)?;
+            let previous = serde_json::from_str(&original).map_err(|e|e.to_string())
+                .and_then(|operation|compaction::Initialization::decode(&operation)?.ok_or("Missing initialization".into()))
+                .and_then(|previous|if previous.data.owner == self.owner { Ok(previous) } else { Err("Initialization owner differs".into()) });
+            match previous {
+                Ok(previous) => { data.revision = previous.data.revision; covered = previous.covered; },
+                Err(error) => {
+                    operit_util::AppLogger::AppLogger::w("TransactionSync", &format!("sync_consistency.damaged owner={} stage=initialization error={error}", self.owner.path));
+                    damage = Some(digest(&original).map_err(sql_error)?);
+                    covered = tx.queryRows("SELECT id FROM _operit_initialization_coverage", vec![])?.iter()
+                        .map(|row|row.get(0)).collect::<std::result::Result<_,_>>()?;
+                },
+            }
+            covered.insert(row.get(0)?);
         }
         for table in self.tables {
             let info = tx.queryRows(
                 &format!("PRAGMA table_info({})", sql_identifier(table)),
                 vec![],
             )?;
-            if info.is_empty() {
-                return Err(sql_error(format!(
-                    "Missing synchronized SQL table: {table}"
-                )));
-            }
             let columns = info
                 .iter()
                 .map(|row| row.get::<_, String>("name"))
@@ -1447,8 +1472,8 @@ impl SqlDataset<'_> {
                     .join(","),
                 sql_identifier(table)
             );
-            let mut rows = tx
-                .queryRows(&query, vec![])?
+            // Missing tables are captured as damaged state so CAS does not require a healthy target.
+            let mut rows = (if columns.is_empty() { Vec::new() } else { tx.queryRows(&query, vec![])? })
                 .into_iter()
                 .map(|row| row.values.into_iter().map(Cell::from).collect::<Vec<_>>())
                 .collect::<Vec<_>>();
@@ -1468,6 +1493,7 @@ impl SqlDataset<'_> {
             covered.insert(id);
         }
         Ok(Snapshot {
+            damage,
             node: self.node.clone(),
             data,
             covered,
@@ -1498,7 +1524,7 @@ impl SqlDataset<'_> {
         if initialization.data.owner != self.owner || operation.domain != self.domain() { return Err("Initialization owner differs".into()); }
         let current = self.snapshot()?;
         if current.covered.contains(&operation.opId) { return Ok(false); }
-        if let Some(previous) = self.initialization()? {
+        if let Some(previous) = if current.damage.is_none() { self.initialization()? } else { None } {
             let previous_data = compaction::Initialization::decode(&previous)?.ok_or("Missing initialization")?;
             if !initialization.covered.contains(&previous.opId)
                 && (previous_data.data.revision.as_ref(), &previous.opId) >= (initialization.data.revision.as_ref(), &operation.opId) {
@@ -1506,7 +1532,7 @@ impl SqlDataset<'_> {
             }
         }
         let source = initialization.snapshot(&self.node, current.generation + 1);
-        if !self.commit_snapshot(&current.token()?, &source, None, Some(operation), replay)? {
+        if !self.commit_snapshot(&current.token()?, &source, initialization.definition, Some(operation), replay)? {
             return Err("SQL owner changed while receiving initialization; retry required".into());
         }
         Ok(true)
@@ -1528,20 +1554,26 @@ impl SqlDataset<'_> {
             } else { expected.to_owned() };
             changed = current.data != source.data;
             if !current.replace(&expected, source).map_err(sql_error)? { return Ok(false); }
+            let (names, schema_changed) = match (self.restore_schema, definition.as_ref()) {
+                (Some(restore), Some(definition)) => restore(tx, definition)?,
+                (Some(_), None) => return Err(sql_error("Missing SQL snapshot definition")),
+                (None, _) => (self.tables.iter().map(|name| name.to_string()).collect(), false),
+            };
+            changed |= schema_changed;
             if changed {
                 let mut tables = BTreeMap::new();
-                if current.data.values.len() != self.tables.len() { return Err(sql_error("Unexpected SQL snapshot tables")); }
-                for name in self.tables {
-                    let table: Table = serde_json::from_value(current.data.values.get(*name).cloned().ok_or_else(|| sql_error("Missing SQL snapshot table"))?).map_err(sql_error)?;
+                if current.data.values.len() != names.len() { return Err(sql_error("Unexpected SQL snapshot tables")); }
+                for name in &names {
+                    let table: Table = serde_json::from_value(current.data.values.get(name).cloned().ok_or_else(|| sql_error("Missing SQL snapshot table"))?).map_err(sql_error)?;
                     let expected = tx.queryRows(&format!("PRAGMA table_info({})", sql_identifier(name)), vec![])?.iter()
                         .map(|row| row.get::<_, String>("name")).collect::<std::result::Result<Vec<_>, _>>()?;
                     if table.columns != expected || table.rows.iter().any(|row| row.len() != expected.len()) { return Err(sql_error("SQL snapshot schema mismatch")); }
-                    tables.insert(*name, table);
+                    tables.insert(name.as_str(), table);
                 }
                 tx.execute("PRAGMA defer_foreign_keys = ON", vec![])?;
-                for name in self.tables.iter().rev() { tx.execute(&format!("DELETE FROM {}", sql_identifier(name)), vec![])?; }
-                for name in self.tables {
-                    let table = tables.remove(name).expect("validated snapshot table");
+                for name in names.iter().rev() { tx.execute(&format!("DELETE FROM {}", sql_identifier(name)), vec![])?; }
+                for name in &names {
+                    let table = tables.remove(name.as_str()).expect("validated snapshot table");
                     let query = format!("INSERT INTO {}({}) VALUES({})", sql_identifier(name), table.columns.iter().map(|column| sql_identifier(column)).collect::<Vec<_>>().join(","),
                         (0..table.columns.len()).map(|_| "?").collect::<Vec<_>>().join(","));
                     for row in table.rows { tx.execute(&query, row.into_iter().map(Into::into).collect())?; }

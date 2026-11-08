@@ -365,13 +365,9 @@ impl RuntimeFileSyncStore {
         Ok(original)
     }
 
-    /// Reports whether a verified content-addressed blob is available locally.
+    /// Checks local blob presence without reading or hashing its contents.
     pub fn hasBlob(&self, reference: &RuntimeFileSyncReference) -> Result<bool, String> {
-        validateBlobReference(reference)?;
-        let path = self.blobPath(&reference.contentHash)?;
-        if !self.storageHost.exists(&path).map_err(|e|e.to_string())? { return Ok(false); }
-        verifyBlob(reference, &self.storageHost.readBytes(&path).map_err(|e|e.to_string())?)?;
-        Ok(true)
+        self.storageHost.exists(&self.blobStoragePath(reference)?).map_err(|e|e.to_string())
     }
 
     /// Reads one bounded range from a verified content-addressed blob.
@@ -737,7 +733,7 @@ mod tests {
         let target = RuntimeFileSyncStore::new(Arc::new(MemoryStorageHost::default()),RUNTIME_SYNC_DIR_PATH);
         let mut data = Data::empty(Owner {backend:Backend::DataStore,path:"runtime/config/preferences/blob.preferences.json".into(),format:1,layout:1});
         data.values.insert("large".into(),serde_json::json!("content".repeat(20_000)));
-        let original = Initialization::from_snapshot(&Snapshot {node:"a".into(),data,covered:Default::default(),generation:0}).operation("preferences",false).unwrap();
+        let original = Initialization::from_snapshot(&Snapshot {damage:None,node:"a".into(),data,covered:Default::default(),generation:0}).operation("preferences",false).unwrap();
         let wire = source.prepareTransactionForTransport(original.clone()).unwrap();
         assert!(serde_json::to_vec(&wire).unwrap().len() < 1024);
         let reference = RuntimeFileSyncStore::requiredBlob(&wire).unwrap().unwrap();
@@ -746,6 +742,9 @@ mod tests {
         assert_eq!(target.hydrateTransaction(wire.clone()).unwrap(),original);
         let mut forged = wire; forged.createdAt += 1;
         assert!(target.hydrateTransaction(forged).is_err());
+        target.storageHost.writeBytes(&target.blobStoragePath(&reference).unwrap(), &vec![0; reference.size as usize]).unwrap();
+        assert!(target.hasBlob(&reference).unwrap());
+        assert!(target.readBlob(&reference).is_err());
     }
 
 }

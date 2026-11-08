@@ -1971,8 +1971,7 @@ impl CoreNodeRouter {
                         let args: crate::PeerSync::SyncRequest = operit_link::fromCoreValue(request.payload.args).map_err(|e|CoreLinkError::internal(e.to_string()))?;
                         let service = crate::SpacePersistenceSyncService::SpacePersistenceSyncService::new(
                             self.localCore.clone(), self.clone(), self.spaceStore.clone());
-                        let status = service.synchronizeRequestedPeer(request.originNodeId, args.limit, args.force).await
-                            .map_err(CoreLinkError::internal)?;
+                        let status = service.synchronizeRequestedPeer(request.originNodeId, args.limit, args.force).await?;
                         operit_link::toCoreValue(status).map_err(|e|CoreLinkError::internal(e.to_string()))
                     }.await;
                     return CoreCallResponse { requestId, result };
@@ -2603,6 +2602,7 @@ mod tests {
     #[derive(Clone)]
     struct TestRuntimeStorageHost {
         files: Arc<StdMutex<BTreeMap<String, Vec<u8>>>>,
+        modifiedTimes: Arc<StdMutex<BTreeMap<String, i64>>>,
         runtimeRoot: std::path::PathBuf,
         workspaceRoot: std::path::PathBuf,
     }
@@ -2624,6 +2624,7 @@ mod tests {
             std::fs::create_dir_all(&workspaceRoot).expect("test workspace root must be creatable");
             Self {
                 files: Arc::new(StdMutex::new(BTreeMap::new())),
+                modifiedTimes: Arc::new(StdMutex::new(BTreeMap::new())),
                 runtimeRoot,
                 workspaceRoot,
             }
@@ -2664,6 +2665,18 @@ mod tests {
                 .get(path)
                 .cloned()
                 .ok_or_else(|| HostError::new(format!("missing runtime storage entry: {path}")))
+        }
+
+        /// Carries source timestamps through the real file synchronization path.
+        fn modifiedAt(&self, path: &str) -> HostResult<i64> {
+            if !self.exists(path)? { return Err(HostError::new("missing runtime storage entry")); }
+            Ok(self.modifiedTimes.lock().unwrap().get(path).copied().unwrap_or(1))
+        }
+
+        fn setModifiedAt(&self, path: &str, time: i64) -> HostResult<()> {
+            if !self.exists(path)? { return Err(HostError::new("missing runtime storage entry")); }
+            self.modifiedTimes.lock().unwrap().insert(path.to_owned(), time);
+            Ok(())
         }
 
         /// Reads one bounded range from an in-memory runtime storage file.
@@ -3291,6 +3304,7 @@ mod tests {
                 [localId.clone(), peerId.clone()]
                     .into_iter()
                     .map(|nodeId| CoreSpaceDeviceProfile {
+                        protocolVersion: None,
                         displayName: nodeId.clone(),
                         nodeId,
                         userName: String::new(),
@@ -4578,7 +4592,7 @@ mod tests {
                 assert_eq!(request.routeKind, RoutedCoreRequestKind::Target);
                 if request.payload.target == crate::NodeSpaceService::NODE_SPACE_TARGET {
                     assert_eq!(request.payload.methodName, "projectionProtocol");
-                    let protocol = serde_json::json!({"version":1,"nodeId":request.targetNodeId,
+                    let protocol = serde_json::json!({"protocol": crate::PeerProtocol::PeerProtocol::current(), "version":1,"nodeId":request.targetNodeId,
                         "endpoint":false,"authorityMode":"localReplay","maxMessageBytes":65536,
                         "snapshotPaging":false,"projectionReference":false});
                     return CoreCallResponse::ok(request.payload.requestId, operit_link::toCoreValue(protocol).unwrap());

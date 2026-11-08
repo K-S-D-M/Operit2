@@ -1572,6 +1572,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sha2",
  "spake2",
  "syn 2.0.119",
  "tokio",
@@ -1725,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "operit-runtime"
-version = "2.0.0-preview.28"
+version = "2.0.0-preview.29"
 dependencies = [
  "aes",
  "async-trait",
