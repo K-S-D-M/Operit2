@@ -34,6 +34,9 @@ jobs:
       RUSTFLAGS: -Awarnings
       RUST_TOOLCHAIN_VERSION: 1.95.0
       FVM_VERSION: 4.3.0
+      # crates.io 偶发连接重置时多试几次，避免整轮 Windows 构建白跑。
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_TIMEOUT: "120"
 
     steps:
       - name: Checkout
