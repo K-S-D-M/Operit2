@@ -174,6 +174,9 @@ jobs:
       RUSTFLAGS: -Awarnings
       RUST_TOOLCHAIN_VERSION: 1.95.0
       FVM_VERSION: 4.3.0
+      # crates.io / pub.dev 偶发连接重置时多试几次，不要让整轮构建白跑。
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_TIMEOUT: "120"
       # 与 build-android-v8 保持一致：这是写进 V8 缓存清单的声明版本，
       # 与实际参与链接的 NDK（flutter.ndkVersion）无关。
       OPERIT_ANDROID_V8_NDK_VERSION: 27.3.13750724
@@ -337,6 +340,35 @@ jobs:
           python plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload
           if ($LASTEXITCODE -ne 0) { throw "sync_plugin_packages.py failed" }
 
+      # Gradle Wrapper 首次运行会从 GitHub Releases 下载 gradle-*-all.zip，
+      # 偶发 HTTP 504 会让 assembleRelease 在几秒内直接失败。先单独预取并重试，
+      # 让后面的 flutter build 直接命中 wrapper 缓存。
+      - name: Prefetch Gradle wrapper distribution
+        shell: pwsh
+        run: |
+          $androidDir = "apps/flutter/app/android"
+          $gradlew = Join-Path $androidDir "gradlew.bat"
+          if (-not (Test-Path -LiteralPath $gradlew)) {
+            throw "Gradle wrapper not found at $gradlew"
+          }
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            Write-Host "Gradle wrapper prefetch attempt $attempt/5"
+            Push-Location $androidDir
+            try {
+              & .\gradlew.bat --version
+              $code = $LASTEXITCODE
+            } finally {
+              Pop-Location
+            }
+            if ($code -eq 0) {
+              Write-Host "Gradle wrapper distribution is ready"
+              exit 0
+            }
+            Write-Warning "Gradle wrapper download failed (exit $code), retrying..."
+            Start-Sleep -Seconds (10 * $attempt)
+          }
+          throw "Gradle wrapper distribution download failed after 5 attempts"
+
       - name: Build and package Android app
         shell: pwsh
         run: |
@@ -344,7 +376,15 @@ jobs:
           if ($version.Count -ne 1) {
             throw "apps/flutter/app/pubspec.yaml must contain exactly one release version line"
           }
-          python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile
+          # pub get（gitee / pub.dev）与 Gradle 依赖下载都可能瞬时失败，重试一轮。
+          for ($attempt = 1; $attempt -le 2; $attempt++) {
+            Write-Host "Android app build attempt $attempt/2"
+            python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($attempt -eq 2) { throw "Android app build failed after 2 attempts" }
+            Write-Warning "Android app build failed, retrying in 20s..."
+            Start-Sleep -Seconds 20
+          }
 
       - name: Build and package Android module
         shell: pwsh
