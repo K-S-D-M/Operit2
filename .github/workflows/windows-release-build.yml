@@ -15,7 +15,12 @@ on:
       cli_arches:
         description: "Windows CLI architectures"
         required: false
-        default: "all"
+        # aarch64-pc-windows-msvc is cross-compiled from the x86_64 runner.
+        # llama.cpp/ggml rejects MSVC-on-ARM unless GGML_NATIVE=ON, which is
+        # wrong for a cross build, so default to the host architecture only.
+        # Choose "aarch64" explicitly once an ARM64 runner or clang toolchain
+        # is available.
+        default: "host"
         type: choice
         options:
           - "host"
@@ -134,6 +139,9 @@ jobs:
 
       - name: Build and package Windows CLI
         if: inputs.products != 'app'
+        # The CLI is a secondary product. Never let it block uploading the
+        # Windows app artifact (a failed CLI previously skipped both uploads).
+        continue-on-error: true
         shell: pwsh
         run: python tools/build_scripts/build_cli_windows.py --arches "${{ inputs.cli_arches }}"
 
@@ -152,5 +160,5 @@ jobs:
         with:
           name: operit2-windows-cli-${{ github.sha }}
           path: tools/release/dist/operit2-cli-windows-*.zip
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
