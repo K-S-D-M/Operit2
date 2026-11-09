@@ -68,6 +68,7 @@ bash build-acceleration/prefetch-flutter-assets.sh 3.41.10-ohos-0.0.2-beta.operi
 | `Server returned HTTP response code: 504 ... gradle-8.14-all.zip` | Gradle Wrapper 首次运行从 GitHub Releases 下载分发包，通道瞬时故障 | 仓库不带 `gradlew.bat`（wrapper 由 Flutter 生成），无法单独预取；已在打包步骤做 3 次重试 |
 | `Exception: 504` + `flutter-web-sdk.zip` / `windows-x64-*.zip` | 自定义 Flutter SDK（`flutter-ohos`）从 GitHub Releases 下载 artifacts，通道故障 | 同样用打包步骤的 3 次重试；通道整体恢复后 `gh run rerun <run-id> --failed` 即可，不要改代码 |
 | `fatal: unable to access 'https://gitee.com/...'` / `exit code 69` | `flutter pub get` 拉 gitee 依赖超时 | 重试打包步骤；`CARGO_NET_RETRY=10`、`CARGO_HTTP_TIMEOUT=120` 已写入两个 workflow 降低同类抖动影响 |
+| `CMake Error: MSVC on ARM requires GGML_NATIVE=ON` / `cargo build --target aarch64-pc-windows-msvc` 失败 | Windows CLI 默认 `cli_arches=all`，在 x86_64 runner 上交叉编译 ARM64 llama.cpp/ggml，MSVC 不接受显式 ARM arch 变体 | 已把 `cli_arches` 默认改为 `host`，并给 CLI 步骤加 `continue-on-error: true`、CLI 上传改 `if-no-files-found: warn`，保证 app artifact 不被连累；只要 EXE 时用 `-f products=app` 触发更快 |
 | `Android Auto Release` 报 `Artifact not found` | `actions/download-artifact@v4` 参数名写成 `run_id`，被忽略 | 使用 `run-id: ${{ github.event.workflow_run.id }}` |
 | `Android builds are only supported on Linux.` | Android V8 源码构建跑在 Windows runner | 由 `build-android-v8`（ubuntu）预构建并上传 artifact，Windows job 下载复用；NDK 固定 `27.3.13750724` |
 
