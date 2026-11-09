@@ -120,7 +120,17 @@ jobs:
       - name: Build and package Windows app
         if: inputs.products != 'cli'
         shell: pwsh
-        run: python tools/build_scripts/build_flutter_windows.py --enforce-lockfile
+        # Flutter SDK 构建时会从 GitHub Releases 下载 windows-x64-*.zip，
+        # 偶发 HTTP 504（Exception: 504）不是代码问题，重试即可命中缓存。
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Windows app build attempt $attempt/3"
+            python tools/build_scripts/build_flutter_windows.py --enforce-lockfile
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($attempt -eq 3) { throw "Windows app build failed after 3 attempts" }
+            Write-Warning "Windows app build failed, retrying in 20s..."
+            Start-Sleep -Seconds 20
+          }
 
       - name: Build and package Windows CLI
         if: inputs.products != 'app'
