@@ -1,5 +1,8 @@
+pub(crate) mod PublishingTerminalHost;
 #[path = "ExtensionRuntimeService.rs"]
 pub mod ExtensionRuntimeService;
+#[path = "PreparedChatDeliveryService.rs"]
+pub mod PreparedChatDeliveryService;
 #[path = "ChatServiceCore.rs"]
 pub mod ChatServiceCore;
 #[path = "CodexOAuthService.rs"]
@@ -73,6 +76,9 @@ pub use AttachmentTransferManager::*;
 #[path = "FileSelectionService.rs"]
 pub mod FileSelectionService;
 pub use FileSelectionService::*;
+#[path = "ChatBackupDirectoryService.rs"]
+pub mod ChatBackupDirectoryService;
+pub use ChatBackupDirectoryService::*;
 
 #[path = "ComposeDslSessionService.rs"]
 pub mod ComposeDslSessionService;

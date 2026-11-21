@@ -7,14 +7,12 @@ use std::sync::Arc;
 
 #[cfg(target_os = "android")]
 use operit_host_api::HostManager::HostManager;
-#[cfg(target_os = "android")]
-use operit_host_api::RuntimeStorageHost;
-
 mod audio_playback;
 mod bluetooth;
 mod document_filesystem;
 mod filesystem;
 mod http;
+mod update_base;
 #[cfg(target_os = "android")]
 mod jni_thread;
 #[cfg(target_os = "android")]
@@ -36,7 +34,7 @@ mod terminal;
 mod terminal_command;
 mod terminal_privilege;
 #[cfg(target_os = "android")]
-pub use terminal::androidPrivilegedPtyOperation;
+pub use terminal::{androidExecShellProcess, androidPrivilegedPtyOperation};
 mod tts_playback;
 mod tts_synthesis;
 mod web_visit;
@@ -78,6 +76,7 @@ mod plugin_sdk_ipc;
 pub fn createRuntimeHostManager(
     runtimeRoot: PathBuf,
     workspaceRoot: PathBuf,
+    archiveRuntimeRoot: PathBuf,
     webVisitHost: Arc<dyn operit_host_api::WebVisitHost>,
     systemOperationHost: Arc<dyn operit_host_api::SystemOperationHost>,
 ) -> HostManager {
@@ -88,11 +87,12 @@ pub fn createRuntimeHostManager(
     createBaseRuntimeHostManager(
         runtimeRoot,
         workspaceRoot,
+        archiveRuntimeRoot,
         webVisitHost,
         systemOperationHost,
     )
     .withHostSecretStore(secrets)
-    .withLocalInferenceHost(Arc::new(AndroidLocalInferenceHost::new()))
+    .withLocalInferenceHost(Arc::new(operit_host_local_inference::NativeLocalInferenceHost::withSpeech(Arc::new(AndroidLocalInferenceHost::new()))))
     .withHostRuntimeEventSchedulerHost(Arc::new(AndroidHostRuntimeEventSchedulerHost::new()))
     .withServiceDiscoveryHost(Arc::new(
         operit_host_native_common::ServiceDiscovery::ServiceDiscoveryProvider::withNetworkLease(
@@ -112,8 +112,9 @@ pub fn createPrivilegedRuntimeHostManager(
     systemOperationHost: Arc<dyn operit_host_api::SystemOperationHost>,
 ) -> HostManager {
     createBaseRuntimeHostManager(
-        runtimeRoot,
+        runtimeRoot.clone(),
         workspaceRoot,
+        runtimeRoot,
         webVisitHost,
         systemOperationHost,
     )
@@ -130,6 +131,7 @@ pub fn createPrivilegedRuntimeHostManager(
 fn createBaseRuntimeHostManager(
     runtimeRoot: PathBuf,
     workspaceRoot: PathBuf,
+    archiveRuntimeRoot: PathBuf,
     webVisitHost: Arc<dyn operit_host_api::WebVisitHost>,
     systemOperationHost: Arc<dyn operit_host_api::SystemOperationHost>,
 ) -> HostManager {
@@ -141,10 +143,11 @@ fn createBaseRuntimeHostManager(
         ));
     let runtimeStorageHost = Arc::new(AndroidRuntimeStorageHost::new(runtimeRoot, workspaceRoot));
     let runtimeSqliteHost = runtimeStorageHost.clone();
+    // Android shared storage rejects flock with ENOSYS. Archive payloads and their
+    // cross-process leases belong to the owner's private storage, even when user
+    // data lives in a selected shared directory. Module runtime roots are private.
     let archiveStagingHost = Arc::new(operit_host_native_common::NativeArchiveStagingHost::new(
-        runtimeStorageHost
-            .runtimeRootDir()
-            .expect("Android runtime storage root must be configured"),
+        archiveRuntimeRoot,
     ));
     HostManager::withFileSystemWebVisitSystemOperationAndManagedRuntimeHosts(
         Arc::new(AndroidFileSystemHost::new()),
@@ -164,3 +167,4 @@ fn createBaseRuntimeHostManager(
     .withHostJavaScriptRuntimeHost(Arc::new(AndroidHostJavaScriptRuntimeHost::new()))
     .withHostRuntimeTaskSchedulerHost(Arc::new(AndroidHostRuntimeTaskSchedulerHost::new()))
 }
+mod update_apk;

@@ -9,6 +9,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:operit2/core/bridge/OperitRuntimeBridge.dart';
 import 'package:operit2/core/link/CoreLinkCodec.dart';
 import 'package:operit2/core/link/CoreLinkProtocol.dart';
+import 'package:operit2/core/logging/ClientLogger.dart';
 import 'package:operit2/core/proxy/generated/CoreProxyClients.g.dart';
 import 'package:operit2/data/preferences/UserPreferencesManager.dart';
 import 'package:operit2/ui/theme/OperitTheme.dart';
@@ -16,6 +17,7 @@ import 'package:operit2/ui/theme/OperitTheme.dart';
 /// Verifies synchronized ordinary appearance through generated clients.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  setUp(ClientLogger.initialize);
 
   OperitThemeController controller(_SharedThemeBridge bridge) {
     final clients = GeneratedCoreProxyClients(bridge);
@@ -25,6 +27,99 @@ void main() {
       saveStartupThemeMode: (_) async {},
     );
   }
+
+  test(
+    'watch payloads update appearance without reads or unrelated rebuilds',
+    () async {
+      final bridge = _SharedThemeBridge();
+      var changes = 0;
+      final startupModes = <ThemeMode>[];
+      final theme = OperitThemeController(
+        onChanged: () => changes++,
+        preferencesManager: UserPreferencesManager(
+          clients: GeneratedCoreProxyClients(bridge),
+        ),
+        saveStartupThemeMode: (mode) async => startupModes.add(mode),
+      );
+      addTearDown(theme.dispose);
+      addTearDown(bridge.close);
+      await theme.start();
+      final watch = bridge._watchRequests['preferencesFlow']!;
+      bridge.calls.clear();
+      changes = 0;
+
+      bridge._events.add(bridge._event(watch, bridge.preferences));
+      await Future<void>.delayed(Duration.zero);
+      bridge.preferences['chat_sidebar_tab'] = 'history';
+      bridge._events.add(bridge._event(watch, Map.of(bridge.preferences)));
+      await Future<void>.delayed(Duration.zero);
+      expect(changes, 0);
+      expect(bridge.calls, isEmpty);
+
+      bridge.preferences['bubble_show_avatar'] = false;
+      bridge._events.add(bridge._event(watch, Map.of(bridge.preferences)));
+      await Future<void>.delayed(Duration.zero);
+      expect(theme.themePreferenceSnapshot.bubbleShowAvatar, isFalse);
+      expect(changes, 1);
+      expect(bridge.calls, isEmpty);
+      expect(startupModes, [ThemeMode.system]);
+
+      await theme.saveThemeSettings(bubbleShowAvatar: true);
+      await Future<void>.delayed(Duration.zero);
+      expect(changes, 2);
+      expect(startupModes, [ThemeMode.system]);
+
+      bridge.preferences['font_scale'] = 'invalid';
+      bridge._events.add(bridge._event(watch, Map.of(bridge.preferences)));
+      await Future<void>.delayed(Duration.zero);
+      expect(theme.themeLoadError, isNotNull);
+      bridge.preferences.remove('font_scale');
+      bridge._events.add(bridge._event(watch, Map.of(bridge.preferences)));
+      await Future<void>.delayed(Duration.zero);
+      expect(theme.themeLoadError, isNull);
+      expect(theme.themePreferenceSnapshot.fontScale, 1.0);
+    },
+  );
+
+  test(
+    'selecting a global font releases previous message font overrides atomically',
+    () async {
+      final bridge = _SharedThemeBridge();
+      bridge.preferences.addAll(<String, Object?>{
+        'bubble_user_use_custom_font': true,
+        'bubble_user_system_font_name': 'serif',
+        'bubble_ai_use_custom_font': true,
+        'bubble_ai_system_font_name': 'serif',
+      });
+      final theme = controller(bridge);
+      addTearDown(theme.dispose);
+      addTearDown(bridge.close);
+      await theme.start();
+      expect(theme.themePreferenceSnapshot.bubbleUserUseCustomFont, isTrue);
+      expect(theme.themePreferenceSnapshot.bubbleAiUseCustomFont, isTrue);
+      await theme.saveThemeSettings(fontScale: 1.2);
+      expect(theme.themePreferenceSnapshot.bubbleUserUseCustomFont, isTrue);
+      expect(theme.themePreferenceSnapshot.bubbleAiUseCustomFont, isTrue);
+      bridge.updates.clear();
+      await theme.saveThemeSettings(
+        fontType: UserPreferencesManager.FONT_TYPE_SYSTEM,
+        systemFontName: UserPreferencesManager.SYSTEM_FONT_SANS_SERIF,
+      );
+      expect(bridge.updates.single, <String, Object?>{
+        'font_type': 'system',
+        'system_font_name': 'sans-serif',
+        'bubble_user_use_custom_font': false,
+        'bubble_ai_use_custom_font': false,
+      });
+      final snapshot = theme.themePreferenceSnapshot;
+      expect(snapshot.bubbleUserUseCustomFont, isFalse);
+      expect(snapshot.bubbleAiUseCustomFont, isFalse);
+      expect(
+        operitMessageFontFamily(snapshot, isUser: true),
+        operitMessageFontFamily(snapshot, isUser: false),
+      );
+    },
+  );
 
   test(
     'startup reads released preferences and watches shared appearance',
@@ -130,6 +225,10 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       expect(theme.themeLoadError, isNotNull);
       expect(theme.hasLoadedTheme, isFalse);
+      final log = await ClientLogger.readText();
+      expect(log, contains('Appearance load failed stage=validate_palette'));
+      expect(log, contains('FormatException'));
+      expect(log, contains('stackTrace='));
       expect(bridge.preferences['theme_palette_json'], 'not json');
       expect(bridge.calls, isNot(contains('useCustomAppearance')));
       await theme.reloadTheme();
@@ -149,6 +248,55 @@ void main() {
       );
     },
   );
+
+  test(
+    'preference stream failures retain their original diagnostic stack',
+    () async {
+      final bridge = _SharedThemeBridge();
+      final theme = controller(bridge);
+      addTearDown(theme.dispose);
+      addTearDown(bridge.close);
+      await theme.start();
+      final error = StateError('Preference connection disconnected');
+      final stack = StackTrace.fromString('preference-disconnect-origin');
+      bridge._events.addError(error, stack);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(theme.themeLoadError, same(error));
+      final log = await ClientLogger.readText();
+      expect(log, contains('Appearance preference subscription failed'));
+      expect(log, contains('Preference connection disconnected'));
+      expect(log, contains('preference-disconnect-origin'));
+    },
+  );
+
+  test(
+    'retry restores appearance and subscribes after disconnection',
+    () async {
+      final bridge = _SharedThemeBridge();
+      final theme = controller(bridge);
+      addTearDown(theme.dispose);
+      addTearDown(bridge.close);
+      await theme.start();
+      final error = StateError('Core FFI connection is closed');
+      bridge._events.addError(error);
+      await bridge._events.close();
+      bridge._events = StreamController<CoreEvent>.broadcast(sync: true);
+      expect(theme.themeLoadError, same(error));
+
+      await theme.reloadTheme();
+      expect(theme.themeLoadError, isNull);
+      expect(theme.hasLoadedTheme, isTrue);
+      expect(bridge.watches, ['preferencesFlow', 'preferencesFlow']);
+      expect(bridge.updates, isEmpty);
+
+      bridge.preferences['theme_mode'] = 'dark';
+      final watch = bridge._watchRequests['preferencesFlow']!;
+      bridge._events.add(bridge._event(watch, bridge.preferences));
+      await Future<void>.delayed(Duration.zero);
+      expect(theme.themeMode, ThemeMode.dark);
+    },
+  );
 }
 
 /// Exercises ordinary appearance calls and watches through the real Link codecs.
@@ -159,8 +307,9 @@ class _SharedThemeBridge extends OperitRuntimeBridge {
   final Map<String, Object?> preferences = <String, Object?>{};
   final Map<String, CoreWatchRequest> _watchRequests =
       <String, CoreWatchRequest>{};
-  final StreamController<CoreEvent> _events =
-      StreamController<CoreEvent>.broadcast(sync: true);
+  StreamController<CoreEvent> _events = StreamController<CoreEvent>.broadcast(
+    sync: true,
+  );
 
   /// Implements only the ordinary appearance operations under test.
   @override

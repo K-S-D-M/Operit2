@@ -2,7 +2,10 @@ use crate::LocalEngineManifest::{
     LocalArchitecture, LocalEngineArchiveFormat, LocalEngineArtifact, LocalEngineDelivery,
     LocalEngineManifest, LocalPlatform, LocalPlatformTarget,
 };
+use crate::LocalModelManifest::LocalEngineRequirement;
 
+const LLAMA_CPP_ENGINE_ID: &str = "llama-cpp";
+const LLAMA_CPP_ENGINE_VERSION: &str = "v1.0.0";
 const SHERPA_ONNX_ENGINE_ID: &str = "sherpa-onnx";
 const SHERPA_ONNX_ENGINE_VERSION: &str = "1.13.2";
 const SHERPA_ONNX_WEB_ASSET_BASE_URL: &str = "https://models.operit.app/sherpa-onnx/v1.13.2";
@@ -10,8 +13,17 @@ const SHERPA_ONNX_WEB_ASSET_BASE_URL: &str = "https://models.operit.app/sherpa-o
 pub struct LocalEngineCatalog;
 
 impl LocalEngineCatalog {
+    /// Returns the llama.cpp engine bundled with this application build.
     pub fn llamaCpp() -> LocalEngineManifest {
-        embeddedLlmEngine("llama-cpp", "b11829", "llama.cpp", "MIT")
+        embeddedLlmEngine(LLAMA_CPP_ENGINE_ID, LLAMA_CPP_ENGINE_VERSION, "llama.cpp", "MIT")
+    }
+
+    /// Returns the engine requirement for GGUF models using the bundled runtime.
+    pub(crate) fn llamaCppRequirement() -> LocalEngineRequirement {
+        LocalEngineRequirement {
+            engineId: LLAMA_CPP_ENGINE_ID.to_string(),
+            version: LLAMA_CPP_ENGINE_VERSION.to_string(),
+        }
     }
 
     pub fn mnn() -> LocalEngineManifest {
@@ -278,11 +290,24 @@ mod tests {
                 .all(|artifact| artifact.delivery == LocalEngineDelivery::Embedded));
         }
     }
+
+    /// Keeps engine metadata available when native compilation is owned by the Host crate.
+    #[test]
+    fn embedded_chat_engines_are_declared_without_core_build_features() {
+        for engine in [LocalEngineCatalog::llamaCpp(), LocalEngineCatalog::mnn()] {
+            for platform in [LocalPlatform::Windows, LocalPlatform::Linux, LocalPlatform::Macos,
+                LocalPlatform::Android, LocalPlatform::Ohos, LocalPlatform::Ios] {
+                assert!(engine.artifacts.iter().any(|artifact|
+                    artifact.target.platform == platform && artifact.delivery == LocalEngineDelivery::Embedded));
+            }
+            assert!(engine.artifacts.iter().all(|artifact| artifact.target.platform != LocalPlatform::Web));
+        }
+    }
 }
 
 /// Native LLM engines are linked into the application; only weights are downloaded.
 fn embeddedLlmEngine(id: &str, version: &str, name: &str, license: &str) -> LocalEngineManifest {
-    let artifacts = if cfg!(feature = "native-llm") {
+    let artifacts = {
         [LocalPlatform::Windows, LocalPlatform::Linux, LocalPlatform::Macos,
          LocalPlatform::Android, LocalPlatform::Ohos, LocalPlatform::Ios].into_iter()
         .flat_map(|platform| [LocalArchitecture::X86_64, LocalArchitecture::Aarch64,
@@ -296,7 +321,7 @@ fn embeddedLlmEngine(id: &str, version: &str, name: &str, license: &str) -> Loca
                 androidLibraryDir: None, ohosLibraryDir: None, iosFrameworkDir: None, webRuntimeDir: None,
             }
         })).collect()
-    } else { Vec::new() };
+    };
     LocalEngineManifest {
         id: id.to_string(), version: version.to_string(), displayName: name.to_string(),
         description: format!("Embedded {name} local chat inference"), license: license.to_string(),

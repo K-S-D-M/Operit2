@@ -24,9 +24,15 @@ class AppUpdateScope extends InheritedWidget {
 
 /// Keeps the version entry attached to the brand in both sidebar layouts.
 class AppUpdateBadge extends StatefulWidget {
-  const AppUpdateBadge({super.key, required this.child, this.controller});
+  const AppUpdateBadge({
+    super.key,
+    required this.child,
+    this.controller,
+    this.showIndicator = true,
+  });
   final Widget child;
   final AppUpdateController? controller;
+  final bool showIndicator;
 
   @override
   State<AppUpdateBadge> createState() => _AppUpdateBadgeState();
@@ -35,6 +41,8 @@ class AppUpdateBadge extends StatefulWidget {
 class _AppUpdateBadgeState extends State<AppUpdateBadge> {
   late final AppLifecycleListener _lifecycle;
   AppUpdateController? _scopedController;
+  AppUpdateController? _listenedController;
+  bool _promptScheduled = false;
   AppUpdateController get _controller =>
       widget.controller ?? _scopedController ?? AppUpdateController.instance;
 
@@ -42,7 +50,10 @@ class _AppUpdateBadgeState extends State<AppUpdateBadge> {
   void initState() {
     super.initState();
     _lifecycle = AppLifecycleListener(
-      onResume: () => unawaited(_controller.check()),
+      onResume: () {
+        unawaited(_controller.check());
+        _scheduleUpdatePrompt();
+      },
     );
   }
 
@@ -50,13 +61,45 @@ class _AppUpdateBadgeState extends State<AppUpdateBadge> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     _scopedController = AppUpdateScope.maybeOf(context);
+    _bindController();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) unawaited(_controller.check());
     });
   }
 
   @override
+  void didUpdateWidget(AppUpdateBadge oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _bindController();
+  }
+
+  void _bindController() {
+    final controller = _controller;
+    if (_listenedController != controller) {
+      _listenedController?.removeListener(_scheduleUpdatePrompt);
+      _listenedController = controller;
+      controller.addListener(_scheduleUpdatePrompt);
+    }
+    _scheduleUpdatePrompt();
+  }
+
+  /// Waits for a mounted navigator and coalesces progress and layout notifications.
+  void _scheduleUpdatePrompt() {
+    if (_promptScheduled || !_controller.hasUnpromptedUpdate) return;
+    _promptScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _promptScheduled = false;
+      if (!mounted || Navigator.maybeOf(context) == null) return;
+      unawaited(
+        showAppUpdateDialog(context, controller: _controller, automatic: true),
+      );
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  @override
   void dispose() {
+    _listenedController?.removeListener(_scheduleUpdatePrompt);
     _lifecycle.dispose();
     super.dispose();
   }
@@ -67,6 +110,14 @@ class _AppUpdateBadgeState extends State<AppUpdateBadge> {
     child: widget.child,
     builder: (context, child) {
       if (!_controller.visible) return child!;
+      final updateEntry = InkWell(
+        key: const ValueKey('app-update-logo'),
+        borderRadius: BorderRadius.circular(16),
+        onTap: () =>
+            unawaited(showAppUpdateDialog(context, controller: _controller)),
+        child: child,
+      );
+      if (!widget.showIndicator) return updateEntry;
       final colors = Theme.of(context).colorScheme;
       final busy = _controller.busy;
       final failed = _controller.phase == AppUpdatePhase.failed;
@@ -75,7 +126,7 @@ class _AppUpdateBadgeState extends State<AppUpdateBadge> {
         children: [
           Padding(
             padding: const EdgeInsets.only(top: 2, right: 22),
-            child: child,
+            child: updateEntry,
           ),
           Positioned(
             top: 0,

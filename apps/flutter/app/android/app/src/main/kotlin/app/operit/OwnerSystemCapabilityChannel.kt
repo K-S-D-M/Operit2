@@ -83,6 +83,8 @@ class OwnerSystemCapabilityChannel(
     }
 
     private var cachedMediaProjectionCaptureManager: MediaProjectionCaptureManager? = null
+    private val uiServer = AndroidUiServer(activity.applicationContext)
+    private val uiAutomation = AndroidUiAutomation(activity.applicationContext, uiServer)
     private var cachedMediaProjection: MediaProjection? = null
     private val ttsPlaybackLock = Any()
     private val ttsPlaybackSynthesisLock = Any()
@@ -110,6 +112,7 @@ class OwnerSystemCapabilityChannel(
     private var musicLoopPlayback: Boolean = false
     private var musicMessage: String = "android music player idle"
     private val locationReader = AndroidLocationReader(activity)
+    private val packageOperations = AndroidPackageOperations(activity, uiServer, uiAutomation)
     private val bluetoothClassicSockets = ConcurrentHashMap<String, BluetoothSocket>()
     private val bluetoothClassicServers = ConcurrentHashMap<String, BluetoothServerSocket>()
     private val bluetoothBleSessions = ConcurrentHashMap<String, BluetoothBleSession>()
@@ -140,6 +143,8 @@ class OwnerSystemCapabilityChannel(
             "ownerSystemLanguageCode" -> ownerSystemLanguageCode(result)
             "ownerSystemRecognizeText" -> ownerSystemRecognizeText(call, result)
             "ownerSystemOperation" -> ownerSystemOperation(call, result)
+            "ownerFileOpen" -> ownerFilePresentation(call, result, "openFile")
+            "ownerFileShare" -> ownerFilePresentation(call, result, "shareFile")
             "ownerLocalInference" -> ownerLocalInference(call, result)
             "ownerAudioPlay" -> ownerAudioPlay(call, result)
             "ownerMusicPlayback" -> ownerMusicPlayback(call, result)
@@ -175,6 +180,9 @@ class OwnerSystemCapabilityChannel(
 
     /** Releases owner-host resources and invalidates every active TTS generation. */
     fun release() {
+        uiAutomation.release()
+        uiServer.release()
+        packageOperations.release()
         cachedMediaProjectionCaptureManager?.release()
         cachedMediaProjectionCaptureManager = null
         cachedMediaProjection = null
@@ -265,10 +273,33 @@ class OwnerSystemCapabilityChannel(
         }
     }
 
-    /** Executes one generic Core-owned system operation. */
+    /** Delivers system uninstall confirmation to the package operation that owns it. */
+    fun onActivityResult(requestCode: Int, resultCode: Int): Boolean =
+        packageOperations.onActivityResult(requestCode, resultCode)
+
     /** Delivers the permission result to the location request that owns it. */
     fun onRequestPermissionsResult(requestCode: Int): Boolean =
         locationReader.onRequestPermissionsResult(requestCode)
+
+    /** Presents files through the same typed owner capability used by other platforms. */
+    private fun ownerFilePresentation(call: MethodCall, result: MethodChannel.Result, operation: String) {
+        runtimeHost.runBackground {
+            val response = try {
+                val payload = call.arguments as? Map<*, *>
+                    ?: throw IllegalArgumentException("File presentation expects a map")
+                val path = payload["path"] as? String
+                    ?: throw IllegalArgumentException("File presentation requires a path")
+                val request = JSONObject().put("operation", operation).put("path", path)
+                if (operation == "shareFile") request.put("title", payload["title"] as? String
+                    ?: throw IllegalArgumentException("File sharing requires a title"))
+                val opened = JSONObject(runtimeHost.fileSystemResourceOperation(request.toString()))
+                mapOf("success" to opened.getBoolean("ok"), "error" to opened.optString("error"))
+            } catch (error: Exception) {
+                mapOf("success" to false, "error" to AndroidFileOpener.safeFailureMessage(error))
+            }
+            activity.runOnUiThread { result.success(response) }
+        }
+    }
 
     /** Dispatches owner system operations on the runtime worker. */
     private fun ownerSystemOperation(call: MethodCall, result: MethodChannel.Result) {
@@ -287,6 +318,7 @@ class OwnerSystemCapabilityChannel(
                         ?: throw IllegalArgumentException("system operation paramsJson is required")
                 val response =
                     when (operation) {
+                        "ui_automation" -> mapOf("resultJson" to uiAutomation.execute(JSONObject(paramsJson)).toString())
                         "send_notification" -> systemSendNotification(JSONObject(paramsJson))
                         "get_device_location" -> mapOf(
                             "resultJson" to JSONObject(locationReader.read(JSONObject(paramsJson))).toString(),
@@ -302,13 +334,8 @@ class OwnerSystemCapabilityChannel(
                         )
                         "get_system_setting" -> systemGetSystemSetting(JSONObject(paramsJson))
                         "modify_system_setting" -> systemModifySystemSetting(JSONObject(paramsJson))
-                        "android_file_presentation" -> {
-                            val response = JSONObject(runtimeHost.fileSystemResourceOperation(paramsJson))
-                            check(response.getBoolean("ok")) { response.optString("error", "File presentation failed") }
-                            mapOf("resultJson" to JSONObject().put("success", true).toString())
-                        }
-                        "install_app", "uninstall_app", "list_installed_apps", "start_app", "stop_app", "get_app_usage_time" ->
-                            mapOf("resultJson" to AndroidPackageOperations(activity).execute(operation, JSONObject(paramsJson)).toString())
+                        "application_update_base", "install_app", "uninstall_app", "list_installed_apps", "start_app", "stop_app", "get_app_usage_time" ->
+                            mapOf("resultJson" to packageOperations.execute(operation, JSONObject(paramsJson)).toString())
                         "execute_privileged_command" -> systemExecutePrivilegedCommand(JSONObject(paramsJson))
                         else -> throw IllegalArgumentException("unsupported system operation: $operation")
                     }
@@ -432,6 +459,7 @@ class OwnerSystemCapabilityChannel(
         requirePrivilegedCommandAuthorization(target)
         val result =
             AndroidPrivilegedCommandExecutor.execute(
+                context = activity,
                 target = target,
                 command = params.getString("command"),
                 timeoutMillis = params.getLong("timeoutMillis"),
@@ -2119,6 +2147,7 @@ class OwnerSystemCapabilityChannel(
     private fun captureScreenshotWithRoot(file: File) {
         val result =
             AndroidPrivilegedCommandExecutor.execute(
+                context = activity,
                 target = AndroidPrivilegedCommandTarget.RootAuto,
                 command = "/system/bin/screencap -p ${shellQuote(file.absolutePath)}",
                 rootSettings = AndroidPrivilegeAuthorization.rootExecutionSettings(activity),
@@ -2134,6 +2163,7 @@ class OwnerSystemCapabilityChannel(
     private fun captureScreenshotWithShizuku(file: File) {
         val result =
             AndroidPrivilegedCommandExecutor.execute(
+                context = activity,
                 target = AndroidPrivilegedCommandTarget.Shizuku,
                 command = "/system/bin/screencap -p",
             )

@@ -27,6 +27,7 @@ pub(crate) enum StartupMetadata {
     HostProvided,
     AndroidDevice {
         model: String,
+        archiveRuntimeRoot: PathBuf,
     },
     AndroidPrivileged {
         model: String,
@@ -60,25 +61,13 @@ pub(crate) fn startBridge(startup: BridgeStartup) -> Result<OperitFlutterBridge,
         .withBrowserAutomationHost(Arc::new(browserAutomationHost))
         .withBrowserSessionHost(Arc::new(FlutterBrowserSessionBridge::new()))
         .withComposeDslWebViewHost(Arc::new(composeDslHost))
-        .withFloatingWindowHost(Arc::new(|request: serde_json::Value| {
-            crate::FlutterOwnerCapabilities::ownerSystemOperation::<serde_json::Value>(
-                "floating_window",
-                request,
-            )
-        }))
+        .withFloatingWindowHost(Arc::new(crate::FlutterOwnerCapabilities::floatingWindowCommand))
         .withToastHost(Arc::new(
             crate::FlutterOwnerCapabilities::presentFlutterToast,
         ))
         .withClipboardHost(Arc::new(
             crate::FlutterOwnerCapabilities::setFlutterClipboardText,
         ));
-    let terminal = context
-        .terminalHost
-        .clone()
-        .ok_or_else(|| "Flutter runtime requires a terminal host".to_string())?;
-    context = context.withTerminalHost(Arc::new(
-        crate::FlutterOwnerCapabilities::RuntimeSessionPublishingTerminalHost::new(terminal),
-    ));
     let deviceInfo = platform::startup_device_info(&context, &startup.metadata)?;
     OperitFlutterBridge::start(
         LocalCoreProxy::new(OperitApplication::newWithContext(context)),

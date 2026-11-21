@@ -1,11 +1,20 @@
 // Generated from operit-plugin-sdk Rust declarations.
 
-import type { AgentStatusResultData, AppListData, AppOperationData, AppUsageTimeResultData, BinaryFileContentData, BluetoothBleNotificationData, BluetoothBleServicesData, BluetoothBondedDevicesData, BluetoothReadData, BluetoothScanResultData, BluetoothSessionData, BluetoothStateData, BluetoothTransferData, CatalogReadToolSourcesResultData, ChatCallResultData, ChatCancelResultData, ChatCreationResultData, ChatDeleteExtensionResultData, ChatDeleteResultData, ChatFindResultData, ChatListResultData, ChatMessagesResultData, ChatObservationResultData, ChatReadExtensionResultData, ChatSendMessageResultData, ChatServiceStartResultData, ChatSwitchResultData, ChatTitleUpdateResultData, ChatWriteExtensionResultData, DeviceInfoResultData, DirectoryListingData, EdgePortResultData, EnvironmentVariableReadResultData, EnvironmentVariableWriteResultData, FileApplyResultData, FileContentData, FileExistsData, FileInfoData, FileOperationData, FilePartContentData, FindFilesResultData, GrepResultData, HiddenTerminalCommandResultData, HttpResponseData, LocationData, MediaRegistrationResultData, MessageSendResultData, ModelsListSummariesResultData, MusicPlaybackResultData, NotificationData, SleepResultData, StorageRequestResultData, SttTranscribeResultData, SystemSettingData, TerminalCommandResultData, TerminalInfoResultData, TerminalObservationResultData, TerminalSessionCloseResultData, TerminalSessionCreationResultData, TerminalSessionScreenResultData, ThemeApplyConfigResultData, ThemeListConfigsResultData, ToolResultData, TtsGetCurrentConfigIdResultData, TtsListConfigsResultData, TtsSetCurrentConfigIdResultData, TtsSpeakResultData, TtsSynthesizeResultData, VisitWebResultData, WebSocketResultData } from "./results";
+import type { AgentStatusResultData, AppListData, AppOperationData, AppUsageTimeResultData, BinaryFileContentData, BluetoothBleNotificationData, BluetoothBleServicesData, BluetoothBondedDevicesData, BluetoothReadData, BluetoothScanResultData, BluetoothSessionData, BluetoothStateData, BluetoothTransferData, BooleanResultData, CatalogReadToolSourcesResultData, ChatCallResultData, ChatCancelResultData, ChatCancelScheduledMessageResultData, ChatCreationResultData, ChatDeleteExtensionResultData, ChatDeleteResultData, ChatFindResultData, ChatListResultData, ChatMessagesResultData, ChatObservationResultData, ChatPreparedDeliveryResultData, ChatReadExtensionResultData, ChatScheduleMessageResultData, ChatScheduledMessagesResultData, ChatSendMessageResultData, ChatServiceStartResultData, ChatSwitchResultData, ChatTitleUpdateResultData, ChatWriteExtensionResultData, DeviceInfoResultData, DirectoryListingData, EdgePortResultData, EnvironmentVariableReadResultData, EnvironmentVariableWriteResultData, FileApplyResultData, FileContentData, FileExistsData, FileInfoData, FileOperationData, FilePartContentData, FindFilesResultData, GrepResultData, HiddenTerminalCommandResultData, HttpResponseData, JsonResultData, LocationData, MediaRegistrationResultData, MessageSendResultData, ModelsListSummariesResultData, MusicPlaybackResultData, NotificationData, SleepResultData, StorageRequestResultData, SttTranscribeResultData, SystemSettingData, TerminalCommandResultData, TerminalInfoResultData, TerminalObservationResultData, TerminalSessionCloseResultData, TerminalSessionCreationResultData, TerminalSessionScreenResultData, ThemeApplyConfigResultData, ThemeListConfigsResultData, ToolResultData, TtsGetCurrentConfigIdResultData, TtsListConfigsResultData, TtsSetCurrentConfigIdResultData, TtsSpeakResultData, TtsSynthesizeResultData, UIActionResultData, UIPageResultData, VisitWebResultData, WebSocketResultData } from "./results";
 
 /**
  * Maps every built-in tool name to its concrete public result type.
  */
 export interface ToolResultMap {
+  list_windows: JsonResultData;
+  focus_window: UIActionResultData;
+  get_page_info: UIPageResultData;
+  tap: UIActionResultData;
+  long_press: UIActionResultData;
+  click_element: UIActionResultData;
+  set_input_text: UIActionResultData;
+  press_key: UIActionResultData;
+  swipe: UIActionResultData;
   edge_execute: EdgePortResultData;
   io_execute: EdgePortResultData;
   list_files: DirectoryListingData;
@@ -101,6 +110,7 @@ export interface ToolResultMap {
   models_list_summaries: ModelsListSummariesResultData;
   tts_synthesize: TtsSynthesizeResultData;
   tts_speak: TtsSpeakResultData;
+  tts_cancel: BooleanResultData;
   stt_transcribe: SttTranscribeResultData;
   tts_list_configs: TtsListConfigsResultData;
   tts_get_current_config_id: TtsGetCurrentConfigIdResultData;
@@ -148,6 +158,10 @@ export interface ToolResultMap {
   send_message_to_ai_streaming: MessageSendResultData;
   chat_send_message: ChatSendMessageResultData;
   chat_observe: ChatObservationResultData;
+  chat_deliver_prepared: ChatPreparedDeliveryResultData;
+  chat_list_scheduled_messages: ChatScheduledMessagesResultData;
+  chat_schedule_message: ChatScheduleMessageResultData;
+  chat_cancel_scheduled_message: ChatCancelScheduledMessageResultData;
   chat_cancel: ChatCancelResultData;
   chat_read_extension: ChatReadExtensionResultData;
   chat_write_extension: ChatWriteExtensionResultData;

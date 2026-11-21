@@ -297,12 +297,26 @@ class _SkillImportDialogState extends State<SkillImportDialog> {
       };
       final after = await repository.getAvailableSkillPackages();
       final added = after.keys.toSet().difference(before.keys.toSet());
-      if (added.length != 1) throw StateError('导入未产生唯一技能：$result');
-      await widget.clients.application.setExtensionScope(
-        kind: 'skill',
-        id: added.single,
-        scope: scope,
-      );
+      if (added.isEmpty) {
+        if (result.startsWith('Imported skill: ') ||
+            RegExp(r'^Imported [1-9]\d* skills;').hasMatch(result)) {
+          final errors = await repository.getSkillLoadErrors();
+          if (errors.isNotEmpty) {
+            throw StateError(
+              '技能加载失败：\n${errors.entries.map((entry) => '${entry.key}: ${entry.value}').join('\n')}',
+            );
+          }
+          throw StateError('技能文件已导入，但未能加载。请刷新扩展列表并查看技能扫描错误。');
+        }
+        throw StateError('未导入新技能：$result');
+      }
+      for (final skillId in added) {
+        await widget.clients.application.setExtensionScope(
+          kind: 'skill',
+          id: skillId,
+          scope: scope,
+        );
+      }
       if (!mounted) {
         return;
       }
@@ -317,7 +331,7 @@ class _SkillImportDialogState extends State<SkillImportDialog> {
       });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(error.toString()),
+          content: Text(error is StateError ? error.message : error.toString()),
           behavior: SnackBarBehavior.floating,
         ),
       );

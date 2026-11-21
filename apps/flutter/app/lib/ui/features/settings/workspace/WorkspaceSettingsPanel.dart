@@ -8,6 +8,7 @@ import '../../../../l10n/generated/app_localizations.dart';
 import '../../../common/components/M3LoadingIndicator.dart';
 import '../../../theme/OperitGlassSurface.dart';
 import '../components/SettingsControlStyles.dart';
+import 'TerminalProfilesSettings.dart';
 
 class WorkspaceSettingsPanel extends StatefulWidget {
   const WorkspaceSettingsPanel({super.key, GeneratedCoreProxyClients? clients})
@@ -32,7 +33,8 @@ class _WorkspaceSettingsPanelState extends State<WorkspaceSettingsPanel> {
   }
 
   Future<_WorkspaceSettingsData> _load() async {
-    final summary = await widget.clients.servicesWorkspaceService
+    final summary = await widget.clients.application
+        .workspaceService()
         .workspaceManagementSummary();
 
     return _WorkspaceSettingsData(
@@ -93,9 +95,9 @@ class _WorkspaceSettingsPanelState extends State<WorkspaceSettingsPanel> {
     final targets = Set<String>.from(_selectedWorkspaceNames);
     setState(() => _deleteInProgress = true);
     try {
-      await widget.clients.servicesWorkspaceService.deleteUnboundWorkspaces(
-        workspaceNames: targets.toList(),
-      );
+      await widget.clients.application
+          .workspaceService()
+          .deleteUnboundWorkspaces(workspaceNames: targets.toList());
       if (!mounted) {
         return;
       }
@@ -158,6 +160,7 @@ class _WorkspaceSettingsPanelState extends State<WorkspaceSettingsPanel> {
         return ListView(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
           children: <Widget>[
+            TerminalProfilesSettings(clients: widget.clients),
             _SectionCard(
               title: l10n.settingsWorkspaceBoundOverview,
               children: <Widget>[

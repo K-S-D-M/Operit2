@@ -3,7 +3,7 @@ use operit_host_api::TimeUtils::currentTimeMillis;
 use operit_link::protocol::LinkDeviceInfo;
 use operit_link::{fromCoreValue, toCoreValue, CoreCallRequest, CoreValue, CORE_INTERNAL_TARGET};
 use operit_store::CoreNodeBindingStore::CoreNodeBindingStore;
-use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceDeviceProfile, CoreSpaceRoutePlan, CoreSpaceStore};
+use operit_store::CoreSpaceStore::{CoreSpace, CoreSpaceDeviceConnection, CoreSpaceDeviceProfile, CoreSpaceRoutePlan, CoreSpaceStore};
 use operit_store::NetworkControlStore::{
     NetworkControlAuditRecord, NetworkControlIdentityAssignment, NetworkControlRole,
     NetworkControlState, NetworkControlStore,
@@ -94,7 +94,8 @@ pub enum RuntimeDeviceSpaceConnectionStatus {
     Unknown,
 }
 
-/// Describes one direct connection in the UI-facing device-space topology projection.
+/// Describes one undirected connection in the UI-facing device-space topology projection.
+/// Endpoints are ordered by device ID so both owners' announcements form one connection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeDeviceSpaceConnection {
     pub firstDeviceId: String,
@@ -612,11 +613,9 @@ impl RuntimeRemoteLinkService {
         };
         let profiles = self.spaceStore.deviceProfiles()?;
         let currentDeviceId = self.nodeRouter.localNodeId();
-        let activePeers = self.nodeServices().and_then(|services| services.peers().activePeerNodeIds().map_err(|error| error.to_string()))
-            .unwrap_or_else(|error| {
-                operit_util::AppLogger::AppLogger::w("RuntimeRemoteLinkService", &format!("Space {} overview active links: {error}", space.spaceId));
-                BTreeSet::new()
-            });
+        let peers = self.nodeServices()?.peers();
+        let activePeers = peers.activePeerNodeIds().map_err(|error| error.to_string())?;
+        let mut protocolFailures = peers.peerProtocolFailures();
         let devices = space
             .members
             .iter().cloned()
@@ -637,21 +636,44 @@ impl RuntimeRemoteLinkService {
                     })
                 };
                 let online = deviceId == currentDeviceId || routePlan.is_some();
-                Ok(runtimeDeviceSpaceDevice(
+                let mut device = runtimeDeviceSpaceDevice(
                     profile,
                     online,
                     routePlan.as_ref(),
                     controlState.as_ref().and_then(|state| runtimeDeviceSpaceIdentity(state, &deviceId)),
-                ))
+                );
+                // A live direct channel has already authenticated the current protocol.
+                if deviceId == currentDeviceId || activePeers.contains(&deviceId) {
+                    device.protocolVersion = Some(crate::PeerProtocol::VERSION);
+                }
+                device
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Vec<_>>();
         let devicesById = devices
             .iter()
             .map(|device| (device.deviceId.clone(), device))
             .collect::<BTreeMap<_, _>>();
+        protocolFailures.retain(|peer, _| devicesById.contains_key(peer) && !activePeers.contains(peer));
         let connections = self
             .spaceStore
             .deviceConnectionsForSpace(&space)?
+            .into_iter()
+            .chain(protocolFailures.keys().map(|peer| CoreSpaceDeviceConnection {
+                firstDeviceId: currentDeviceId.clone(), secondDeviceId: peer.clone(),
+            }))
+            .map(|mut connection| {
+                // Routing announcements are directed and independently owned. The
+                // overview shows device pairs, so merge A -> B and B -> A here
+                // without discarding either owner's routing/quality record.
+                if connection.firstDeviceId > connection.secondDeviceId {
+                    std::mem::swap(
+                        &mut connection.firstDeviceId,
+                        &mut connection.secondDeviceId,
+                    );
+                }
+                connection
+            })
+            .collect::<BTreeSet<_>>()
             .into_iter()
             .map(|connection| {
                 let first = devicesById.get(&connection.firstDeviceId).ok_or_else(|| {
@@ -666,15 +688,18 @@ impl RuntimeRemoteLinkService {
                         connection.secondDeviceId
                     )
                 })?;
-                let directlyOnline = if connection.firstDeviceId == currentDeviceId {
-                    Some(activePeers.contains(&connection.secondDeviceId))
+                let directPeer = if connection.firstDeviceId == currentDeviceId {
+                    Some(&connection.secondDeviceId)
                 } else if connection.secondDeviceId == currentDeviceId {
-                    Some(activePeers.contains(&connection.firstDeviceId))
+                    Some(&connection.firstDeviceId)
                 } else {
                     None
                 };
-                let (status, reason) =
-                    runtimeDeviceSpaceConnectionState(first, second, directlyOnline);
+                let directlyOnline = directPeer.map(|peer| activePeers.contains(peer));
+                let (status, reason) = match directPeer.and_then(|peer| protocolFailures.get(peer)) {
+                    Some(failure) => (RuntimeDeviceSpaceConnectionStatus::VersionMismatch, failure.to_string()),
+                    None => runtimeDeviceSpaceConnectionState(first, second, directlyOnline),
+                };
                 Ok(RuntimeDeviceSpaceConnection {
                     firstDeviceId: connection.firstDeviceId,
                     secondDeviceId: connection.secondDeviceId,
@@ -1292,10 +1317,10 @@ fn runtimeDeviceSpaceConnectionState(
     if directlyOnline == Some(false) {
         reasons.push("Direct Peer Link is offline".to_string());
     }
-    let status = if !first.online || !second.online || directlyOnline == Some(false) {
-        RuntimeDeviceSpaceConnectionStatus::Offline
-    } else if versionsMismatch {
+    let status = if versionsMismatch {
         RuntimeDeviceSpaceConnectionStatus::VersionMismatch
+    } else if !first.online || !second.online || directlyOnline == Some(false) {
+        RuntimeDeviceSpaceConnectionStatus::Offline
     } else if firstProtocol.is_none() || secondProtocol.is_none() {
         reasons.push("Peer protocol version is unavailable".to_string());
         RuntimeDeviceSpaceConnectionStatus::Unknown
@@ -1384,7 +1409,11 @@ impl crate::NodeSpaceService::NodeSpaceContext for RuntimeRemoteLinkService {
     fn localNodeId(&self) -> String { self.nodeRouter.localNodeId() }
     fn nodeIsReachable(&self, node: &str) -> Result<bool, String> { self.nodeRouter.nodeIsReachable(node) }
     async fn callNode(&self, node: String, request: CoreCallRequest) -> operit_link::CoreCallResponse {
-        self.nodeRouter.callNode(node, request).await
+        let response = self.nodeRouter.callNode(node, request).await;
+        if let Err(error) = &response.result {
+            crate::SpacePersistenceSyncService::recordSyncTransportError(error);
+        }
+        response
     }
     async fn afterJoined(&self, _peer: String) -> Result<(), String> {
         self.persistenceSyncService().scheduleSynchronization("space_joined")

@@ -19,15 +19,59 @@ Core preferences.
 | ObjectBox memories | Complete memories with original timestamps, UUIDs, tags and properties |
 | ObjectBox links | Original identities, exact endpoints, types, weights and descriptions |
 | ObjectBox document chunks | Original identity, content and order, bound by memory UUID |
-| ObjectBox autosave candidates | Original task status and counters, with selected variant resolved from actual imported messages |
+| ObjectBox autosave candidates | Original task status and counters, exact imported message revision, and the importing CoreNode as producer |
 | Native conversation folder | Core chat group membership |
 | Card name/group association | Resolved plugin selection marker on the imported Core chat |
-| Models, speech, general preferences, chats, token statistics and workspaces | Existing general import paths |
+| API configurations and function models | All providers, credentials and model-index bindings, including unused providers without models |
+| Fixed character models | The corresponding imported provider and model together |
+| Speech, general preferences, chats, token statistics and workspaces | Existing general import paths |
+
+Saved model indices follow Operit1 Kotlin's `getModelList`, `getValidModelIndex`
+and `getModelByIndex` semantics. Model names are split on commas, trimmed and
+filtered for empty entries before indexing. An index outside that list selects
+index 0, as it does in Operit1; the preview, function bindings and fixed character
+bindings all use that effective selection. A binding to an absent configuration
+or a configuration with no models selects the first model of the first nonempty
+configuration in source `config_list` order, without checking function capability,
+endpoint availability or credentials. Preview, function bindings and fixed character
+bindings use the same resolution. Valid existing bindings remain unchanged. A
+snapshot with no configured models is an explicit error. Empty configurations
+remain importable as draft providers.
+
+Provider display names may repeat in Operit1. The shared provider importer retains
+each provider ID and assigns numeric suffixes (`Name1`, `Name2`, and so on) when a
+name collides with another imported provider or a retained target provider. Names
+already present in the incoming backup are reserved before suffix allocation.
+Model IDs, credentials and function/character bindings are preserved.
 
 Existing snapshot resources are rewritten to public runtime paths by the established
 file plan. Declared ObjectBox and memory-space profile directories are consumed by
 migration and excluded from general resource copying. A workspace/external USER.md
 is still an ordinary resource; its filename does not classify it as legacy memory.
+
+The source `memory_space_list` supplies registered memory-space metadata. Operit1
+also opens ObjectBox directly by the active or fixed character profile ID, even
+when that ID has lost its registry entry. Import adopts these referenced databases
+under their original IDs and keeps the character bindings and per-space settings.
+For an unregistered database, its ID is the display name and profile update flags
+use the source schema defaults; an absent user.md represents an empty document.
+Existing documents still undergo UTF-8 and size validation. Unreferenced, unlisted
+databases remain excluded. A reference lacking both metadata and a database is an
+explicit error, as is a registered space missing its required document.
+
+Active selection follows Kotlin's `ActivePromptManager`: a nonblank group ID selects
+that group, a nonblank card ID selects that card, and an unset or blank selection
+means the source `default_character`. The default identity is decoded explicitly
+without creating a replacement role or changing an explicit saved selection.
+
+Importing ordinary appearance clears the target's active saved-theme selection in
+the same preference commit. Existing saved themes retain their own snapshots.
+Imported extraction tasks belong to the importing CoreNode, so the scheduler can
+process them without classifying them as released tasks with unknown provenance.
+Candidates already failed by a previous import can be explicitly retried through
+the existing memory settings action, which records the requesting CoreNode and
+clears the failure before requeuing them. A completed import does not rewrite those
+existing records.
 
 Room 10 has no group-association or pinned source field. Room 20/21 preserve both.
 Each source bridge targets Core SQLite 28 without changing the source version.

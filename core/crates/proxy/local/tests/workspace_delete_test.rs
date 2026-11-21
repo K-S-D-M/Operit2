@@ -11,7 +11,8 @@ use operit_model::ChatMessage::ChatMessage;
 use operit_model::Workspace::WorkspaceFolder;
 use operit_proxy_local::LocalCoreProxy;
 use operit_runtime::core::application::OperitApplication::OperitApplication;
-use operit_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
+use operit_store::repository::WorkspacePreferenceStore::WorkspacePreferenceStore;
+
 use serde_json::json;
 
 /// Exercises the sidebar's generated deletion route with real storage, mounts, and chat metadata.
@@ -31,10 +32,7 @@ async fn workspace_deletion_preserves_chats_and_mounted_files() {
             let workspace_root = root.join("workspaces");
             std::fs::create_dir_all(&runtime_root).unwrap();
             std::fs::create_dir_all(&workspace_root).unwrap();
-            setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(
-                runtime_root.clone(),
-                workspace_root.clone(),
-            ));
+
             let storage = Arc::new(NativeRuntimeStorageHost::new(runtime_root, workspace_root));
             let hosts = HostManager {
                 fileSystemHost: Some(Arc::new(PosixFileSystemHost::new())),
@@ -57,7 +55,7 @@ async fn workspace_deletion_preserves_chats_and_mounted_files() {
             std::fs::write(project.join("nested/keep.txt"), "shared area").unwrap();
             std::fs::write(extra.join("delete.txt"), "default area").unwrap();
             std::fs::write(external.join("keep.txt"), "mounted original").unwrap();
-            let registry = operit_tools::files::MountRegistry::MountRegistry::withStorage(
+            let registry = operit_vfs::MountRegistry::MountRegistry::withStorage(
                 operit_store::RuntimeStorageHost::defaultRuntimeStorageHost(),
             );
             let private_mount = registry
@@ -126,7 +124,7 @@ async fn workspace_deletion_preserves_chats_and_mounted_files() {
                     .set_value(Some(chats[0].id.clone()));
                 let messages = chats
                     .iter()
-                    .map(|chat| manager.loadChatMessages(&chat.id).unwrap())
+                    .map(|chat| manager.loadChatMessagesRange(chat.id.clone(), "asc".to_string(), 0, 79).unwrap())
                     .collect::<Vec<_>>();
                 (workspace, survivor, chats, messages)
             };
@@ -186,7 +184,7 @@ async fn workspace_deletion_preserves_chats_and_mounted_files() {
                 external.join("keep.txt").exists(),
                 "mounted original files must survive"
             );
-            assert_eq!(registry.list().unwrap(), vec![shared_mount]);
+            assert_eq!(registry.list().unwrap(), vec![shared_mount.clone()]);
             {
                 let holder = proxy.chatRuntimeHolder();
                 let mut holder = holder.lock().await;
@@ -197,13 +195,79 @@ async fn workspace_deletion_preserves_chats_and_mounted_files() {
                     manager.getWorkspace(&survivor.id).unwrap(),
                     Some(survivor.clone())
                 );
-                for (chat, original_messages) in chats.iter().zip(messages) {
+                for (chat, original_messages) in chats.iter().zip(messages.iter()) {
                     let retained = manager.loadChatHistory(chat.id.clone()).unwrap().unwrap();
                     assert_eq!(retained.workspaceId, None);
                     assert_eq!(retained.title, chat.title);
                     assert_eq!(
-                        manager.loadChatMessages(&chat.id).unwrap(),
-                        original_messages
+                        manager.loadChatMessagesRange(chat.id.clone(), "asc".to_string(), 0, 79).unwrap(),
+                        *original_messages
+                    );
+                }
+                assert_eq!(
+                    core.chatHistoryDelegate.currentChatIdFlow.value(),
+                    Some(chats[0].id.clone())
+                );
+            }
+            // Simulate a synchronized record disappearing while chats retain its binding.
+            let missing = {
+                let holder = proxy.chatRuntimeHolder();
+                let mut holder = holder.lock().await;
+                let core = holder.coreForTarget(target).unwrap();
+                let manager = &core.chatHistoryDelegate.chatHistoryManager;
+                let missing = manager
+                    .createWorkspace(
+                        "Missing".into(),
+                        vec![folder("project", "/operitapp/workspaces/project".into())],
+                    )
+                    .unwrap();
+                for chat in &chats {
+                    manager
+                        .updateChatWorkspaceId(chat.id.clone(), Some(missing.id.clone()))
+                        .unwrap();
+                }
+                WorkspacePreferenceStore::getInstance().delete(&missing.id).unwrap();
+                assert!(manager.getWorkspace(&missing.id).unwrap().is_none());
+                for chat in &chats {
+                    assert_eq!(
+                        manager.loadChatHistory(chat.id.clone()).unwrap().unwrap().workspaceId,
+                        Some(missing.id.clone())
+                    );
+                }
+                missing
+            };
+            // Missing folder ownership must not trigger filesystem or mount cleanup.
+            let catalog = std::fs::read(&catalog_path).unwrap();
+            std::fs::write(&catalog_path, "invalid catalog").unwrap();
+            let response = CoreLinkSharedClient::call(
+                &proxy,
+                CoreCallRequest::new(
+                    "flutter-delete-missing-bound",
+                    target,
+                    "deleteWorkspace",
+                    toCoreValue(json!({"workspaceId": missing.id})).unwrap(),
+                ),
+            )
+            .await;
+            response.result.expect("missing workspace bindings must be deletable");
+            std::fs::write(&catalog_path, catalog).unwrap();
+            assert!(project.join("nested/keep.txt").exists());
+            assert!(external.join("keep.txt").exists());
+            assert_eq!(registry.list().unwrap(), vec![shared_mount.clone()]);
+            {
+                let holder = proxy.chatRuntimeHolder();
+                let mut holder = holder.lock().await;
+                let core = holder.coreForTarget(target).unwrap();
+                let manager = &core.chatHistoryDelegate.chatHistoryManager;
+                assert!(manager.getWorkspace(&missing.id).unwrap().is_none());
+                assert_eq!(manager.getWorkspace(&survivor.id).unwrap(), Some(survivor.clone()));
+                for (chat, original_messages) in chats.iter().zip(messages.iter()) {
+                    let retained = manager.loadChatHistory(chat.id.clone()).unwrap().unwrap();
+                    assert_eq!(retained.workspaceId, None);
+                    assert_eq!(retained.title, chat.title);
+                    assert_eq!(
+                        manager.loadChatMessagesRange(chat.id.clone(), "asc".to_string(), 0, 79).unwrap(),
+                        *original_messages
                     );
                 }
                 assert_eq!(

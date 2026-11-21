@@ -4,7 +4,7 @@ use super::OpenAIResponsesProvider;
 use crate::chat::llmprovider::ThinkingDialect::RequestThinking;
 use operit_model::ModelThinking::ModelThinkingSpec;
 use crate::chat::llmprovider::ProviderMediaTestSupport::{
-    test_runtime_context, tool_image_request, TestImage, IMAGE_DATA_URL,
+    test_runtime_context, tool_image_request, TestImage,
 };
 
 #[test]
@@ -17,7 +17,7 @@ fn shared_responses_wrappers_keep_tool_images_in_function_output() {
     ] {
         let responses_provider = OpenAIResponsesProvider::new(
             "https://example.test/v1/responses".to_string(),
-            "test-key".to_string(),
+            "test-key".to_string().into(),
             "test-model".to_string(),
             provider_type.to_string(),
             Vec::new(),
@@ -41,7 +41,7 @@ fn shared_responses_wrappers_keep_tool_images_in_function_output() {
             "{provider_type}"
         );
         assert_eq!(
-            output["output"][0]["image_url"], IMAGE_DATA_URL,
+            output["output"][0]["image_url"], image.data_url(),
             "{provider_type}"
         );
         assert_eq!(output["output"][1]["text"], "tool text", "{provider_type}");
@@ -84,7 +84,7 @@ fn shared_responses_history_images_and_encrypted_reasoning_are_preserved() {
     };
     let provider = OpenAIResponsesProvider::new(
         "https://example.test/v1/responses".to_string(),
-        "test-key".to_string(),
+        "test-key".to_string().into(),
         "test-model".to_string(),
         "OPENAI_RESPONSES_GENERIC".to_string(),
         Vec::new(),
@@ -105,8 +105,8 @@ fn shared_responses_history_images_and_encrypted_reasoning_are_preserved() {
     assert_eq!(reasoning["encrypted_content"], "encrypted-reasoning");
     let users: Vec<_> = input.iter().filter(|item| item["role"] == "user").collect();
     assert_eq!(users.len(), 2);
-    assert_eq!(users[0]["content"][0]["image_url"], IMAGE_DATA_URL);
-    assert_eq!(users[1]["content"][1]["image_url"], IMAGE_DATA_URL);
+    assert_eq!(users[0]["content"][0]["image_url"], image.data_url());
+    assert_eq!(users[1]["content"][1]["image_url"], image.data_url());
     let assistant = input
         .iter()
         .find(|item| item["role"] == "assistant")

@@ -377,12 +377,11 @@ where F: Fn(&str,&str)->bool + Copy + 'a {
                     if initialization.data.owner.backend != crate::Transaction::Backend::DataStore {
                         return Err(ApplyError::Capability("Preference initialization requires DataStore data".into()));
                     }
-                    if operation.payload["encrypted"] != owner.encrypted { return Err(ApplyError::Capability("Conflicting preference encryption policy".into())); }
                     if initialization.data.owner.format > validation.syncSchemaVersion().map_err(ApplyError::from)? { return Err(ApplyError::Retry("Future preference initialization format".into())); }
                     return Ok(());
                 }
                 let entry = PreferencesSyncedEntry::fromOperation(operation).map_err(ApplyError::from)?;
-                if entry.encrypted() != owner.encrypted { return Err(ApplyError::Capability("Conflicting preference encryption policy".into())); }
+                // Encryption describes the source's storage format; the local owner chooses how to write.
                 entry.requireSchemaVersion(validation.syncSchemaVersion().map_err(ApplyError::from)?).map_err(ApplyError::from)?;
                 if owner.merge.catalog.is_some() { declaredAliases(schema, std::slice::from_ref(&entry)).map(|_| ()).map_err(ApplyError::Capability) }
                 else { Ok(()) }
@@ -397,7 +396,7 @@ where F: Fn(&str,&str)->bool + Copy + 'a {
             snapshot: Some(Box::new(move || snapshot.syncSnapshot().map_err(|e|e.to_string()))),
             definition: None,
             coverage: Box::new(move || coverage.syncSnapshot().map(|snapshot|snapshot.covered).map_err(|e|e.to_string())),
-            content_digest: crate::Transaction::Snapshot::content_digest,
+            content_summary: crate::Transaction::Snapshot::content_summary,
             repair: Some(Box::new(move |expected, source, file, _| crate::Transaction::preference::repair_file(&repair,expected,source,file).map_err(|e|e.to_string()))),
         })?;
     }
@@ -470,6 +469,27 @@ pub(crate) fn applyDeclaredOperations<F>(
 ) -> Result<BTreeMap<String,String>,PreferencesDataStoreError>
 where F: Fn(&str,&str)->bool {
     let path = store.path().to_str().ok_or_else(||PreferencesDataStoreError::Message("Invalid preference path".into()))?;
+    // Covered opaque history has no compaction work. Reuse committed state when
+    // identity decisions leave its declared records and references unchanged,
+    // without requiring old migration context to replay already applied originals.
+    if incoming.is_empty()
+        && store.schema.as_ref().is_some_and(|schema| !schema.migrate.independent)
+    {
+        let declared = schema.stores.iter().find(|owner| owner.path == path);
+        if let Some(declared) = declared {
+            if let Ok(snapshot) = store.syncSnapshot() {
+                let decisions_absorbed = aliasesAbsorbed(declared, &snapshot.data, externalAliases)?;
+                let history_absorbed = crate::SyncOperationStore::SyncOperationStore::new(
+                        store.storageHost.clone(), operit_util::RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH)
+                    .archivedPreferenceHistory(path).map(|history| {
+                        history.iter().all(|op| snapshot.covered.contains(&op.opId))
+                    }).unwrap_or(false);
+                if decisions_absorbed && history_absorbed {
+                    return Ok(snapshot.data.aliases.clone());
+                }
+            }
+        }
+    }
     let encrypted = schema.owner(path).map_err(PreferencesDataStoreError::Message)?.ok_or_else(||PreferencesDataStoreError::Message("Preference owner is not registered".into()))?.encrypted;
     let version = store.syncSchemaVersion()?;
     crate::Transaction::preference::apply(store, incoming,
@@ -516,7 +536,7 @@ where F: Fn(&str,&str)->bool {
         }
         store.migrateSyncedEntries(version, preferences, &mut entries)?;
         let schema = &owner;
-        if entries.iter().any(|entry| entry.storagePath() != path || entry.encrypted() != encrypted)
+        if entries.iter().any(|entry| entry.storagePath() != path)
             || schema.stores.iter().any(|store| store.path != path || store.encrypted != encrypted) {
             return Err(PreferencesDataStoreError::Message("Conflicting preference dataset or encryption policy".into()));
         }
@@ -544,6 +564,11 @@ where F: Fn(&str,&str)->bool {
         }
         let compact = independentHistory(store, &schema.stores);
         let retired = PreferencesSyncedEntry::replay(&entries, preferences, compact)?;
+        // Contract resolution is independent of business LWW order, including
+        // schema-only checkpoints whose originals are already covered.
+        if let Some(contract) = &contract {
+            preferences.set(&stringPreferencesKey(crate::PluginPreferenceSchema::KEY), serde_json::to_value(contract)?);
+        }
         // Content identity is declared by the owner catalog; ignored fields are not business identity.
         for (store, catalog) in schema.catalogs() {
             let mut contents = BTreeMap::<String, String>::new();
@@ -610,6 +635,36 @@ where F: Fn(&str,&str)->bool {
         }
         Ok((aliases, retired))
     })
+}
+
+/// Checks pending identity decisions through the same catalog and reference selectors as replay.
+fn aliasesAbsorbed(
+    store: &PreferenceMergeStore,
+    data: &crate::Transaction::Data,
+    aliases: &BTreeMap<String, String>,
+) -> Result<bool, PreferencesDataStoreError> {
+    let pending = aliases.iter()
+        .filter(|(key, value)| data.aliases.get(*key) != Some(*value))
+        .map(|(key, value)| (key.clone(), value.clone())).collect::<BTreeMap<_, _>>();
+    if pending.is_empty() { return Ok(true); }
+    if let Some(catalog) = &store.merge.catalog {
+        for key in data.values.keys().filter(|key| keyMatches(key, catalog)) {
+            let id = catalogIdentity(key, catalog).map_err(PreferencesDataStoreError::Message)?;
+            if pending.contains_key(&referenceKey(&store.path, id)) { return Ok(false); }
+        }
+    }
+    for reference in &store.merge.references {
+        if !pending.keys().any(|key| key.split_once('\u{1f}').is_some_and(|(path, _)| path == reference.target)) {
+            continue;
+        }
+        for (_, value) in data.values.iter().filter(|(key, _)| reference.key.matches(key)) {
+            let mut rewritten = value.clone();
+            rewriteReferenceValue(&mut rewritten, &reference.path, &reference.target, &pending)
+                .map_err(PreferencesDataStoreError::Message)?;
+            if rewritten != *value { return Ok(false); }
+        }
+    }
+    Ok(true)
 }
 
 /// Rewrites declared references using the executor's canonical identity map.

@@ -1,6 +1,10 @@
 import type { WorldBookI18n } from "./types";
+import { WORLDBOOK_SERVICE_ZH_CN } from "./service.js";
+import { WORLDBOOK_SNIPPETS_ZH_CN } from "./snippets.js";
 
 export const WORLDBOOK_I18N_ZH_CN: WorldBookI18n = {
+  service: WORLDBOOK_SERVICE_ZH_CN,
+  contentSnippets: WORLDBOOK_SNIPPETS_ZH_CN,
   unknown: "未知错误",
   toastLoadFailedPrefix: "加载失败: ",
   toastActionFailedPrefix: "操作失败: ",

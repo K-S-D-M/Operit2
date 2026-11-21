@@ -33,6 +33,14 @@ pub fn verify_original<T: PartialEq>(id: &str, existing: &T, incoming: &T) -> Re
     Ok(())
 }
 
+/// A blob reference preserves the fingerprint of the complete canonical original.
+pub(crate) fn operation_digest(operation:&crate::SyncOperationStore::SyncOperation)->Result<String> {
+    if let Some(reference)=crate::SyncBlobIo::transaction_reference(operation)? {
+        return Ok(reference.contentHash);
+    }
+    digest(operation)
+}
+
 /// Immutable identity union followed by business ordering, preserving each author's sequence.
 pub fn ordered<T: PartialEq>(
     items: impl IntoIterator<Item = T>,
@@ -337,11 +345,18 @@ pub struct Addition {
     pub delta: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(not(feature="full"), derive(Serialize, PartialEq))]
 pub struct Data {
     pub owner: Owner,
     pub values: BTreeMap<String, Value>,
+    #[cfg(feature="full")]
+    #[serde(skip)]
+    pub sql: Option<std::sync::Arc<sql_snapshot::SqlSnapshot>>,
     pub revision: Option<Revision>,
+    /// Identifies an explicit restore that supersedes every earlier synchronization lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restoration: Option<Revision>,
     pub deleted: BTreeSet<String>,
     pub aliases: BTreeMap<String, String>,
     #[serde(default)]
@@ -350,12 +365,43 @@ pub struct Data {
     pub additions: BTreeMap<String, Vec<Addition>>,
 }
 
+#[cfg(feature="full")]
+impl Serialize for Data {
+    fn serialize<S:serde::Serializer>(&self, serializer:S) -> std::result::Result<S::Ok,S::Error> {
+        sql_snapshot::DataWire { data:self, canonical:false }.serialize(serializer)
+    }
+}
+#[cfg(feature="full")]
+impl PartialEq for Data {
+    fn eq(&self, other:&Self) -> bool {
+        self.owner == other.owner && self.revision == other.revision && self.restoration == other.restoration && self.deleted == other.deleted
+            && self.aliases == other.aliases && self.versions == other.versions && self.additions == other.additions
+            && if self.sql.is_none() && other.sql.is_none() { self.values == other.values } else {
+                matches!((self.values_digest(),other.values_digest()),(Ok(a),Ok(b)) if a==b)
+            }
+    }
+}
 impl Data {
+    /// Hashes business values and counts their canonical bytes in the same pass.
+    pub fn values_summary(&self) -> Result<(String, u64)> {
+        #[cfg(feature="full")]
+        if let Some(sql)=&self.sql { return serialized_digest(&sql.values()); }
+        serialized_digest(&self.values)
+    }
+
+    /// Reads the business digest independently of replay metadata.
+    pub fn values_digest(&self) -> Result<String> {
+        self.values_summary().map(|(digest, _)| digest)
+    }
+
     pub fn empty(owner: Owner) -> Self {
         Self {
             owner,
             values: BTreeMap::new(),
+            #[cfg(feature="full")]
+            sql: None,
             revision: None,
+            restoration: None,
             deleted: BTreeSet::new(),
             aliases: BTreeMap::new(),
             versions: BTreeMap::new(),
@@ -383,48 +429,73 @@ impl Data {
         Ok(())
     }
 
-    /// Publish the entire transaction only after all edits succeed.
+    /// Publish a transaction only after all edits succeed.
     pub fn apply(&mut self, transaction: &Transaction) -> Result<()> {
+        self.apply_batch(std::slice::from_ref(transaction))
+    }
+
+    /// Retains the caller's state if any edit in the batch fails.
+    pub fn apply_batch(&mut self, transactions: &[Transaction]) -> Result<()> {
+        if transactions.is_empty() { return Ok(()); }
+        *self = self.clone().into_applied_batch(transactions)?;
+        Ok(())
+    }
+
+    /// Consumes a private replay view; failure drops it before any state is published.
+    pub(crate) fn into_applied_batch(mut self, transactions: &[Transaction]) -> Result<Self> {
+        if transactions.is_empty() { return Ok(self); }
+        // Validate encoded scopes once; individual edits only decode their key or namespace.
+        let mut canonical_scopes = true;
+        for encoded in self.versions.keys().chain(self.additions.keys()) {
+            let scope = serde_json::from_str::<(String, Vec<Path>)>(encoded).map_err(|e|e.to_string())?;
+            canonical_scopes &= serde_json::to_string(&scope).map_err(|e|e.to_string())? == *encoded;
+        }
+        for transaction in transactions { self.apply_in_place(transaction, canonical_scopes)?; }
+        Ok(self)
+    }
+
+    /// Publish the entire transaction only after all edits succeed.
+    fn apply_in_place(&mut self, transaction: &Transaction, canonical_scopes: bool) -> Result<()> {
         if transaction.target != Target::Data(self.owner.clone()) {
             return Err("Transaction owner/version is not ready".into());
         }
-        let mut staged = self.clone();
         for edit in &transaction.edits {
             if let Edit::Patch { key, set, delete } = edit {
                 for (field, value) in set {
-                    staged.apply_edit(
+                    self.apply_edit(
                         &Edit::Set {
                             key: key.clone(),
                             path: vec![Path::Field(field.clone())],
                             value: value.clone(),
                         },
                         &transaction.revision,
+                        canonical_scopes,
                     )?;
                 }
                 for field in delete {
-                    staged.apply_edit(
+                    self.apply_edit(
                         &Edit::Delete {
                             key: key.clone(),
                             path: vec![Path::Field(field.clone())],
                         },
                         &transaction.revision,
+                        canonical_scopes,
                     )?;
                 }
             } else {
-                staged.apply_edit(edit, &transaction.revision)?;
+                self.apply_edit(edit, &transaction.revision, canonical_scopes)?;
             }
         }
-        if staged
+        if self
             .revision
             .as_ref()
             .is_none_or(|previous| newer(&transaction.revision, previous))
         {
-            staged.revision = Some(transaction.revision.clone());
+            self.revision = Some(transaction.revision.clone());
         }
-        *self = staged;
         Ok(())
     }
-    fn apply_edit(&mut self, edit: &Edit, revision: &Revision) -> Result<()> {
+    fn apply_edit(&mut self, edit: &Edit, revision: &Revision, canonical_scopes: bool) -> Result<()> {
         if let Edit::ReplaceRecords { prefix, records } = edit {
             if prefix.is_empty() {
                 return Err("Empty record namespace".into());
@@ -454,7 +525,7 @@ impl Data {
                     },
                     None => Edit::Delete { key, path: vec![] },
                 };
-                self.apply_edit(&effect, revision)?;
+                self.apply_edit(&effect, revision, canonical_scopes)?;
             }
             self.versions.retain(|encoded, previous| {
                 let (key, path): (String, Vec<Path>) =
@@ -477,8 +548,11 @@ impl Data {
             _ => unreachable!(),
         };
         let scope = (edit.key().to_owned(), path.clone());
+        let key_prefix = format!("[{},", serde_json::to_string(&scope.0).map_err(|e|e.to_string())?);
         let mut descendants = Vec::new();
         for (encoded, previous) in &self.versions {
+            // Ordinary scopes for other keys cannot affect this edit. Record namespaces can.
+            if canonical_scopes && !encoded.starts_with(&key_prefix) && !encoded.ends_with(",[{\"kind\":\"records\"}]]") { continue; }
             let (key, ancestor): (String, Vec<Path>) =
                 serde_json::from_str(encoded).map_err(|e| e.to_string())?;
             if ancestor == [Path::Records] && scope.0.starts_with(&key) {
@@ -518,6 +592,7 @@ impl Data {
             // A checkpoint contains totals and the still-relevant additive effects.
             // Retain only effects after this assignment and reapply them to its new value.
             for (encoded, additions) in &mut self.additions {
+                if canonical_scopes && !encoded.starts_with(&key_prefix) { continue; }
                 let (key, nested): (String, Vec<Path>) =
                     serde_json::from_str(encoded).map_err(|e| e.to_string())?;
                 if key != scope.0 || !nested.starts_with(path) {
@@ -555,6 +630,7 @@ impl Data {
                 restore.apply(&mut self.values)?;
             }
             self.versions.retain(|encoded, previous| {
+                if canonical_scopes && !encoded.starts_with(&key_prefix) { return true; }
                 let (key, nested): (String, Vec<Path>) =
                     serde_json::from_str(encoded).expect("validated scope");
                 key != scope.0 || !nested.starts_with(path) || newer(previous, revision)
@@ -1136,11 +1212,30 @@ pub struct Replay {
     pub pending: BTreeMap<String, String>,
 }
 
+/// Hashes the existing JSON representation without allocating another complete document.
 pub fn digest<T: Serialize>(value: &T) -> Result<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(value).map_err(|e| e.to_string())?)
-    ))
+    serialized_digest(value).map(|(hash, _)| hash)
+}
+
+pub(crate) fn serialized_digest<T: Serialize>(value: &T) -> Result<(String, u64)> {
+    struct HashWriter { hash: Sha256, bytes: u64 }
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.hash.update(bytes);
+            self.bytes = self.bytes.checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("Serialized transaction is too large"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut writer = HashWriter { hash: Sha256::new(), bytes: 0 };
+    // JSON emits many tiny writes. Buffer them without changing the canonical bytes.
+    {
+        let mut buffered = std::io::BufWriter::with_capacity(8192, &mut writer);
+        serde_json::to_writer(&mut buffered, value).map_err(|e| e.to_string())?;
+        std::io::Write::flush(&mut buffered).map_err(|e| e.to_string())?;
+    }
+    Ok((format!("{:x}", writer.hash.finalize()), writer.bytes))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1160,10 +1255,14 @@ impl Snapshot {
     }
     /// Compare the materialized file values/tables, independently of replay bookkeeping.
     pub fn content_digest(&self) -> Result<String> {
-        digest(&self.data.values)
+        self.data.values_digest()
+    }
+    /// Counts synchronized business bytes without including history or snapshot metadata.
+    pub fn content_summary(&self) -> Result<(String, u64)> {
+        self.data.values_summary()
     }
     /// Owners may project local SQL bookkeeping out of comparisons while retaining the full CAS/export snapshot.
-    pub fn projected_content_digest(&self, project: impl Fn(&str, &Value) -> Result<Option<Value>>) -> Result<String> {
+    pub fn projected_content_summary(&self, project: impl Fn(&str, &Value) -> Result<Option<Value>>) -> Result<(String, u64)> {
         use std::borrow::Cow;
         let values = self.data.values.iter().map(|(name, value)| {
             if self.data.owner.backend == Backend::Sql && value["columns"].as_array().is_none_or(Vec::is_empty) {
@@ -1175,7 +1274,7 @@ impl Snapshot {
             };
             Ok((name, content))
         }).collect::<Result<BTreeMap<_, _>>>()?;
-        digest(&values)
+        serialized_digest(&values)
     }
 
     /// Installs authoritative data without allocating a business revision.
@@ -1217,8 +1316,12 @@ pub struct Manifest {
     pub owner: Owner,
     pub node: String,
     pub revision: Option<Revision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restoration: Option<Revision>,
     pub token: String,
     pub digest: String,
+    /// Canonical synchronized content bytes, excluding local bookkeeping and journal history.
+    pub contentBytes: u64,
     #[serde(default)]
     pub damaged: bool,
 }
@@ -1230,6 +1333,7 @@ pub enum Source {
     Remote,
 }
 
+/// Gives explicit restore baselines priority, then compares ordinary synchronized contents.
 pub fn compare_manifests(local: &Manifest, remote: &Manifest) -> Result<Source> {
     if local.owner != remote.owner {
         return Err("Snapshots are not at the same format/layout".into());
@@ -1240,11 +1344,14 @@ pub fn compare_manifests(local: &Manifest, remote: &Manifest) -> Result<Source> 
         (true, true) => return Err(format!("Neither peer has a complete synchronized file: {}", local.owner.path)),
         _ => {},
     }
+    if local.restoration != remote.restoration {
+        return Ok(if local.restoration > remote.restoration { Source::Local } else { Source::Remote });
+    }
     if local.digest == remote.digest {
         return Ok(Source::Equal);
     }
     Ok(
-        if (&local.revision, &local.node) >= (&remote.revision, &remote.node) {
+        if (local.contentBytes, &local.revision, &local.node) >= (remote.contentBytes, &remote.revision, &remote.node) {
             Source::Local
         } else {
             Source::Remote
@@ -1253,18 +1360,21 @@ pub fn compare_manifests(local: &Manifest, remote: &Manifest) -> Result<Source> 
 }
 
 impl Snapshot {
+    /// Captures the business digest and byte count together with the complete CAS token.
     pub fn manifest(&self) -> Result<Manifest> {
-        self.manifest_with_digest(self.content_digest()?)
+        self.manifest_with_content(self.content_summary()?)
     }
 
-    /// Use the owner's content digest while retaining the complete snapshot token.
-    pub fn manifest_with_digest(&self, digest: String) -> Result<Manifest> {
+    /// Uses the owner's digest and byte count while retaining the complete snapshot token.
+    pub fn manifest_with_content(&self, (digest, contentBytes): (String, u64)) -> Result<Manifest> {
         Ok(Manifest {
             owner: self.data.owner.clone(),
             node: self.node.clone(),
             revision: self.data.revision.clone(),
+            restoration: self.data.restoration.clone(),
             token: self.token()?,
             digest,
+            contentBytes,
             damaged: self.damage.is_some(),
         })
     }
@@ -1296,6 +1406,11 @@ pub fn compare(local: &Snapshot, remote: &Snapshot) -> Result<Option<Correction>
 
 #[path = "transaction/Journal.rs"]
 mod journal;
+#[cfg(feature = "full")]
+#[path = "transaction/FileIndex.rs"]
+mod file_index;
+#[cfg(feature = "full")]
+pub(crate) use file_index::FileSource;
 pub(crate) use journal::{text, Journal, LegacyReceiveState};
 #[path = "transaction/Kernel.rs"]
 pub mod kernel;
@@ -1303,6 +1418,10 @@ pub mod kernel;
 pub mod migration;
 #[path = "transaction/PreferenceOwner.rs"]
 pub mod preference;
+
+#[cfg(feature="full")]
+#[path="transaction/SqlSnapshot.rs"]
+pub mod sql_snapshot;
 
 #[cfg(feature = "full")]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1354,19 +1473,15 @@ pub fn project_sql_table(value: &Value, local_columns: &[&str], identity: Option
         return Err("SQL content projection has an invalid row width".into());
     }
     if let Some((from, to)) = identity {
-        let from = table.columns.iter().position(|name| name == from)
-            .ok_or("Missing identity source column")?;
-        let to = table.columns.iter().position(|name| name == to)
-            .ok_or("Missing identity destination column")?;
+        let locate = |column| table.columns.iter().position(|name| name == column).ok_or("Missing identity column");
+        let (from,to) = (locate(from)?,locate(to)?);
         table.rows.retain(|row| row[from] != row[to]);
     }
-    for index in (0..table.columns.len()).rev() {
-        if local_columns.contains(&table.columns[index].as_str()) {
-            table.columns.remove(index);
-            for row in &mut table.rows {
-                row.remove(index);
-            }
-        }
+    let retained = table.columns.iter().enumerate().filter_map(|(i,name)|
+        (!local_columns.contains(&name.as_str())).then_some(i)).collect::<BTreeSet<_>>();
+    table.columns = table.columns.into_iter().enumerate().filter_map(|(i,value)| retained.contains(&i).then_some(value)).collect();
+    for row in &mut table.rows {
+        *row = std::mem::take(row).into_iter().enumerate().filter_map(|(i,value)| retained.contains(&i).then_some(value)).collect();
     }
     table.rows.sort_by_cached_key(|row| serde_json::to_string(row).expect("SQL cells serialize"));
     table.rows.dedup();
@@ -1401,10 +1516,8 @@ impl SqlDataset<'_> {
         // Read-only import of the previous checkpoint carrier; new writes use initialization transactions.
         self.store.transaction(|tx| {
             if tx.queryOne("SELECT 1 FROM sqlite_master WHERE name='_operit_transaction_checkpoint'",vec![])?.is_some() {
-                if let Some(row) = tx.queryOne("SELECT snapshot FROM _operit_transaction_checkpoint WHERE id=1",vec![])? {
-                    let snapshot: Snapshot = serde_json::from_str(&row.get::<_,String>(0)?).map_err(sql_error)?;
-                    let operation = compaction::Initialization::from_snapshot(&snapshot).operation(self.domain(),false).map_err(sql_error)?;
-                    if compaction::initialization(tx)?.is_none() { compaction::save_initialization(tx,&operation)?; }
+                if let Some(row)=tx.queryOne("SELECT rowid FROM _operit_transaction_checkpoint WHERE id=1",vec![])? {
+                    sql_snapshot::migrate_checkpoint(self.store,tx,row.get(0)?,self.domain())?;
                 }
                 tx.execute("DROP TABLE _operit_transaction_checkpoint",vec![])?;
             }
@@ -1424,10 +1537,13 @@ impl SqlDataset<'_> {
     /// Reads committed identities without loading initialization payloads or business tables.
     pub fn coverage(&self) -> Result<BTreeSet<String>> {
         self.prepare()?;
-        self.store.queryRows(&format!("WITH revisions(id,time,origin,sequence) AS ({})
+        let mut covered = BTreeSet::new();
+        self.store.visitRows(&format!("WITH revisions(id,time,origin,sequence) AS ({})
             SELECT id FROM revisions UNION SELECT id FROM _operit_initialization_coverage
-            UNION SELECT operation_id FROM _operit_transaction_initialization", self.revisions),vec![])
-            .map_err(|e|e.to_string())?.iter().map(|row|row.get(0).map_err(|e|e.to_string())).collect()
+            UNION SELECT operation_id FROM _operit_transaction_initialization", self.revisions),vec![], &mut |row| {
+                covered.insert(row.valueAt(0)?.asString()?); Ok(())
+            }).map_err(|e|e.to_string())?;
+        Ok(covered)
     }
 
     fn snapshot_in(
@@ -1436,68 +1552,46 @@ impl SqlDataset<'_> {
     ) -> std::result::Result<Snapshot, crate::SqliteStore::SqliteStoreError> {
         let mut data = Data::empty(self.owner.clone());
         let mut covered = BTreeSet::new();
-        let generation = 0;
         let mut damage = None;
-        if let Some(row) = tx.queryOne("SELECT operation_id,original FROM _operit_transaction_initialization WHERE id=1", vec![])? {
-            let original: String = row.get(1)?;
-            let previous = serde_json::from_str(&original).map_err(|e|e.to_string())
-                .and_then(|operation|compaction::Initialization::decode(&operation)?.ok_or("Missing initialization".into()))
-                .and_then(|previous|if previous.data.owner == self.owner { Ok(previous) } else { Err("Initialization owner differs".into()) });
-            match previous {
-                Ok(previous) => { data.revision = previous.data.revision; covered = previous.covered; },
-                Err(error) => {
-                    operit_util::AppLogger::AppLogger::w("TransactionSync", &format!("sync_consistency.damaged owner={} stage=initialization error={error}", self.owner.path));
-                    damage = Some(digest(&original).map_err(sql_error)?);
-                    covered = tx.queryRows("SELECT id FROM _operit_initialization_coverage", vec![])?.iter()
-                        .map(|row|row.get(0)).collect::<std::result::Result<_,_>>()?;
-                },
+        if let Some(row)=tx.queryOne("SELECT i.operation_id,m.data,i.original FROM _operit_initialization_metadata m LEFT JOIN _operit_transaction_initialization i ON m.id=i.id WHERE m.id=1",vec![])? {
+            let metadata:Value=serde_json::from_str(&row.get::<_,String>(1)?).map_err(sql_error)?;
+            let owner:Owner=serde_json::from_value(metadata["owner"].clone()).map_err(sql_error)?;
+            let original:Option<String>=row.get(2)?;
+            let pending = metadata["pendingRestoration"] == Value::Bool(true);
+            let fingerprint = match &original {
+                Some(original) => serde_json::from_str::<crate::SyncOperationStore::SyncOperation>(original).map_err(|e|e.to_string()).and_then(|op|digest(&op)),
+                None => Err("Missing initialization original".into()),
+            };
+            if owner!=self.owner || (!pending && fingerprint.as_ref().ok().map(String::as_str)!=metadata["originalFingerprint"].as_str()) {
+                damage=Some(digest(&metadata).map_err(sql_error)?);
+            } else {
+                data.revision=serde_json::from_value(metadata["revision"].clone()).map_err(sql_error)?;
+                data.restoration=serde_json::from_value(metadata["restoration"].clone()).map_err(sql_error)?;
             }
-            covered.insert(row.get(0)?);
+            tx.visitRows("SELECT id FROM _operit_initialization_coverage",vec![], &mut |row| {
+                covered.insert(row.valueAt(0)?.asString()?); Ok(())
+            })?;
+            if let Some(id) = row.get::<_,Option<String>>(0)? { covered.insert(id); }
         }
-        for table in self.tables {
-            let info = tx.queryRows(
-                &format!("PRAGMA table_info({})", sql_identifier(table)),
-                vec![],
-            )?;
-            let columns = info
-                .iter()
-                .map(|row| row.get::<_, String>("name"))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let query = format!(
-                "SELECT {} FROM {}",
-                columns
-                    .iter()
-                    .map(|column| sql_identifier(column))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                sql_identifier(table)
-            );
-            // Missing tables are captured as damaged state so CAS does not require a healthy target.
-            let mut rows = (if columns.is_empty() { Vec::new() } else { tx.queryRows(&query, vec![])? })
-                .into_iter()
-                .map(|row| row.values.into_iter().map(Cell::from).collect::<Vec<_>>())
-                .collect::<Vec<_>>();
-            rows.sort_by_cached_key(|row| serde_json::to_string(row).expect("SQL cells serialize"));
-            data.values.insert(
-                table.to_string(),
-                serde_json::to_value(Table { columns, rows }).map_err(sql_error)?,
-            );
-        }
-        for row in tx.queryRows(self.revisions, vec![])? {
-            let id = row.get::<_, String>(0)?;
-            let revision = Revision { createdAt: row.get(1)?, originDeviceId: row.get(2)?, sequence: row.get(3)? };
+        data.sql=Some(sql_snapshot::SqlSnapshot::capture(self.store.storage.clone().ok_or_else(||sql_error("SQL host requires disk-backed synchronization staging"))?,tx,self.tables)?);
+        let restorationSuffix = data.restoration.as_ref().map(|baseline| format!(":restore:{}:{}", baseline.createdAt, baseline.originDeviceId));
+        tx.visitRows(self.revisions, vec![], &mut |row| {
+            let id = row.get::<_, String>(0).map_err(|e|operit_host_api::HostError::new(e.to_string()))?;
+            let revision = Revision { createdAt: row.get(1).map_err(|e|operit_host_api::HostError::new(e.to_string()))?, originDeviceId: row.get(2).map_err(|e|operit_host_api::HostError::new(e.to_string()))?, sequence: row.get(3).map_err(|e|operit_host_api::HostError::new(e.to_string()))? };
             // Sealed history supplies receipts; only uncovered edits advance the restored data.
-            if !covered.contains(&id) && !revision.originDeviceId.starts_with("~init:") {
-                data.revision = data.revision.max(Some(revision));
+            if !covered.contains(&id) && !revision.originDeviceId.starts_with("~init:")
+                && restorationSuffix.as_ref().is_none_or(|suffix| revision.originDeviceId.ends_with(suffix)) {
+                data.revision = data.revision.take().max(Some(revision));
             }
             covered.insert(id);
-        }
+            Ok(())
+        })?;
         Ok(Snapshot {
             damage,
             node: self.node.clone(),
             data,
             covered,
-            generation,
+            generation: 0,
         })
     }
 
@@ -1508,52 +1602,118 @@ impl SqlDataset<'_> {
             .map_err(|e| e.to_string())
     }
 
+    /// Establishes restore authority using metadata only; synchronization exports its contents later.
+    pub fn rebase(&self, mut restoration: Revision, resetTables: &[&str],
+        retire: impl FnOnce(&mut crate::SqliteStore::SqliteTransaction<'_>) -> std::result::Result<(),crate::SqliteStore::SqliteStoreError>) -> Result<()> {
+        self.prepare()?;
+        self.store.transaction(|tx| {
+            if let Some(row) = tx.queryOne("SELECT data FROM _operit_initialization_metadata WHERE id=1", vec![])? {
+                let metadata:Value = serde_json::from_str(&row.get::<_,String>(0)?).map_err(sql_error)?;
+                let previous:Option<Revision> = serde_json::from_value(metadata["restoration"].clone()).map_err(sql_error)?;
+                if let Some(previous) = previous {
+                    restoration.createdAt = restoration.createdAt.max(previous.createdAt.saturating_add(1));
+                }
+            }
+            for table in resetTables {
+                tx.execute(&format!("DELETE FROM {}", sql_identifier(table)), vec![])?;
+            }
+            let origin = format!("~restore:{}:{}", restoration.createdAt, restoration.originDeviceId);
+            let id = format!("{origin}:1");
+            compaction::seal_identity(tx.raw(), &id, &origin, 1, restoration.createdAt, "")?;
+            tx.execute("INSERT OR IGNORE INTO _operit_initialization_coverage SELECT opId FROM sync_sql_operations", vec![])?;
+            tx.execute("INSERT OR IGNORE INTO _operit_initialization_coverage SELECT operation_id FROM _operit_transaction_initialization", vec![])?;
+            tx.execute("INSERT OR IGNORE INTO _operit_initialization_coverage VALUES(?1)", vec![crate::SqliteStore::SqliteValue::Text(id)])?;
+            tx.execute("DELETE FROM _operit_transaction_initialization", vec![])?;
+            let metadata = serde_json::to_string(&serde_json::json!({"owner":self.owner,"revision":restoration,"restoration":restoration,"pendingRestoration":true})).map_err(sql_error)?;
+            tx.execute("INSERT INTO _operit_initialization_metadata VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET data=excluded.data", vec![crate::SqliteStore::SqliteValue::Text(metadata)])?;
+            retire(tx)
+        }).map_err(|e| e.to_string())
+    }
+
+    /// Materializes a pending restore initializer only when synchronization requests an export.
+    pub fn publishRestoration(&self) -> Result<()> {
+        self.prepare()?;
+        self.store.transaction(|tx| {
+            let Some(row) = tx.queryOne("SELECT data FROM _operit_initialization_metadata WHERE id=1", vec![])? else { return Ok(()); };
+            let metadata:Value = serde_json::from_str(&row.get::<_,String>(0)?).map_err(sql_error)?;
+            if metadata["pendingRestoration"] != Value::Bool(true) { return Ok(()); }
+            let snapshot = self.snapshot_in(tx)?;
+            let operation = compaction::Initialization::from_snapshot(&snapshot).operation(self.domain(), false).map_err(sql_error)?;
+            compaction::save_initialization(tx, &operation, &snapshot.covered, &snapshot.data)
+        }).map_err(|e| e.to_string())
+    }
+
     pub fn repair(&self, expected: &str, source: &Snapshot) -> Result<bool> {
         self.repair_with(expected,source,None,|_,_|Ok(()))
     }
 
     pub fn repair_with(&self, expected: &str, source: &Snapshot, definition: Option<Value>,
         retire: impl FnOnce(&mut crate::SqliteStore::SqliteTransaction<'_>, &Snapshot) -> std::result::Result<(),crate::SqliteStore::SqliteStoreError>) -> Result<bool> {
-        self.commit_snapshot(expected, source, definition, None, retire)
+        self.commit_snapshot(expected, std::borrow::Cow::Borrowed(source), definition, None, retire)
     }
 
     /// Install the immutable initialization, then replay only locally retained, uncovered originals.
     pub fn receive_initialization(&self, operation: &crate::SyncOperationStore::SyncOperation,
         replay: impl FnOnce(&mut crate::SqliteStore::SqliteTransaction<'_>, &Snapshot) -> std::result::Result<(),crate::SqliteStore::SqliteStoreError>) -> Result<bool> {
-        let initialization = compaction::Initialization::decode(operation)?.ok_or("Missing initialization")?;
+        if self.coverage()?.contains(&operation.opId) { return Ok(false); }
+        let initialization=if crate::RuntimeFileSyncStore::RuntimeFileSyncStore::requiredBlob(operation)?.is_some() {
+            crate::RuntimeFileSyncStore::RuntimeFileSyncStore::new(self.store.storage.clone().ok_or("SQL host cannot stage initialization blobs")?,"runtime/sync").readSqlInitialization(operation)?
+        } else { compaction::Initialization::decode(operation)?.ok_or("Missing initialization")? };
+        self.receive_validated_initialization(operation,initialization,replay)
+    }
+
+    pub(crate) fn receive_validated_initialization(&self,operation:&crate::SyncOperationStore::SyncOperation,initialization:compaction::Initialization,
+        replay:impl FnOnce(&mut crate::SqliteStore::SqliteTransaction<'_>,&Snapshot)->std::result::Result<(),crate::SqliteStore::SqliteStoreError>)->Result<bool> {
         if initialization.data.owner != self.owner || operation.domain != self.domain() { return Err("Initialization owner differs".into()); }
+        if self.coverage()?.contains(&operation.opId) { return Ok(false); }
         let current = self.snapshot()?;
-        if current.covered.contains(&operation.opId) { return Ok(false); }
+        if initialization.data.restoration < current.data.restoration { return Ok(false); }
         if let Some(previous) = if current.damage.is_none() { self.initialization()? } else { None } {
-            let previous_data = compaction::Initialization::decode(&previous)?.ok_or("Missing initialization")?;
-            if !initialization.covered.contains(&previous.opId)
-                && (previous_data.data.revision.as_ref(), &previous.opId) >= (initialization.data.revision.as_ref(), &operation.opId) {
+
+            if initialization.data.restoration == current.data.restoration
+                && !initialization.covered.contains(&previous.opId)
+                && (current.data.revision.as_ref(), &previous.opId) >= (initialization.data.revision.as_ref(), &operation.opId) {
                 return Ok(false);
             }
         }
-        let source = initialization.snapshot(&self.node, current.generation + 1);
-        if !self.commit_snapshot(&current.token()?, &source, initialization.definition, Some(operation), replay)? {
+        let expected = current.token()?;
+        drop(current);
+        let source = Snapshot { damage: None, node: self.node.clone(), generation: 0,
+            data: initialization.data, covered: initialization.covered };
+        if !self.commit_snapshot(&expected, std::borrow::Cow::Owned(source), initialization.definition, Some(operation), replay)? {
             return Err("SQL owner changed while receiving initialization; retry required".into());
         }
         Ok(true)
     }
 
-    fn commit_snapshot(&self, expected: &str, source: &Snapshot, definition: Option<Value>,
+    fn commit_snapshot(&self, expected: &str, mut source: std::borrow::Cow<'_ ,Snapshot>, definition: Option<Value>,
         original: Option<&crate::SyncOperationStore::SyncOperation>,
         retire: impl FnOnce(&mut crate::SqliteStore::SqliteTransaction<'_>, &Snapshot) -> std::result::Result<(),crate::SqliteStore::SqliteStoreError>) -> Result<bool> {
         self.prepare()?;
+        if source.data.sql.is_none() {
+            let source=source.to_mut();
+            source.data.sql=Some(sql_snapshot::SqlSnapshot::from_values(self.store.storage.clone().ok_or("SQL host requires disk-backed synchronization staging")?,&source.data.values)?);
+            source.data.values.clear();
+        }
         let mut changed = false;
         let repaired = self.store.transaction(|tx| {
-            let mut current = self.snapshot_in(tx)?;
+            let current = self.snapshot_in(tx)?;
             let expected = if expected.is_empty() {
                 // Provisioning requires an empty database with no initialization or history.
                 let initialized = tx.queryOne("SELECT 1 FROM _operit_transaction_initialization WHERE id=1", vec![])?.is_some();
-                let occupied = current.data.values.values().any(|table| table["rows"].as_array().is_none_or(|rows| !rows.is_empty()));
+                let occupied = current.data.sql.as_ref().ok_or_else(||sql_error("Missing SQL snapshot staging"))?.has_rows().map_err(sql_error)?;
                 if initialized || !current.covered.is_empty() || occupied { return Ok(false); }
                 current.token().map_err(sql_error)?
             } else { expected.to_owned() };
+            if source.damage.is_some() { return Err(sql_error("A damaged snapshot cannot be authoritative")); }
+            if current.token().map_err(sql_error)? != expected { return Ok(false); }
+            if current.data.owner != source.data.owner { return Err(sql_error("Snapshot owners or migrations differ")); }
             changed = current.data != source.data;
-            if !current.replace(&expected, source).map_err(sql_error)? { return Ok(false); }
+            let source=source.to_mut();
+            source.generation = current.generation.checked_add(1).ok_or_else(||sql_error("Snapshot generation overflow"))?;
+            source.node = current.node;
+            if original.is_none() { source.covered.extend(current.covered); }
+            drop(current.data);
             let (names, schema_changed) = match (self.restore_schema, definition.as_ref()) {
                 (Some(restore), Some(definition)) => restore(tx, definition)?,
                 (Some(_), None) => return Err(sql_error("Missing SQL snapshot definition")),
@@ -1561,35 +1721,18 @@ impl SqlDataset<'_> {
             };
             changed |= schema_changed;
             if changed {
-                let mut tables = BTreeMap::new();
-                if current.data.values.len() != names.len() { return Err(sql_error("Unexpected SQL snapshot tables")); }
-                for name in &names {
-                    let table: Table = serde_json::from_value(current.data.values.get(name).cloned().ok_or_else(|| sql_error("Missing SQL snapshot table"))?).map_err(sql_error)?;
-                    let expected = tx.queryRows(&format!("PRAGMA table_info({})", sql_identifier(name)), vec![])?.iter()
-                        .map(|row| row.get::<_, String>("name")).collect::<std::result::Result<Vec<_>, _>>()?;
-                    if table.columns != expected || table.rows.iter().any(|row| row.len() != expected.len()) { return Err(sql_error("SQL snapshot schema mismatch")); }
-                    tables.insert(name.as_str(), table);
-                }
-                tx.execute("PRAGMA defer_foreign_keys = ON", vec![])?;
-                for name in names.iter().rev() { tx.execute(&format!("DELETE FROM {}", sql_identifier(name)), vec![])?; }
-                for name in &names {
-                    let table = tables.remove(name.as_str()).expect("validated snapshot table");
-                    let query = format!("INSERT INTO {}({}) VALUES({})", sql_identifier(name), table.columns.iter().map(|column| sql_identifier(column)).collect::<Vec<_>>().join(","),
-                        (0..table.columns.len()).map(|_| "?").collect::<Vec<_>>().join(","));
-                    for row in table.rows { tx.execute(&query, row.into_iter().map(Into::into).collect())?; }
-                }
+                source.data.sql.as_ref().ok_or_else(||sql_error("Missing SQL snapshot staging"))?.install(tx,&names)?;
                 if !self.cleanup.is_empty() { tx.execute(self.cleanup, vec![])?; }
             }
-            // Correction seals the exchanged history. Receipt of an initializer preserves its exact coverage.
-            if original.is_some() { current.covered = source.covered.clone(); }
-            let mut initialization = compaction::Initialization::from_snapshot(&current);
-            initialization.definition = definition;
-            let operation = match original {
-                Some(operation) => operation.clone(),
-                None => initialization.operation(self.domain(),false).map_err(sql_error)?,
-            };
-            compaction::save_initialization(tx,&operation)?;
-            retire(tx, &current)?;
+            // Correction seals exchanged history; received initializers retain exact original coverage.
+            if let Some(operation) = original {
+                compaction::save_initialization(tx, operation, &source.covered,&source.data)?;
+            } else {
+                let mut initialization = compaction::Initialization::from_snapshot(&*source);
+                initialization.definition = definition;
+                compaction::save_initialization(tx, &initialization.operation(self.domain(),false).map_err(sql_error)?, &source.covered,&source.data)?;
+            }
+            retire(tx, source)?;
             Ok(true)
         }).map_err(|e| e.to_string())?;
         if repaired && changed {

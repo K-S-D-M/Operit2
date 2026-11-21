@@ -32,9 +32,7 @@ impl ApiPreferences {
 
     /// Returns the root directory used for API preference storage.
     pub fn data_dir() -> PathBuf {
-        defaultRuntimeStorageHost()
-            .runtimeRootDir()
-            .expect("runtime storage host must provide an API preference root")
+        PathBuf::from("/operitapp/data")
     }
 
     /// Creates preferences using the default runtime data directory.
@@ -53,15 +51,6 @@ impl ApiPreferences {
     /// Reads the committed typed values for another owning runtime module.
     pub(crate) fn snapshot(&self) -> Result<Preferences, PreferencesDataStoreError> {
         self.apiDataStore.data()
-    }
-
-    /// Creates preferences rooted at the supplied directory.
-    pub fn new(root_dir: PathBuf) -> Self {
-        let path = OperitPaths::runtimePathFromRoot(&root_dir, OperitPaths::API_PREFERENCES_PATH)
-            .expect("API preferences path must use the runtime storage prefix");
-        Self {
-            apiDataStore: PreferencesDataStore::new(path).withMigration(3, Self::migration),
-        }
     }
 
     /// Drops the keys a version retires, then converts the remaining values.
@@ -520,7 +509,7 @@ impl ApiPreferences {
             Ok(preferences
                 .getTyped::<i32>(&stringPreferencesKey("mcp_startup_timeout_seconds"))?
                 .unwrap_or(Self::DEFAULT_MCP_STARTUP_TIMEOUT_SECONDS)
-                .clamp(1, 10))
+                .clamp(1, 60))
         })
     }
 
@@ -659,7 +648,7 @@ impl ApiPreferences {
         self.apiDataStore.edit(|preferences| {
             preferences.set(
                 &stringPreferencesKey("mcp_startup_timeout_seconds"),
-                seconds.clamp(1, 10),
+                seconds.clamp(1, 60),
             );
         })
     }
@@ -684,7 +673,7 @@ impl ApiPreferences {
         Ok(preferences
             .getTyped::<i32>(&stringPreferencesKey("mcp_startup_timeout_seconds"))?
             .unwrap_or(Self::DEFAULT_MCP_STARTUP_TIMEOUT_SECONDS)
-            .clamp(1, 10))
+            .clamp(1, 60))
     }
 
     /// Reads the total timeout for one ToolPkg pre-hook dispatch chain in seconds.
@@ -695,5 +684,44 @@ impl ApiPreferences {
             .getTyped::<i32>(&stringPreferencesKey("toolpkg_pre_hook_timeout_seconds"))?
             .unwrap_or(Self::DEFAULT_TOOLPKG_PRE_HOOK_TIMEOUT_SECONDS)
             .clamp(1, 60))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use operit_host_native_storage::NativeRuntimeStorageHost;
+
+    fn isolatedPreferences() -> ApiPreferences {
+        let root = std::env::temp_dir()
+            .join(format!("operit-api-preferences-tests-{}", uuid::Uuid::new_v4()));
+        ApiPreferences {
+            apiDataStore: ApiPreferences::store(std::sync::Arc::new(
+                NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces")),
+            )),
+        }
+    }
+
+    /// A raised MCP startup timeout must survive the save/read round trip so cold
+    /// npx/uvx installs can outlast the default budget.
+    #[test]
+    fn mcpStartupTimeoutRoundTripsAboveDefault() {
+        let preferences = isolatedPreferences();
+        assert_eq!(
+            preferences.getMcpStartupTimeoutSeconds().unwrap(),
+            ApiPreferences::DEFAULT_MCP_STARTUP_TIMEOUT_SECONDS
+        );
+        preferences.saveMcpStartupTimeoutSeconds(30).unwrap();
+        assert_eq!(preferences.getMcpStartupTimeoutSeconds().unwrap(), 30);
+    }
+
+    /// Out-of-range input is bounded identically by the saver and the reader.
+    #[test]
+    fn mcpStartupTimeoutClampsToBounds() {
+        let preferences = isolatedPreferences();
+        preferences.saveMcpStartupTimeoutSeconds(0).unwrap();
+        assert_eq!(preferences.getMcpStartupTimeoutSeconds().unwrap(), 1);
+        preferences.saveMcpStartupTimeoutSeconds(600).unwrap();
+        assert_eq!(preferences.getMcpStartupTimeoutSeconds().unwrap(), 60);
     }
 }

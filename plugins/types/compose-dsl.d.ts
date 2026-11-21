@@ -2908,6 +2908,36 @@ export interface BoxProps extends ComposeCommonProps {
 }
 
 /**
+ * Transparent animated perimeter, painted by the host without JavaScript frames.
+ */
+export interface GlowBorderProps extends ComposeCommonProps {
+  /**
+   * Ordered colors that flow around the perimeter.
+   */
+  colors: ComposeColor[];
+  /**
+   * Corner radius in logical pixels, default 0 (square corners).
+   */
+  cornerRadius?: number;
+  /**
+   * Crisp edge width in logical pixels, default 3.
+   */
+  strokeWidth?: number;
+  /**
+   * Soft inward bloom width in logical pixels, default 56.
+   */
+  glowWidth?: number;
+  /**
+   * One full circuit in milliseconds, default 6000.
+   */
+  durationMillis?: number;
+  /**
+   * Whether to animate; respects the host's reduced motion preference.
+   */
+  running?: boolean;
+}
+
+/**
  * Empty layout element that reserves explicit width and height.
  */
 export interface SpacerProps {
@@ -3123,6 +3153,74 @@ export interface ScrollAreaProps extends ComposeCommonProps {
   thumbVisibility?: boolean;
   /**
    * Child content.
+   */
+  content?: ComposeChildren;
+}
+
+/**
+ * Intrinsic source extent and gutter space in one custom editor column.
+ */
+export interface ComposeCodeEditorColumn {
+  text: string;
+  /**
+   * Proportion of available body width, between zero and one.
+   */
+  fraction?: number;
+  /**
+   * Reserved horizontal space for gutter, padding and column separators.
+   */
+  horizontalPadding?: number;
+}
+
+/**
+ * The shared native code editor in read-only or custom-body presentation mode.
+ */
+export interface CodeEditorProps extends ComposeCommonProps {
+  /**
+   * Source document. Omit when supplying a custom body.
+   */
+  text?: string;
+  /**
+   * Material typography role and optional source font overrides.
+   */
+  style?: ComposeTextStyle;
+  fontSize?: number;
+  fontFamily?: string;
+  fontWeight?: string;
+  color?: ComposeColor;
+  lineHeight?: number;
+  /**
+   * Filename used to choose the editor's syntax grammar.
+   */
+  filePath?: string;
+  /**
+   * Optional unscaled document width for custom source rows.
+   */
+  contentWidth?: number;
+  /**
+   * Source columns measured by the native editor for unwrapped custom bodies.
+   */
+  contentColumns?: ComposeCodeEditorColumn[];
+  /**
+   * Reflows text to the viewport as it zooms. Defaults to true.
+   */
+  wrapToViewport?: boolean;
+  /**
+   * Shows the editor's logical line-number gutter for ordinary source text.
+   */
+  showLineNumbers?: boolean;
+  /**
+   * Enables diagonal panning; defaults to true for read-only code views.
+   */
+  panEnabled?: boolean;
+  /**
+   * Controlled zoom factor and allowed zoom interval.
+   */
+  scale?: number;
+  minScale?: number;
+  maxScale?: number;
+  /**
+   * Optional decorated body containing one vertical scrollable. Omit for text.
    */
   content?: ComposeChildren;
 }
@@ -3370,6 +3468,14 @@ export interface TextFieldProps extends ComposeCommonProps {
    * Receives each user-proposed value for controlled-state updates.
    */
   onValueChange: (arg0: string) => void;
+  /**
+   * Receives the current text when Enter or the keyboard action submits the field.
+   */
+  onSubmitted?: (arg0: string) => ComposeInteractionOutput;
+  /**
+   * Native keyboard action, such as search, done, send or next.
+   */
+  imeAction?: string;
   /**
    * Restricts input and layout to one visual line.
    */
@@ -4382,6 +4488,10 @@ export interface AlertDialogProps extends ComposeCommonProps {
  */
 export interface ComposeUiFactoryRegistry {
   /**
+   * Paints a host-animated gradient perimeter with a transparent center.
+   */
+  GlowBorder: ComposeNodeFactory<GlowBorderProps>;
+  /**
    * Creates one native paragraph with individually styled spans.
    */
   RichText: ComposeNodeFactory<RichTextProps>;
@@ -4397,6 +4507,10 @@ export interface ComposeUiFactoryRegistry {
    * Creates one independently controlled native scroll viewport.
    */
   ScrollArea: ComposeNodeFactory<ScrollAreaProps>;
+  /**
+   * Presents source text or custom diff rows through the shared native editor.
+   */
+  CodeEditor: ComposeNodeFactory<CodeEditorProps>;
   /**
    * Opens a native popup with plugin-composed anchor and entries.
    */
@@ -4694,7 +4808,7 @@ export interface ComposeFilePickerResult {
 }
 
 /**
- * UTF-8 content and metadata passed to the host file-save selector.
+ * Text or binary content and metadata passed to the host file-save selector.
  */
 export interface ComposeFileSaveOptions {
   /**
@@ -4702,9 +4816,13 @@ export interface ComposeFileSaveOptions {
    */
   suggestedName: string;
   /**
-   * Exact UTF-8 text to save after the user accepts the destination.
+   * Exact UTF-8 text. Supply exactly one of content or contentBase64.
    */
-  content: string;
+  content?: string;
+  /**
+   * Base64-encoded binary bytes, decoded before opening the save selector.
+   */
+  contentBase64?: string;
   /**
    * Media type of the exported file.
    */
@@ -4873,7 +4991,7 @@ export interface ComposeDslContext {
    */
   openFilePicker(options?: ComposeFilePickerOptions): Promise<ComposeFilePickerResult>;
   /**
-   * Saves UTF-8 content to a user-selected destination through the host file selector.
+   * Saves text or binary bytes to a user-selected destination through the host file selector.
    */
   saveFile(options: ComposeFileSaveOptions): Promise<ComposeFileSaveResult>;
   /**

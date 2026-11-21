@@ -10,11 +10,11 @@ where
     F: FnMut(usize),
 {
     match bridge {
-        Operit1ToOperit2ChatArchiveBridge::Operit1RoomV10ToOperit2SqliteV29 => {
+        Operit1ToOperit2ChatArchiveBridge::Operit1RoomV10ToOperit2SqliteV30 => {
             buildChatArchiveFromOperit1RoomV10Database(connection, fileImportPlan, onMessageParsed)
         }
-        Operit1ToOperit2ChatArchiveBridge::Operit1RoomV20ToOperit2SqliteV29
-        | Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV29 => {
+        Operit1ToOperit2ChatArchiveBridge::Operit1RoomV20ToOperit2SqliteV30
+        | Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV30 => {
             buildChatArchiveFromOperit1RoomV20Database(connection, fileImportPlan, onMessageParsed)
         }
     }
@@ -136,7 +136,7 @@ fn rewriteOperit1ChatWorkspacePath(
     if path.is_empty() {
         return Ok(None);
     }
-    let path = operit_tools::files::PathMapper::PathMapper::canonicalizeVfsPath(path)?;
+    let path = operit_vfs::VfsPath::canonicalizeVfsPath(path)?;
     if path == "/" {
         return Ok(None);
     }

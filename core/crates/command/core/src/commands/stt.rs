@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 
 use crate::output::CoreCommandOutput;
@@ -17,7 +16,7 @@ pub fn run_stt_command(
     match args.first().map(String::as_str) {
         Some("provider-list") if args.len() == 1 => print_provider_catalog(output),
         Some("provider-model-list") if args.len() == 2 => print_provider_models(&args[1], output),
-        Some("config") => run_config_command(&args[1..], output),
+        Some("config") => run_config_command(application, &args[1..], output),
         Some("transcribe") if args.len() == 2 => {
             transcribe_current(application, &args[1], None, output)
         }
@@ -85,9 +84,26 @@ fn print_provider_models(
 }
 
 /// Runs STT provider configuration commands.
-fn run_config_command(args: &[String], output: &mut CoreCommandOutput) -> Result<(), String> {
+fn run_config_command(
+    application: &OperitApplication,
+    args: &[String],
+    output: &mut CoreCommandOutput,
+) -> Result<(), String> {
     let manager = SttConfigManager::getInstance();
     match args.first().map(String::as_str) {
+        Some(command @ ("create-json" | "save")) if args.len() == 2 => {
+            let config = serde_json::from_str(&super::util::read_content_arg(
+                &application.hostManager,
+                &args[1],
+            )?)
+            .map_err(|error| error.to_string())?;
+            let config = if command == "create-json" {
+                manager.createSttConfig(config)?
+            } else {
+                manager.updateSttConfig(config)?
+            };
+            print_config(&config, output)
+        }
         Some("list") if args.len() == 1 => {
             let configs = manager.getAllSttConfigs()?;
             let items = configs.iter().map(stt_config_json).collect::<Vec<_>>();
@@ -278,7 +294,7 @@ fn transcribe_current(
     language: Option<String>,
     output: &mut CoreCommandOutput,
 ) -> Result<(), String> {
-    let (audioBytes, fileName, contentType) = readAudioInput(audioPath)?;
+    let (audioBytes, fileName, contentType) = readAudioInput(application, audioPath)?;
     let result = SttRecognitionService::getInstance(&application.hostManager).transcribeCurrent(
         audioBytes,
         fileName,
@@ -299,7 +315,7 @@ fn transcribe_config(
     language: Option<String>,
     output: &mut CoreCommandOutput,
 ) -> Result<(), String> {
-    let (audioBytes, fileName, contentType) = readAudioInput(audioPath)?;
+    let (audioBytes, fileName, contentType) = readAudioInput(application, audioPath)?;
     let result = SttRecognitionService::getInstance(&application.hostManager)
         .transcribeWithConfigId(
             configId.to_string(),
@@ -315,9 +331,14 @@ fn transcribe_config(
 }
 
 /// Reads one CLI audio file and returns its explicit multipart metadata.
-fn readAudioInput(audioPath: &str) -> Result<(Vec<u8>, String, String), String> {
-    let path = Path::new(audioPath);
-    if !path.is_file() {
+fn readAudioInput(
+    application: &OperitApplication,
+    audioPath: &str,
+) -> Result<(Vec<u8>, String, String), String> {
+    let filesystem = application.hostManager.vfs()?;
+    let virtualPath = super::util::command_file_path(&application.hostManager, audioPath)?;
+    let path = Path::new(&virtualPath);
+    if !filesystem.fileExists(&virtualPath)?.exists {
         return Err(format!("STT audio file is missing: {}", path.display()));
     }
     let fileName = path
@@ -339,7 +360,7 @@ fn readAudioInput(audioPath: &str) -> Result<(Vec<u8>, String, String), String> 
         "flac" => "audio/flac",
         other => return Err(format!("unsupported STT audio extension: {other}")),
     };
-    let audioBytes = fs::read(path).map_err(|error| error.to_string())?;
+    let audioBytes = filesystem.readFileBytes(&virtualPath)?;
     if audioBytes.is_empty() {
         return Err("STT audio file is empty".to_string());
     }
@@ -359,6 +380,7 @@ fn print_stt_usage(output: &mut CoreCommandOutput) {
         "operit2 stt config create-remote <name> <provider-type-id> <endpoint> <api-key> <model>",
         "operit2 stt config update <id> <field> <value>",
         "operit2 stt config delete <id>",
+        "operit2 stt config <create-json|save> <config-json|@vfs-file>",
         "operit2 stt transcribe <audio-path>",
         "operit2 stt transcribe <audio-path> --language <language>",
         "operit2 stt transcribe-config <config-id> <audio-path>",

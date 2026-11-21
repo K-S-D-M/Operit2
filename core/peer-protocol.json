@@ -1,44 +1,4 @@
 {
-  "sources": [
-    "core/crates/foundation/link/src",
-    "core/crates/node/peer-link/src",
-    "core/crates/node/runtime/build.rs",
-    "core/crates/node/runtime/src/PeerProtocol.rs",
-    "core/crates/node/runtime/src/HostRuntimePeerService.rs",
-    "core/crates/node/runtime/src/PeerStateStore.rs",
-    "core/crates/node/runtime/src/PeerRouter.rs",
-    "core/crates/node/runtime/src/RuntimePeerService.rs",
-    "core/crates/node/runtime/src/NodeSpaceService.rs",
-    "core/crates/node/runtime/src/CoreNodeRouter.rs",
-    "core/crates/node/runtime/src/PeerSync.rs",
-    "core/crates/node/runtime/src/route_forwarding.rs",
-    "core/crates/node/runtime/src/space_policy.rs",
-    "core/crates/node/runtime/src/SpacePersistenceSyncService.rs",
-    "core/crates/node/runtime/src/SyncConsistency.rs",
-    "core/crates/node/runtime/src/peer",
-    "core/crates/persistence/store/src/SyncOperationStore.rs",
-    "core/crates/persistence/store/src/CoreSpaceStore.rs",
-    "core/crates/persistence/store/src/NetworkControlStore.rs",
-    "core/crates/persistence/store/src/NetworkControlReadModel.rs",
-    "core/crates/persistence/store/src/Transaction.rs",
-    "core/crates/persistence/store/src/RuntimeFileSyncStore.rs",
-    "core/crates/persistence/store/src/WorkspaceFileSyncStore.rs",
-    "core/crates/persistence/store/src/sync",
-    "edge/sdk/contract/src",
-    "edge/sdk/node/src",
-    "edge/sdk/proxy/src",
-    "core/crates/persistence/store/src/transaction",
-    "core/crates/persistence/store/src/FileSyncPolicy.rs",
-    "core/crates/node/runtime/src/RuntimeRemoteLinkService.rs",
-    "core/crates/node/runtime/src/NodeServices.rs",
-    "core/crates/node/runtime/src/SpaceRuntime.rs",
-    "core/crates/node/route-macros/src",
-    "core/crates/rslink/runtime/src",
-    "core/crates/runtime/application/src/services/SyncBlobTransferManager.rs",
-    "core/crates/runtime/application/src/core/application/SyncConsistency.rs",
-    "core/crates/node/runtime/build_support/peer_protocol.rs",
-    "core/crates/node/runtime/src/host_time.rs"
-  ],
   "revisions": [
     {
       "version": 1,
@@ -67,15 +27,82 @@
     {
       "version": 7,
       "hash": "2a2a125eafc681c72e999341c2a61ac5784580a0c6d024fb0d78dc3aeeada4a8"
+    },
+    {
+      "version": 8,
+      "hash": "49ea3182285ac816e4cec84cda76285aac6874fe00fe5c5cca3f6f4430c66b87"
+    },
+    {
+      "version": 9,
+      "hash": "65bfb5f453c93339cc1166f28d90da45744b4d8683dbba24772d085928de053d"
+    },
+    {
+      "version": 10,
+      "hash": "60906c2313b92f71c873c779471c906890f182a7cdc719fa41d20db1d8c3a843"
+    },
+    {
+      "version": 11,
+      "hash": "ea2926bd3a024622f47b475022cd908b4188efc4c1ee786878635321a761415b"
+    },
+    {
+      "version": 12,
+      "hash": "47c0a61c633d5bdcbb815359641d789b734a7906fc57d673c4f54b8ce820c85e"
+    },
+    {
+      "version": 13,
+      "hash": "bd5e57f23be6ed518956f9ac43efef463a9db3cb3dbfd92b68ae441dba9cf6b3"
+    },
+    {
+      "version": 14,
+      "hash": "6e5c06e42dfc8d5b5be8737246dfb4dc3a9d706cc00ef302086b242317359794"
+    },
+    {
+      "version": 15,
+      "hash": "6e1cd3450e8812471bfd25830cf769c1ce2e2181387b3b1a1357ea259952e80d"
+    },
+    {
+      "version": 16,
+      "hash": "715ec7e1cefe4abb553e34208b0344665969ab1a1e9ad3416ed0a6fafabdf9bb"
+    },
+    {
+      "version": 17,
+      "hash": "b392a0bf17280a53cfea021b954a1e52c11c0b72075b7cf04374be059758437a"
+    },
+    {
+      "version": 18,
+      "hash": "66c6bf40ffc6a4a8dd7d23080133abf03b7414f003054f89fcccb5762708cc45"
+    },
+    {
+      "version": 19,
+      "hash": "39d74dfd26054fb2c749c4b2175735b301e2ed646ebd54aa1285aebb2310c768"
+    },
+    {
+      "version": 20,
+      "hash": "f2f1b08cd1f56f036b53661d388a4b6d5af502e12c2e82a79aac9be0ecaa2bff"
+    },
+    {
+      "version": 21,
+      "hash": "efb80f2d3aab8f20dccbac5bb41084046b7c8103e77c76d53db18126a645447c"
+    },
+    {
+      "version": 22,
+      "hash": "730f35f0431e9350431b07084e6dfcfaaba53475a8674310377058b1c51ba29e"
+    },
+    {
+      "version": 23,
+      "hash": "016f6fac4d7fed15115c675787fd907543deebbbdd05945c1a8202d7dcc1ed22"
+    },
+    {
+      "version": 24,
+      "hash": "bb3372520ca577f16c2ba1b2ff265d777eac047fa50f844a1baf928481cd0cf9"
+    },
+    {
+      "version": 25,
+      "hash": "f486dc9b423430fcc85db351d317e0373ea4a72557778f3a6b997fee7c9f251b"
+    },
+    {
+      "version": 26,
+      "hash": "bb3372520ca577f16c2ba1b2ff265d777eac047fa50f844a1baf928481cd0cf9"
     }
-  ],
-  "schemaRoots": [
-    "core/crates/foundation/model/src",
-    "core/crates/foundation/host-api/src",
-    "core/crates/runtime/application/src",
-    "core/crates/provider/services/src",
-    "core/crates/tool/services/src",
-    "core/crates/plugin/sdk/src",
-    "core/crates/persistence/store/src"
   ]
 }

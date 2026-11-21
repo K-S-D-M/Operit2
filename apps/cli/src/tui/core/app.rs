@@ -44,7 +44,7 @@ use operit_tools::tools::ToolPermissionSystem::AiPermissionMode;
 use operit_util::stream::TextStreamRevisionTracker::TextStreamRevisionTracker;
 use operit_util::AppLogger::AppLogger;
 use operit_util::GithubReleaseUtil::{
-    FullUpdateProgressEvent, FullUpdateStage, FullUpdateTarget, ReleaseInfo,
+    FullUpdateProgressEvent, FullUpdateStage, ReleaseInfo,
 };
 use operit_util::MarkdownRenderStream::MarkdownStreamEvent;
 
@@ -965,7 +965,7 @@ pub(super) enum FullUpdateDownloadState {
         speed_bytes_per_sec: u64,
     },
     Complete {
-        package_path: PathBuf,
+        package_path: String,
         install_status: Option<crate::cli::DownloadedUpdateInstallStatus>,
     },
     Error {
@@ -979,7 +979,7 @@ pub(super) enum FullUpdateDownloadState {
 #[derive(Debug, Clone)]
 pub(super) enum FullUpdateDownloadMessage {
     Progress(FullUpdateProgressEvent),
-    Complete(Result<(PathBuf, Option<crate::cli::DownloadedUpdateInstallStatus>), String>),
+    Complete(Result<(String, Option<crate::cli::DownloadedUpdateInstallStatus>), String>),
 }
 
 #[derive(Clone, Debug)]
@@ -2411,8 +2411,16 @@ impl OperitTui {
         Ok(())
     }
 
+    /// Downloads through shared Host streaming and keeps the completed package as a VFS path.
     fn start_full_update_download(&mut self) -> Result<(), String> {
         let text = self.text();
+        let context = self
+            .core
+            .application()
+            .generatedClientMut()
+            .0
+            .hostManager()
+            .clone();
         let Some(prompt) = self.startup_update_prompt.as_mut() else {
             return Ok(());
         };
@@ -2420,10 +2428,9 @@ impl OperitTui {
             return Ok(());
         };
         let (tx, rx) = mpsc::channel::<FullUpdateDownloadMessage>();
-        let package_url = release_info.downloadUrl.clone();
-        let package_file_name = release_info.assetName.clone();
-        let update_target = FullUpdateTarget::cliForCurrentHost()?;
-        let work_dir = std::env::temp_dir().join("operit2").join("full_update");
+        let release_info = release_info.clone();
+        let update_target = crate::cli::host_ops::cli_update_target()?;
+        let current_asset = update_target.assetNameForVersion(env!("CARGO_PKG_VERSION"))?;
         prompt.progress_rx = Some(rx);
         prompt.download_state = FullUpdateDownloadState::Downloading {
             stage: FullUpdateStage::DownloadingPackage,
@@ -2435,19 +2442,23 @@ impl OperitTui {
         self.status_message = text.downloading_full_update_package().to_string();
         tokio::spawn(async move {
             let progress_tx = tx.clone();
-            let result = operit_util::GithubReleaseUtil::GithubReleaseUtil::downloadAndPrepareFullUpdateWithProgress(
-                package_url,
-                package_file_name,
-                work_dir,
+            let result = operit_util::IncrementalUpdate::prepareUpdate(
+                release_info,
+                current_asset,
+                &context,
+                operit_host_api::HttpDownloadControl::new(),
                 move |event| {
                     let _ = progress_tx.send(FullUpdateDownloadMessage::Progress(event));
                 },
             )
             .await
-            .and_then(|package_path| {
+            .and_then(|storage_path| {
+                let package_path = operit_vfs::VisualFileSystem::VisualFileSystem::runtimePath(&storage_path)?;
+                let vfs = (&context).vfs()?;
+                let source = vfs.file(&package_path)?;
                 crate::cli::install_downloaded_cli_update(
                     &update_target,
-                    &package_path,
+                    &source,
                     crate::cli::InstallOutput::Silent,
                 )
                 .map(|status| (package_path, Some(status)))
@@ -3450,6 +3461,10 @@ impl OperitTui {
         let return_to_hub = modal.returnToHub;
         let transports = plan.transports.clone();
         let config = PeerHostConfig {
+            discovery: match self.networkControl.localHostConfig() {
+                Ok(config) => config.and_then(|config| config.discovery),
+                Err(error) => { self.set_listener_error(error); return; }
+            },
             bindAddress: plan.bindAddress.clone(),
             transports: transports.clone(),
             discoveryEnabled: plan.discoveryEnabled,
@@ -3464,7 +3479,7 @@ impl OperitTui {
             self.set_listener_error(error);
             return;
         }
-        if !transports.is_empty() {
+        if !transports.is_empty() || config.discovery.is_some() {
             if let Err(error) = self.networkControl.startListening(transports.clone()).await {
                 self.set_listener_error(error);
                 return;
@@ -5846,26 +5861,12 @@ impl OperitTui {
                         if stage == FullUpdateStage::Ready {
                             continue;
                         }
-                        let current = match prompt.download_state.clone() {
-                            FullUpdateDownloadState::Downloading {
-                                read_bytes,
-                                total_bytes,
-                                speed_bytes_per_sec,
-                                ..
-                            } => (read_bytes, total_bytes, speed_bytes_per_sec),
-                            _ => (0, 0, 0),
-                        };
-                        let message = if current.1 == 0 {
-                            text.preparing_download().to_string()
-                        } else {
-                            message
-                        };
                         prompt.download_state = FullUpdateDownloadState::Downloading {
                             stage,
                             message,
-                            read_bytes: current.0,
-                            total_bytes: current.1,
-                            speed_bytes_per_sec: current.2,
+                            read_bytes: 0,
+                            total_bytes: 0,
+                            speed_bytes_per_sec: 0,
                         };
                     }
                     FullUpdateProgressEvent::DownloadProgress {
@@ -5873,21 +5874,25 @@ impl OperitTui {
                         totalBytes,
                         speedBytesPerSec,
                     } => {
-                        let current = match prompt.download_state.clone() {
-                            FullUpdateDownloadState::Downloading { stage, message, .. } => {
-                                (stage, message)
-                            }
-                            _ => (
-                                FullUpdateStage::DownloadingPackage,
-                                text.full_update_download_message().to_string(),
-                            ),
+                        let message = match prompt.download_state.clone() {
+                            FullUpdateDownloadState::Downloading { message, .. } => message,
+                            _ => text.full_update_download_message().to_string(),
                         };
                         prompt.download_state = FullUpdateDownloadState::Downloading {
-                            stage: current.0,
-                            message: current.1,
+                            stage: FullUpdateStage::DownloadingPackage,
+                            message,
                             read_bytes: readBytes,
                             total_bytes: totalBytes,
                             speed_bytes_per_sec: speedBytesPerSec,
+                        };
+                    }
+                    FullUpdateProgressEvent::PreparationProgress { phase, completedBytes, totalBytes } => {
+                        prompt.download_state = FullUpdateDownloadState::Downloading {
+                            stage: FullUpdateStage::ReconstructingPackage,
+                            message: phase.label().into(),
+                            read_bytes: completedBytes,
+                            total_bytes: totalBytes,
+                            speed_bytes_per_sec: 0,
                         };
                     }
                 },
@@ -8007,6 +8012,7 @@ mod tests {
                 platform: "linux".to_string(),
                 model: String::new(),
                 coreVersion: None,
+                protocolVersion: None,
                 online,
                 relayHops: None,
                 relayPath: None,
@@ -8348,6 +8354,7 @@ mod tests {
             platform: "linux".to_string(),
             model: String::new(),
             coreVersion: None,
+            protocolVersion: None,
             online,
             relayHops: None,
             relayPath: None,

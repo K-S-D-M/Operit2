@@ -43,6 +43,17 @@ impl ChatDao {
             .transpose()
     }
 
+    /// Selects the latest active history by activity, using sidebar order to break ties.
+    pub fn getMostRecentChatId(&self) -> Result<Option<String>, SqliteStoreError> {
+        self.store
+            .queryOne(
+                "SELECT id FROM chats ORDER BY updatedAt DESC, pinned DESC, displayOrder ASC, id ASC LIMIT 1",
+                sqliteParams![],
+            )?
+            .map(|row| row.get("id"))
+            .transpose()
+    }
+
     /// Selects a bounded set of chat metadata through the primary-key index.
     pub fn getChatsByIds(&self, ids: &[String]) -> Result<Vec<ChatEntity>, SqliteStoreError> {
         if ids.is_empty() || ids.len() > 200 {
@@ -286,10 +297,10 @@ impl ChatDao {
         values: Vec<String>,
     ) -> Result<StateFlow<Vec<ChatEntity>>, SqliteStoreError> {
         let stateFlow = StateFlow::new(self.selectChatsByValues(&sql, &values)?);
-        let chatDao = self.clone();
         let stateFlowForObserver = stateFlow.clone();
-        self.store.addInvalidationObserver(move || {
-            stateFlowForObserver.set_value(chatDao.selectChatsByValues(&sql, &values)?);
+        self.store.addInvalidationObserver(move |store| {
+            stateFlowForObserver
+                .set_value(ChatDao::new(store.clone()).selectChatsByValues(&sql, &values)?);
             Ok(())
         })?;
         Ok(stateFlow)

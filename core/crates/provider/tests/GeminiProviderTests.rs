@@ -8,7 +8,7 @@ use operit_util::ImagePoolManager::ImagePoolManager;
 fn test_provider() -> GeminiProvider {
     GeminiProvider::new(
         "http://localhost".to_string(),
-        String::new(),
+        String::new().into(),
         "gemini-test".to_string(),
         "GEMINI".to_string(),
         Vec::new(),
@@ -17,15 +17,14 @@ fn test_provider() -> GeminiProvider {
     )
 }
 
-/// Requests SSE explicitly and keeps API keys containing query delimiters intact.
+/// Negotiates SSE while deferring credential encoding to the shared HTTP transport.
 #[test]
 fn streaming_request_negotiates_sse_and_encodes_query_authentication() {
-    let mut provider = test_provider();
-    provider.api_key = "key&with=delimiters".to_string();
+    let provider = test_provider();
     let url = url::Url::parse(&provider.request_url(true).unwrap()).unwrap();
     let pairs = url.query_pairs().collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(pairs.get("alt").map(|s| s.as_ref()), Some("sse"));
-    assert_eq!(pairs.get("key").map(|s| s.as_ref()), Some("key&with=delimiters"));
+    assert!(!pairs.contains_key("key"));
     let url = url::Url::parse(&provider.request_url(false).unwrap()).unwrap();
     assert!(!url.query_pairs().any(|(name, _)| name == "alt"));
 }
@@ -34,7 +33,7 @@ fn streaming_request_negotiates_sse_and_encodes_query_authentication() {
 #[test]
 fn imageLinksBecomeGeminiInlineDataParts() {
     let image_id = ImagePoolManager::add_image_bytes(
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01",
+        include_bytes!("fixtures/pixel.png"),
         Some("image/png"),
         None,
     );
@@ -57,7 +56,8 @@ fn imageLinksBecomeGeminiInlineDataParts() {
 #[test]
 fn packageProxyResultMatchesGeminiFunctionCall() {
     let provider = test_provider();
-    let image_id = ImagePoolManager::add_image_bytes(b"\x89PNG\r\n\x1a\n", Some("image/png"), None);
+    let image_id = ImagePoolManager::add_image_bytes(include_bytes!("fixtures/pixel.png"), Some("image/png"), None);
+    let expected_image = ImagePoolManager::get_image(&image_id).unwrap().base64;
     let history = vec![
         PromptTurn::new(
             PromptTurnKind::ASSISTANT,
@@ -96,7 +96,7 @@ fn packageProxyResultMatchesGeminiFunctionCall() {
         Some(&serde_json::json!("2026-09-12"))
     );
     assert_eq!(contents[1]["parts"][1]["inline_data"]["mime_type"], "image/png");
-    assert_eq!(contents[1]["parts"][1]["inline_data"]["data"], "iVBORw0KGgo=");
+    assert_eq!(contents[1]["parts"][1]["inline_data"]["data"], expected_image);
 }
 
 /// Verifies audio and video media links become Gemini inline_data parts.

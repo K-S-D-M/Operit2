@@ -10,7 +10,7 @@
 
 Operit2 的 ToolPkg API 支持版本为 `2.0.0`；对 `1.0.0` 和 `1.0.1` 的加载支持并不完整。Operit1 完整支持 ToolPkg API `1.0.0` 和 `1.0.1`，这两个版本主要面向 Android，是旧版 API 形式。
 
-在 Operit2 创建 ToolPkg 时显式填写 `"api_version": "2.0.0"`，接口以随 PackageBuilder 携带的当前版本类型为准。不能通过仅改 manifest 版本号把旧 Android 插件视为已完成迁移；需要检查实际接口与平台行为。`api_version` 是 ToolPkg 清单字段，不是单文件脚本的元数据字段。
+在 Operit2 创建插件时显式填写 `"api_version": "2.0.0"`：ToolPkg 写在 manifest 中，独立脚本包写在 `METADATA` 根对象中（JSON/HJSON 脚本包写在元数据根对象中）。接口以随 Operit 插件开发套件携带的当前版本类型为准。省略该字段的脚本包与 ToolPkg 一律按 `1.0.0` 兼容契约解析和执行；支持显式声明 `1.0.0`、`1.0.1`、`2.0.0`，其他版本或非字符串值会被拒绝。ToolPkg 内的子包使用所属 manifest 的版本。不能仅改版本号就把旧 Android 插件视为已完成迁移；需要检查实际接口与平台行为。
 
 ToolPkg API `2.0.0` 面向多平台开发，基本所有公共接口都通过统一 host 能力提供跨平台兼容。常规功能直接使用当前版本接口即可，不必为每个平台重复实现。作者仍需注重跨平台兼容性：遇到平台特异接口时，明确其适用范围，考虑并验证其他平台的安装、界面与核心功能；不能把某个平台的专用能力当作所有平台都具备的接口。
 
@@ -44,7 +44,7 @@ ToolPkg API `2.0.0` 面向多平台开发，基本所有公共接口都通过统
 
 ### 2.1. 当前版本开发入口
 
-从包管理的“快速创作你的插件”开始时，应用准备 PackageBuilder 与 operit_editor，并把需求填入聊天草稿。用户发送草稿后，由 AI 与用户协作开发；不是按钮自动生成或安装成品。
+从包管理的“快速创作你的插件”开始时，应用准备 Operit 插件开发套件 与 operit_editor，并把需求填入聊天草稿。用户发送草稿后，由 AI 与用户协作开发；不是按钮自动生成或安装成品。
 
 先阅读 [当前版本插件创作流程](./PLUGIN_CREATION_WORKFLOW.md)。通过 `["skill", "show", "PackageBuilder"]` 读取真实 Skill 目录，检查终端 host 与可写文件位置，确定 `<dev_root>`。所有平台都使用现有 host API；不固定到某个平台的下载目录。
 
@@ -107,7 +107,7 @@ ToolPkg API `2.0.0` 面向多平台开发，基本所有公共接口都通过统
 ["log", "package"]
 ```
 
-名称与导出函数来自第 4 章示例。实际项目使用导入结果与 `package show` 返回的名称。核对 `package list` 的真实启用状态与执行返回内容。同名包重新安装会被拒绝，更新需要按 [创作流程第 5 节](./PLUGIN_CREATION_WORKFLOW.md#5-同-id-的修改与重新安装) 完成明确授权的替换操作。
+名称与导出函数来自第 4 章示例。实际项目使用导入结果与 `package show` 返回的名称。核对 `package list` 的真实启用状态与执行返回内容。独立脚本仍拒绝同名重新导入；普通本地 `.toolpkg` 的同 ID 更新按 [创作流程第 5 节](./PLUGIN_CREATION_WORKFLOW.md#5-同-id-的修改与更新) 完成明确授权的导入与验证。
 
 ## 3. 核心概念
 
@@ -117,13 +117,14 @@ ToolPkg API `2.0.0` 面向多平台开发，基本所有公共接口都通过统
 
 每个脚本文件的开头都必须包含一个 `/* METADATA ... */` 注释块。这个块定义了脚本的名称、描述、分类以及最重要的——它所提供的工具。**这块元数据是 Operit AI 理解并调用你所编写功能的唯一途径。AI 会解析 `METADATA` 中的信息，将其作为可用的“工具”呈现给大语言模型（LLM），从而实现通过自然语言指令来执行复杂脚本的能力。**
 
-**示例：**（元数据结构示意；具体示例以本 Skill 的 `examples/packages/` 为准）
+**示例：**（元数据结构示意；具体插件实现按创作流程中的 VFS 路径查阅当前已安装包）
 
 ```typescript
 /*
 METADATA
 {
     "name": "Automatic_bilibili_assistant",
+    "api_version": "2.0.0",
     "display_name": {
         "zh": "B站智能助手",
         "en": "Bilibili Assistant"
@@ -153,6 +154,7 @@ METADATA
 ```
 
 -   `name`: 脚本的唯一标识符。
+-   `api_version`: 脚本包 API 契约版本。新建脚本包填写 `"2.0.0"`；省略时默认 `"1.0.0"` 并启用 v1 兼容适配。不要与插件自身的发布版本混用。
 -   `display_name`: （可选，推荐）用于界面显示的名称。不会影响脚本 ID；脚本 ID 仍由 `name` 决定。支持字符串或多语言对象（见 3.1.2）。
 -   `description`: 对脚本功能的详细描述。
 -   `author`: （可选）作者信息，支持单个字符串或字符串数组。
@@ -266,6 +268,7 @@ METADATA
 METADATA
 {
   "name": "MyBilingualPackage",
+  "api_version": "2.0.0",
   "category": "Utility",
   "display_name": {
     "zh": "双语示例包",
@@ -316,7 +319,7 @@ METADATA
 
 ### 3.1.3. `category` 字段规范
 
-`category` 为 **可选字段**，类型为字符串，用于脚本分类展示与检索。建议直接复用 `examples/packages/` 中已使用的分类，避免创建语义重复的新分类。
+`category` 为 **可选字段**，类型为字符串，用于脚本分类展示与检索。建议直接复用当前已安装插件中已使用的分类，避免创建语义重复的新分类。
 
 ```json
 "category": "Utility"
@@ -328,7 +331,7 @@ METADATA
 "category": "Other"
 ```
 
-本 Skill 的 `examples/packages/` 中可参考的分类值：
+可参考的分类值（实际使用情况以已安装插件为准）：
 
 -   `Automatic`
 -   `Chat`
@@ -492,6 +495,7 @@ const service = await EnhancedAIService.callSuspend(
 METADATA
 {
     "name": "MyNewScript",
+    "api_version": "2.0.0",
     "description": "一个用于演示脚本开发的新脚本。",
     "category": "Utility",
     "tools": [
@@ -538,16 +542,13 @@ exports.hello_world = hello_world;
 -   在文件顶部添加 `/// <reference path="../../types/index.d.ts" />` 可以让 TypeScript 编译器和你的IDE（如 VS Code）找到全局的类型定义。
 -   `types/` 目录下的 `.d.ts` 文件详细定义了所有可用工具的签名和返回类型。Java Bridge 的签名以随 Skill 携带的声明为准，调用前核对当前宿主能力。
 
-## 5. 当前版本示例
+## 5. 查阅已安装插件
 
-示例由当前版本软件随 PackageBuilder 提供，位于 Skill 的 `examples/packages/`。下列文件实际来自当前源码；构建产物并不代表它们已安装到当前 runtime。
+本套件只携带当前版本类型和文档，不维护插件文件索引或示例副本。参考实现由 AI 通过 VFS 自行查找：先列举 `/operitapp/data/extensions/device/packages/` 和 `/operitapp/data/extensions/space/packages/`，再按需查看 `/operitapp/data/cache/toolpkg/` 中实际存在的缓存。
 
-- `examples/packages/buildin/time.ts`：单文件工具包的 `METADATA`、参数与导出函数。
-- `examples/packages/buildin/operit_editor.ts`：实际执行平台编辑命令的包；`operit_editor` 工具将 `args` 字符串数组传给 `Tools.SoftwareSettings.exec(args)`，与 `execute_cli_command` 使用同一执行入口，返回真实结果与错误，不接受自然语言 `query`。
-- `examples/packages/external/template_try/`：ToolPkg 清单、工作流模板、工作区模板和资源注册。
-- `examples/packages/buildin/workflow/`：较完整的 ToolPkg 项目，包含 UI、公共接口和构建说明。
+单文件包可直接阅读脚本；ToolPkg 优先读取与安装版本核对过的现有缓存中的 manifest、入口和随包源码。没有可读缓存时，只将需要参考的安装归档解压到独立临时目录。目录不存在或包未携带 `.ts`、`package.json`、`tsconfig.json` 时明确说明，不假定某个示例已经安装，不批量解压插件。
 
-读取所选示例的实际 manifest、package.json 和源码，再确定项目结构、API 版本及构建命令，不使用旧版仓库中的固定示例路径。
+具体查阅步骤和路径语义见 [插件创作流程](./PLUGIN_CREATION_WORKFLOW.md)。读取所选包的真实配置后再确定项目结构、API 版本和构建命令；API 签名始终以本 Skill 的当前版本 `types/` 为准。
 
 ## 6. UI自动化详解
 
@@ -612,7 +613,9 @@ if (loginButton) {
 
 使用 [当前版本插件创作流程](./PLUGIN_CREATION_WORKFLOW.md) 中的首次安装与同 ID 更新步骤。Core command 参数数组不含 `operit2`；脚本可调用 `Tools.SoftwareSettings.exec(args)`，AI 可直接调用系统工具 `execute_cli_command`。
 
-`package import` 接收成品文件，不接收源码目录，并拒绝重复的已注册包名。更新前完成构建、记录配置并获得删除授权，再明确执行删除、导入、恢复配置与重新测试。不能把源码同步、命令回显或一次工具调用完成解释为热更新成功。
+`package import` 接收成品文件，不接收源码目录。普通本地外部 `.toolpkg` 可按同 ID 直接再次导入更新，保留原配置、安装位置及既有成员启用状态，新增子包默认关闭；其他重名及固定安装范围冲突仍拒绝。内置、市场及随应用包沿用各自既有流程，独立脚本不因此支持同名覆盖。
+
+更新前完成构建、记录安装状态并获得更新授权，直接导入新成品，不先卸载。检查新版本与对应场景；失败时核对旧归档和安装状态的回滚结果，保留错误并停止。显式卸载仍按现有规则删除普通本地安装的配置。不能把源码同步、命令回显或一次工具调用完成解释为热更新成功。
 
 ## 10. 编辑器辅助
 

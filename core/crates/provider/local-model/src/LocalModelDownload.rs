@@ -127,56 +127,34 @@ pub type LocalModelDownloadProgressCallback =
 #[derive(Clone)]
 pub struct LocalModelInstaller {
     runtimeRoot: PathBuf,
+    filesystem: operit_vfs::VisualFileSystem::VisualFileSystem,
     registryStore: LocalModelRegistryStore,
     httpHost: Arc<dyn HttpHost>,
     storageHost: Option<Arc<dyn RuntimeStorageHost>>,
 }
 
 impl LocalModelInstaller {
-    /// Creates a filesystem-backed installer for native test coverage.
+    /// Creates an isolated VFS backed by native test storage.
     #[cfg(test)]
-    pub fn forRuntimeRoot(
-        runtimeRoot: PathBuf,
-        httpHost: Arc<dyn HttpHost>,
-    ) -> Result<Self, LocalModelDownloadError> {
-        let storageHost = testRuntimeStorageHost(runtimeRoot.clone());
-        let registryStore = LocalModelRegistryStore::forRuntimeStorage(storageHost.clone());
-        Ok(Self {
-            runtimeRoot,
-            registryStore,
-            httpHost,
-            storageHost: Some(storageHost),
-        })
+    pub fn forRuntimeRoot(runtimeRoot: PathBuf, httpHost: Arc<dyn HttpHost>) -> Result<Self, LocalModelDownloadError> {
+        let storage = testRuntimeStorageHost(runtimeRoot.clone());
+        let filesystem = operit_vfs::VisualFileSystem::VisualFileSystem::builtinOnly(Arc::new(operit_host_native_filesystem::PosixFileSystemHost::new()), runtimeRoot.clone(), runtimeRoot.join("workspaces"));
+        Self::withFilesystem(storage, httpHost, filesystem)
     }
 
-    /// Creates a filesystem-backed installer for native test coverage.
+    /// Creates an isolated installer with an explicit test registry.
     #[cfg(test)]
-    pub fn new(
-        runtimeRoot: PathBuf,
-        registryPath: PathBuf,
-        httpHost: Arc<dyn HttpHost>,
-    ) -> Result<Self, LocalModelDownloadError> {
-        let storageHost = testRuntimeStorageHost(runtimeRoot.clone());
-        Ok(Self {
-            runtimeRoot,
-            registryStore: LocalModelRegistryStore::new(registryPath),
-            httpHost,
-            storageHost: Some(storageHost),
-        })
+    pub fn new(runtimeRoot: PathBuf, registryPath: PathBuf, httpHost: Arc<dyn HttpHost>) -> Result<Self, LocalModelDownloadError> {
+        let mut installer = Self::forRuntimeRoot(runtimeRoot, httpHost)?;
+        installer.registryStore = LocalModelRegistryStore::new(registryPath);
+        Ok(installer)
     }
 
-    /// Creates an installer backed by the runtime storage host.
-    pub fn forRuntimeStorage(
-        storageHost: Arc<dyn RuntimeStorageHost>,
-        httpHost: Arc<dyn HttpHost>,
-    ) -> Result<Self, LocalModelDownloadError> {
-        let runtimeRoot = storageHost.runtimeRootDir().ok_or_else(|| {
-            LocalModelDownloadError::Storage(
-                "RuntimeStorageHost runtime root is not configured".to_string(),
-            )
-        })?;
+    /// Creates an installer bound to the owning VFS and registry storage.
+    pub fn withFilesystem(storageHost: Arc<dyn RuntimeStorageHost>, httpHost: Arc<dyn HttpHost>, filesystem: operit_vfs::VisualFileSystem::VisualFileSystem) -> Result<Self, LocalModelDownloadError> {
         Ok(Self {
-            runtimeRoot,
+            runtimeRoot: PathBuf::from("/operitapp/data"),
+            filesystem,
             registryStore: LocalModelRegistryStore::forRuntimeStorage(storageHost.clone()),
             httpHost,
             storageHost: Some(storageHost),
@@ -229,9 +207,9 @@ impl LocalModelInstaller {
             installedAtMs: request.installedAtMs,
             verifiedAtMs: Some(request.installedAtMs),
         };
-        let mut registry = self.readRegistry()?;
-        registry.upsert(installedModel.clone());
-        self.writeRegistry(&registry)?;
+        self.registryStore
+            .update(|registry| registry.upsert(installedModel.clone()))
+            .map_err(|error| LocalModelDownloadError::Storage(error.to_string()))?;
         onProgress(LocalModelDownloadProgress::Completed {
             modelId: installedModel.manifest.id.clone(),
             downloadedBytes,
@@ -268,16 +246,14 @@ impl LocalModelInstaller {
             downloadFiles.push(HttpDownloadFileRequest {
                 fileId: file.relativePath.clone(),
                 url,
-                targetPath: nativePathString(&tempTarget)?,
+                targetPath: vfsPathString(&tempTarget)?,
                 headers: Vec::new(),
                 expectedBytes: file.byteSize,
             });
             downloadedTargets.push((file.clone(), tempTarget, target));
         }
         let progressCallback = modelDownloadProgressCallback(onProgress);
-        let downloadResult = self
-            .httpHost
-            .downloadFiles(
+        let downloadResult = self.filesystem.downloadFiles(self.httpHost.as_ref(),
                 HttpDownloadRequest {
                     downloadId: format!("local-model:{}:{installedAtMs}", manifest.registryKey()),
                     maxConcurrency: downloadFiles.len().min(4),
@@ -339,7 +315,7 @@ impl LocalModelInstaller {
             downloadFiles.push(HttpDownloadFileRequest {
                 fileId: archive.archiveId.clone(),
                 url: source.fileUrl(&archive.relativePath),
-                targetPath: nativePathString(&archivePath)?,
+                targetPath: vfsPathString(&archivePath)?,
                 headers: Vec::new(),
                 expectedBytes: archive.byteSize,
             });
@@ -347,7 +323,7 @@ impl LocalModelInstaller {
         }
 
         let progressCallback = modelDownloadProgressCallback(onProgress.clone());
-        let downloadResult = self.httpHost.downloadFiles(
+        let downloadResult = self.filesystem.downloadFiles(self.httpHost.as_ref(),
             HttpDownloadRequest {
                 downloadId: format!("local-model:{}:{installedAtMs}", manifest.registryKey()),
                 maxConcurrency: downloadFiles.len().min(4),
@@ -406,22 +382,35 @@ impl LocalModelInstaller {
     ) -> Result<LocalModelVerifyResult, LocalModelDownloadError> {
         let modelId = modelId.trim();
         let version = version.trim();
-        let mut registry = self.readRegistry()?;
-        let index = registry
-            .installedModels
-            .iter()
-            .position(|model| model.manifest.id == modelId && model.manifest.version == version)
-            .ok_or_else(|| LocalModelDownloadError::ModelNotInstalled {
-                modelId: modelId.to_string(),
-                version: version.to_string(),
-            })?;
-        let installDir = self.runtimeStoragePath(&registry.installedModels[index].storagePath)?;
-        let manifest = registry.installedModels[index].manifest.clone();
-        validateManifestStorageSegments(&manifest)?;
-        let verifiedBytes = self.verifyInstalledFiles(&manifest, &installDir)?;
-        registry.installedModels[index].verifiedAtMs = Some(verifiedAtMs);
-        let installedModel = registry.installedModels[index].clone();
-        self.writeRegistry(&registry)?;
+        let notInstalled = || LocalModelDownloadError::ModelNotInstalled {
+            modelId: modelId.to_string(),
+            version: version.to_string(),
+        };
+        let registry = self.readRegistry()?;
+        let model = registry
+            .getInstalledModel(modelId, version)
+            .ok_or_else(notInstalled)?;
+        let installDir = self.runtimeStoragePath(&model.storagePath)?;
+        validateManifestStorageSegments(&model.manifest)?;
+        let verifiedBytes = self.verifyInstalledFiles(&model.manifest, &installDir)?;
+        let installedModel = self
+            .registryStore
+            .update(|registry| {
+                registry
+                    .installedModels
+                    .iter_mut()
+                    .find(|current| {
+                        current.manifest == model.manifest
+                            && current.storagePath == model.storagePath
+                            && current.installedAtMs == model.installedAtMs
+                    })
+                    .map(|current| {
+                        current.verifiedAtMs = Some(verifiedAtMs);
+                        current.clone()
+                    })
+            })
+            .map_err(|error| LocalModelDownloadError::Storage(error.to_string()))?
+            .ok_or_else(notInstalled)?;
         Ok(LocalModelVerifyResult {
             installedModel,
             verifiedBytes,
@@ -436,7 +425,7 @@ impl LocalModelInstaller {
     ) -> Result<LocalModelDeleteResult, LocalModelDownloadError> {
         let modelId = modelId.trim();
         let version = version.trim();
-        let mut registry = self.readRegistry()?;
+        let registry = self.readRegistry()?;
         let installedModel = registry
             .getInstalledModel(modelId, version)
             .cloned()
@@ -446,8 +435,14 @@ impl LocalModelInstaller {
             })?;
         let installDir = self.runtimeStoragePath(&installedModel.storagePath)?;
         self.removePath(&installDir)?;
-        registry.remove(modelId, version);
-        self.writeRegistry(&registry)?;
+        self.registryStore
+            .update(|registry| {
+                registry.remove(modelId, version);
+                if installedModel.manifest.sources.is_empty() {
+                    registry.removeCustomModel(modelId, version);
+                }
+            })
+            .map_err(|error| LocalModelDownloadError::Storage(error.to_string()))?;
         Ok(LocalModelDeleteResult {
             removedStoragePath: installedModel.storagePath.clone(),
             removedModel: installedModel,
@@ -504,7 +499,7 @@ impl LocalModelInstaller {
 
     /// Verifies that the installer has a runtime storage host.
     fn createDirectory(&self, path: &Path) -> Result<(), LocalModelDownloadError> {
-        let pathString = nativePathString(path)?;
+        let pathString = vfsPathString(path)?;
         self.storageHost
             .as_ref()
             .ok_or_else(|| LocalModelDownloadError::Storage(pathString))?;
@@ -536,7 +531,7 @@ impl LocalModelInstaller {
     /// Removes one completed or retained partial HTTP download target.
     fn removeDownloadTarget(&self, target: &Path) -> Result<(), LocalModelDownloadError> {
         self.removePath(target)?;
-        let partial = PathBuf::from(httpDownloadPartialTargetPath(&nativePathString(target)?));
+        let partial = PathBuf::from(httpDownloadPartialTargetPath(&vfsPathString(target)?));
         self.removePath(&partial)
     }
 
@@ -669,7 +664,7 @@ impl LocalModelInstaller {
     }
 }
 
-/// Maps a runtime-layout path into a native path under the runtime root.
+/// Maps a runtime-layout key into a portable path under the owning VFS root.
 fn runtimeLayoutPath(
     runtimeRoot: &Path,
     storagePath: &str,
@@ -677,9 +672,10 @@ fn runtimeLayoutPath(
     let storagePath = storagePath.trim();
     let relative = storagePath
         .strip_prefix(RUNTIME_ROOT_PATH_PREFIX)
-        .ok_or_else(|| LocalModelDownloadError::InvalidStoragePath(storagePath.to_string()))?
-        .replace('/', std::path::MAIN_SEPARATOR_STR);
-    Ok(runtimeRoot.join(relative))
+        .ok_or_else(|| LocalModelDownloadError::InvalidStoragePath(storagePath.to_string()))?;
+    operit_vfs::VfsPath::joinVfsPath(&runtimeRoot.to_string_lossy(), relative)
+        .map(PathBuf::from)
+        .map_err(LocalModelDownloadError::InvalidStoragePath)
 }
 
 /// Maps a native runtime-root path into a virtual runtime storage path.
@@ -750,9 +746,9 @@ fn modelDownloadProgressCallback(
 }
 
 /// Converts one native target path into the host download contract representation.
-fn nativePathString(path: &Path) -> Result<String, LocalModelDownloadError> {
+fn vfsPathString(path: &Path) -> Result<String, LocalModelDownloadError> {
     path.to_str()
-        .map(str::to_string)
+        .map(|path| path.replace('\\', "/"))
         .ok_or_else(|| LocalModelDownloadError::InvalidFileName {
             path: path.to_string_lossy().to_string(),
         })
@@ -1223,8 +1219,8 @@ mod tests {
         )
         .unwrap();
         let installDir = installer.runtimeStoragePath(&storagePath).unwrap();
-        fs::create_dir_all(&installDir).unwrap();
-        fs::write(installDir.join("model.bin"), FIXTURE_BYTES).unwrap();
+        installer.filesystem.makeDirectory(&vfsPathString(&installDir).unwrap(), true).unwrap();
+        installer.filesystem.writeFileBytes(&vfsPathString(&installDir.join("model.bin")).unwrap(), FIXTURE_BYTES).unwrap();
         installer
             .writeRegistry(&LocalModelRegistrySnapshot {
                 installedModels: vec![InstalledLocalModel {
@@ -1260,8 +1256,8 @@ mod tests {
         )
         .unwrap();
         let installDir = installer.runtimeStoragePath(&storagePath).unwrap();
-        fs::create_dir_all(&installDir).unwrap();
-        fs::write(installDir.join("model.bin"), FIXTURE_BYTES).unwrap();
+        installer.filesystem.makeDirectory(&vfsPathString(&installDir).unwrap(), true).unwrap();
+        installer.filesystem.writeFileBytes(&vfsPathString(&installDir.join("model.bin")).unwrap(), FIXTURE_BYTES).unwrap();
         installer
             .writeRegistry(&LocalModelRegistrySnapshot {
                 installedModels: vec![InstalledLocalModel {
@@ -1281,7 +1277,7 @@ mod tests {
 
         assert_eq!(result.removedStoragePath, storagePath);
         assert_eq!(registry.installedModels.len(), 0);
-        assert!(!installDir.exists());
+        assert!(!installer.filesystem.fileExists(&vfsPathString(&installDir).unwrap()).unwrap().exists);
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1322,7 +1318,7 @@ mod tests {
 
         assert_eq!(result.downloadedBytes, archiveBytes);
         assert_eq!(
-            fs::read(installDir.join("archive-root/model.bin")).unwrap(),
+            installer.filesystem.readFileBytes(&vfsPathString(&installDir.join("archive-root/model.bin")).unwrap()).unwrap(),
             FIXTURE_BYTES
         );
         assert!(installer

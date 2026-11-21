@@ -14,6 +14,9 @@ pub mod DocumentConversionUtil;
 pub mod FFmpegUtil;
 pub mod FileUtils;
 pub mod GithubReleaseUtil;
+pub mod IncrementalUpdate;
+mod UpdateHttp;
+mod UpdateSources;
 pub mod GlobalExceptionHandler;
 pub mod HtmlParserUtil;
 pub mod HttpMultiPartDownloader;
@@ -33,8 +36,7 @@ pub mod OCRUtils;
 pub mod OperitPaths;
 pub mod PortProcessKiller;
 pub mod PluginStoragePaths;
-#[path = "RuntimeStorageLayout.rs"]
-pub mod RuntimeStorageLayout;
+pub use operit_host_api::RuntimeStorageLayout;
 #[path = "RuntimeStoreRoot.rs"]
 pub mod RuntimeStoreRoot;
 pub mod SerializationSetup;

@@ -24,7 +24,7 @@ use operit_providers::runtime_support::{
 use operit_store::PreferencesDataStore::{MutableStateFlow, StateFlow, mutableStateFlow};
 use operit_store::SyncOperationStore::SyncClock;
 use operit_store::repository::ChatHistoryManager::ChatHistoryManager;
-use operit_tools::files::PathMapper::PathMapper;
+use operit_vfs::VfsPath;
 use operit_util::AppLogger::AppLogger;
 use operit_util::ChainLogger::{self, MESSAGE_STORE_CHAIN};
 use serde_json::Value;
@@ -33,21 +33,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Number of persisted messages loaded per display-window query.
-pub const DISPLAY_WINDOW_QUERY_BATCH_SIZE: usize = 80;
-/// Number of user or summary messages that close one display page.
-const DISPLAY_PAGE_TRIGGER_COUNT: usize = 5;
-/// Number of display pages kept visible around locator jumps.
-const MAX_DISPLAY_PAGE_COUNT: usize = 2;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-/// Defines one timestamp range used by the chat locator display window.
-struct DisplayPageRange {
-    startIndex: usize,
-    endIndexExclusive: usize,
-    startTimestampInclusive: i64,
-    endTimestampInclusive: i64,
-}
-
+pub const DISPLAY_WINDOW_QUERY_BATCH_SIZE: usize = 20;
 #[derive(Clone, Debug, PartialEq)]
 /// Defines whether chat selection follows global persisted state or stays local.
 pub enum ChatSelectionMode {
@@ -139,81 +125,16 @@ fn preserveLiveMessageStreams(
         let Some(previousMessage) = liveMessages.get(&message.timestamp) else {
             continue;
         };
+        if previousMessage.selectedVariantIndex != message.selectedVariantIndex
+            || message.completedAt > 0
+        {
+            continue;
+        }
         message.contentStream = previousMessage.contentStream.clone();
         message.parts = previousMessage.parts.clone();
         message.completedAt = previousMessage.completedAt;
         message.completedExecutionGeneration = previousMessage.completedExecutionGeneration;
     }
-}
-
-/// Splits locator previews into timestamp ranges from oldest to newest.
-fn resolveDisplayPageRanges(messages: &[ChatMessageLocatorPreview]) -> Vec<DisplayPageRange> {
-    if messages.is_empty() {
-        return Vec::new();
-    }
-
-    let mut pageStartIndicesNewestFirst = Vec::<usize>::new();
-    let mut cursor = messages.len() as isize - 1;
-
-    while cursor >= 0 {
-        let mut pageStartIndex = 0usize;
-        let mut triggerCountInCurrentPage = 0usize;
-        let mut pageClosed = false;
-
-        while cursor >= 0 && !pageClosed {
-            let messageIndex = cursor as usize;
-            let message = &messages[messageIndex];
-            if isDisplayPageTriggerMessage(&message.sender) {
-                triggerCountInCurrentPage += 1;
-
-                if message.sender == "summary" {
-                    pageStartIndex = messageIndex;
-                    cursor -= 1;
-                    pageClosed = true;
-                }
-
-                if !pageClosed && triggerCountInCurrentPage >= DISPLAY_PAGE_TRIGGER_COUNT {
-                    pageStartIndex = messageIndex;
-                    cursor -= 1;
-                    pageClosed = true;
-                }
-            }
-
-            if !pageClosed {
-                cursor -= 1;
-            }
-        }
-
-        if !pageClosed {
-            pageStartIndex = 0;
-            cursor = -1;
-        }
-
-        pageStartIndicesNewestFirst.push(pageStartIndex);
-    }
-
-    pageStartIndicesNewestFirst.reverse();
-    pageStartIndicesNewestFirst
-        .iter()
-        .enumerate()
-        .map(|(index, pageStartIndex)| {
-            let pageEndExclusive = pageStartIndicesNewestFirst
-                .get(index + 1)
-                .copied()
-                .unwrap_or(messages.len());
-            DisplayPageRange {
-                startIndex: *pageStartIndex,
-                endIndexExclusive: pageEndExclusive,
-                startTimestampInclusive: messages[*pageStartIndex].timestamp,
-                endTimestampInclusive: messages[pageEndExclusive - 1].timestamp,
-            }
-        })
-        .collect()
-}
-
-/// Returns whether the sender closes display pages while navigating history.
-fn isDisplayPageTriggerMessage(sender: &str) -> bool {
-    sender == "user" || sender == "summary"
 }
 
 /// Coordinates chat history persistence, current-chat state, and display-window updates.
@@ -433,13 +354,6 @@ impl ChatHistoryDelegate {
             hasOlderDisplayHistory: self.hasOlderDisplayHistory,
             hasNewerDisplayHistory: self.hasNewerDisplayHistory,
             isLoadingDisplayWindow: self.isLoadingDisplayWindow,
-        }
-    }
-
-    #[allow(non_snake_case)]
-    fn emitChatHistoryState(&mut self) {
-        if let Some(chatId) = self.currentChatIdFlow.value() {
-            self.dispatchChatViewEvent(ChatViewEvent::ViewUpdated, &chatId);
         }
     }
 
@@ -703,7 +617,6 @@ impl ChatHistoryDelegate {
         self.hasNewerDisplayHistory = false;
         self.isLoadingDisplayWindow = false;
         self.emitDisplayWindowState();
-        self.emitChatHistoryState();
         AppLogger::v_with_level(
             "ChatFlowTrace",
             "clear_current.done",
@@ -745,7 +658,6 @@ impl ChatHistoryDelegate {
                 ),
             );
         }
-        self.emitChatHistoryState();
         if let Some(value) = hasOlderPersistedHistory {
             self.currentChatWindow.hasOlderDisplayHistory = value;
             self.hasOlderDisplayHistory = value;
@@ -973,23 +885,17 @@ impl ChatHistoryDelegate {
     }
 
     #[allow(non_snake_case)]
-    /// Loads all persisted messages for a chat.
-    pub fn getChatHistory(&self, chatId: String) -> Vec<ChatMessage> {
-        self.chatHistoryManager
-            .loadChatMessages(&chatId)
-            .expect("ChatHistoryManager.loadChatMessages must succeed")
-    }
-
-    #[allow(non_snake_case)]
-    /// Loads persisted messages that should participate in runtime model context.
+    /// Loads the latest summary and its visible successors without hydrating compacted history.
     pub fn getRuntimeChatHistory(&self, chatId: String) -> Vec<ChatMessage> {
-        self.getChatHistory(chatId)
+        self.chatHistoryManager
+            .loadRuntimeChatMessages(chatId)
+            .expect("ChatHistoryManager.loadRuntimeChatMessages must succeed")
             .into_iter()
             .filter(|message| message.displayMode != operit_model::ChatMessageDisplayMode::ChatMessageDisplayMode::HIDDEN_PLACEHOLDER)
             .collect()
     }
 
-    /// Loads runtime chat messages through one inclusive message timestamp.
+    /// Loads visible context through a historical message while retaining its summary checkpoint.
     #[allow(non_snake_case)]
     pub fn getRuntimeChatHistoryUpTo(
         &self,
@@ -997,8 +903,11 @@ impl ChatHistoryDelegate {
         upToTimestampInclusive: i64,
     ) -> Vec<ChatMessage> {
         self.chatHistoryManager
-            .loadMessagesAfterLatestSummaryInRange(chatId, None, Some(upToTimestampInclusive))
-            .expect("ChatHistoryManager.loadMessagesAfterLatestSummaryInRange must succeed")
+            .loadRuntimeChatMessagesUpTo(chatId, upToTimestampInclusive)
+            .expect("ChatHistoryManager.loadRuntimeChatMessagesUpTo must succeed")
+            .into_iter()
+            .filter(|message| message.displayMode != operit_model::ChatMessageDisplayMode::ChatMessageDisplayMode::HIDDEN_PLACEHOLDER)
+            .collect()
     }
 
     #[allow(non_snake_case)]
@@ -1039,9 +948,9 @@ impl ChatHistoryDelegate {
     #[allow(non_snake_case)]
     /// Returns whether a chat contains at least one user-authored message.
     pub fn hasUserMessage(&self, chatId: String) -> bool {
-        self.getChatHistory(chatId)
-            .iter()
-            .any(|message| message.sender == "user")
+        self.chatHistoryManager
+            .hasUserMessage(chatId)
+            .expect("ChatHistoryManager.hasUserMessage must succeed")
     }
 
     #[allow(non_snake_case)]
@@ -1062,38 +971,31 @@ impl ChatHistoryDelegate {
             return false;
         }
 
+        if self.chatHistoryManager.loadChatMessageIndexPosition(&chatId, targetTimestamp)
+            .expect("ChatHistoryManager.loadChatMessageIndexPosition must succeed").is_none() {
+            return false;
+        }
+
         self.isLoadingDisplayWindow = true;
         self.currentChatWindow.isLoadingDisplayWindow = true;
         self.emitDisplayWindowState();
 
-        let locatorEntries = self
+        let mut revealedMessages = self
             .chatHistoryManager
-            .loadChatMessageLocatorPreviews(chatId.clone(), String::new())
-            .expect("ChatHistoryManager.loadChatMessageLocatorPreviews must succeed");
-        let pageRanges = resolveDisplayPageRanges(&locatorEntries);
-        let Some(targetPageIndex) = pageRanges.iter().position(|range| {
-            targetTimestamp >= range.startTimestampInclusive
-                && targetTimestamp <= range.endTimestampInclusive
-        }) else {
+            .loadChatMessagesDescUpTo(chatId.clone(), targetTimestamp, (DISPLAY_WINDOW_QUERY_BATCH_SIZE / 2) as i32)
+            .expect("ChatHistoryManager.loadChatMessagesDescUpTo must succeed");
+        if revealedMessages.first().map(|message| message.timestamp) != Some(targetTimestamp) {
             self.isLoadingDisplayWindow = false;
             self.currentChatWindow.isLoadingDisplayWindow = false;
             self.emitDisplayWindowState();
             return false;
-        };
-
-        let windowStartPageIndex = if targetPageIndex + 1 < pageRanges.len() {
-            targetPageIndex
-        } else {
-            targetPageIndex.saturating_sub(MAX_DISPLAY_PAGE_COUNT - 1)
-        };
-        let windowEndPageIndex =
-            (windowStartPageIndex + MAX_DISPLAY_PAGE_COUNT - 1).min(pageRanges.len() - 1);
-        let startTimestamp = pageRanges[windowStartPageIndex].startTimestampInclusive;
-        let endTimestamp = pageRanges[windowEndPageIndex].endTimestampInclusive;
-        let mut revealedMessages = self
-            .chatHistoryManager
-            .loadChatMessagesWindow(chatId.clone(), startTimestamp, endTimestamp)
-            .expect("ChatHistoryManager.loadChatMessagesWindow must succeed");
+        }
+        revealedMessages.reverse();
+        revealedMessages.extend(self.chatHistoryManager.loadChatMessagesAscAfter(
+            chatId.clone(), targetTimestamp, (DISPLAY_WINDOW_QUERY_BATCH_SIZE / 2) as i32,
+        ).expect("ChatHistoryManager.loadChatMessagesAscAfter must succeed"));
+        let startTimestamp = revealedMessages.first().expect("target window contains its target").timestamp;
+        let endTimestamp = revealedMessages.last().expect("target window contains its target").timestamp;
         let previousMessages = self
             .openedChatMessageFlowSnapshot(&chatId)
             .unwrap_or_default();
@@ -1109,11 +1011,9 @@ impl ChatHistoryDelegate {
         AppLogger::trace(
             "ChatFlowTrace",
             &format!(
-                "reveal_locator chatId={} target={} pages={}..{} loaded={} hasOlder={} hasNewer={}",
+                "reveal_locator chatId={} target={} loaded={} hasOlder={} hasNewer={}",
                 chatId,
                 targetTimestamp,
-                windowStartPageIndex,
-                windowEndPageIndex,
                 chat_flow_trace_summary(&revealedMessages),
                 hasOlder,
                 hasNewer
@@ -1484,7 +1384,7 @@ impl ChatHistoryDelegate {
             participantId: None,
             promptFunctionType: PromptFunctionType::CHAT,
             defaultModelBinding: support
-                .modelBindingForFunction(support.dataDir()?, FunctionType::CHAT)?,
+                .modelBindingForFunction(FunctionType::CHAT)?,
             defaultTtsConfigId: support.defaultTtsConfigId()?,
         };
         let ownerExtension = draft
@@ -1717,8 +1617,9 @@ impl ChatHistoryDelegate {
         Ok(true)
     }
 
-    /// Clears local projections of a committed deletion without invoking configuration owners again.
+    /// Clears a committed deletion and opens the latest remaining history when the active chat was deleted.
     pub(crate) fn clearDeletedChatState(&mut self, chatId: String) -> Result<(), String> {
+        let wasCurrentChat = self.currentChatIdFlow.value().as_ref() == Some(&chatId);
         if self.chatHistoryManager.currentChatIdFlow()
             .map_err(|error| error.to_string())?
             .as_ref() == Some(&chatId)
@@ -1726,7 +1627,7 @@ impl ChatHistoryDelegate {
             self.chatHistoryManager.clearCurrentChatId()
                 .map_err(|error| error.to_string())?;
         }
-        if self.currentChatIdFlow.value().as_ref() == Some(&chatId) {
+        if wasCurrentChat {
             self.currentChatIdFlow.set_value(None);
             self.clearCurrentChatHistoryInMemory();
         }
@@ -1735,6 +1636,13 @@ impl ChatHistoryDelegate {
         });
         self.clearChatFlow(&chatId);
         self.finishDestructiveHistoryMutation(chatId);
+        if wasCurrentChat {
+            if let Some(nextChatId) = self.chatHistoryManager.mostRecentChatId()
+                .map_err(|error| error.to_string())?
+            {
+                self.openChatHistory(nextChatId, true)?;
+            }
+        }
         Ok(())
     }
 
@@ -1745,9 +1653,6 @@ impl ChatHistoryDelegate {
             .deleteMessage(chatId.clone(), timestamp)
             .expect("ChatHistoryManager.deleteMessage must remove message");
         self.removeChatMessage(&chatId, timestamp);
-        if self.currentChatIdFlow.value().as_ref() == Some(&chatId) {
-            self.emitChatHistoryState();
-        }
         true
     }
 
@@ -1785,9 +1690,6 @@ impl ChatHistoryDelegate {
                     .expect("ChatHistoryManager.deleteMessage must remove message");
                 delegate.removeChatMessage(&chatId, timestamp);
             }
-            if delegate.currentChatIdFlow.value().as_ref() == Some(&chatId) {
-                delegate.emitChatHistoryState();
-            }
             true
         })
     }
@@ -1804,9 +1706,6 @@ impl ChatHistoryDelegate {
         self.updateOpenedChatMessage(&chatId, timestamp, |message| {
             message.isFavorite = isFavorite;
         });
-        if self.currentChatIdFlow.value().as_deref() == Some(chatId.as_str()) {
-            self.emitChatHistoryState();
-        }
     }
 
     #[allow(non_snake_case)]
@@ -1830,9 +1729,6 @@ impl ChatHistoryDelegate {
                 .deleteMessagesFrom(chatId.clone(), timestamp)
                 .expect("ChatHistoryManager.deleteMessagesFrom must remove messages");
             delegate.removeChatMessagesFrom(&chatId, timestamp);
-            if delegate.currentChatIdFlow.value().as_ref() == Some(&chatId) {
-                delegate.emitChatHistoryState();
-            }
             true
         })
     }
@@ -1846,7 +1742,7 @@ impl ChatHistoryDelegate {
         self.chatHistoryManager
             .selectMessageVariant(chatId.clone(), timestamp, selectedVariantIndex)
             .expect("ChatHistoryManager.selectMessageVariant must select the requested variant");
-        self.reloadCurrentChatDisplayHistory(chatId);
+        self.reloadCurrentChatDisplayHistoryWithInvalidatedRevision(chatId, Some(timestamp));
     }
 
     #[allow(non_snake_case)]
@@ -1870,7 +1766,10 @@ impl ChatHistoryDelegate {
             .expect("The newly persisted exact variant must be readable");
         ToolPkgChatMessageHookBridge::dispatchMessagePersisted(&chatId, &persistedVariant);
         if self.currentChatIdFlow.value().as_ref() == Some(&chatId) {
-            self.reloadCurrentChatDisplayHistory(chatId.clone());
+            self.reloadCurrentChatDisplayHistoryWithInvalidatedRevision(
+                chatId.clone(),
+                Some(timestamp),
+            );
         }
         ChainLogger::verbose(
             MESSAGE_STORE_CHAIN,
@@ -1964,15 +1863,15 @@ impl ChatHistoryDelegate {
     ) -> Result<operit_model::Workspace::Workspace, String> {
         let selection = folderPath.trim();
         let source = if let Some(json) =
-            selection.strip_prefix(operit_tools::files::MountRegistry::MOUNT_SOURCE_PREFIX)
+            selection.strip_prefix(operit_vfs::MountRegistry::MOUNT_SOURCE_PREFIX)
         {
             Some(
-                serde_json::from_str::<operit_tools::files::MountRegistry::MountSource>(json)
+                serde_json::from_str::<operit_vfs::MountRegistry::MountSource>(json)
                     .map_err(|e| format!("Invalid workspace mount source: {e}"))?,
             )
         } else if selection.starts_with("content://") {
             // Keep compatibility with callers that submit a raw authorized tree URI.
-            Some(operit_tools::files::MountRegistry::MountSource {
+            Some(operit_vfs::MountRegistry::MountSource {
                 namespace: "/virtual/android/documents".into(),
                 backend: "android_documents".into(),
                 root: selection.into(),
@@ -1984,7 +1883,7 @@ impl ChatHistoryDelegate {
         let (folderPath, mountedName) = match source {
             Some(source) => {
                 let host = operit_store::RuntimeStorageHost::defaultRuntimeStorageHost();
-                let mount = operit_tools::files::MountRegistry::MountRegistry::withStorage(host)
+                let mount = operit_vfs::MountRegistry::MountRegistry::withStorage(host)
                     .register(
                         &source.namespace,
                         &source.backend,
@@ -1995,11 +1894,18 @@ impl ChatHistoryDelegate {
             }
             None => (folderPath, None),
         };
-        let folderPath = PathMapper::normalizeWorkspaceBindingPath(&folderPath)?;
+        let (nodeId, path) = match operit_util::FileUtils::FileUtils::splitQualifiedVfsPath(&folderPath) {
+            Some((owner, path)) => (owner.to_owned(), VfsPath::normalizeVfsPath(path)?),
+            None => (
+                operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::native().initialize()?.nodeId,
+                VfsPath::normalizeWorkspaceBindingPath(&folderPath)?,
+            ),
+        };
         let folderName = match mountedName {
             Some(name) => name,
-            None => operit_model::Workspace::Workspace::folderNameFromPath(&folderPath)?,
+            None => operit_model::Workspace::Workspace::folderNameFromPath(&path)?,
         };
+        let folderPath = operit_util::FileUtils::FileUtils::qualifyVfsPath(&nodeId, &path);
         let workspace = match self
             .chatHistoryManager
             .getWorkspaceForChat(&chatId)
@@ -2052,7 +1958,13 @@ impl ChatHistoryDelegate {
             .getWorkspace(workspaceId)
             .ok()
             .flatten()
-            .map(|workspace| workspace.primaryFolder().path.clone())
+            .map(|workspace| {
+                let path = &workspace.primaryFolder().path;
+                match operit_util::FileUtils::FileUtils::splitQualifiedVfsPath(path) {
+                    Some((owner, localPath)) if Some(owner) == operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::localNodeId().as_deref() => localPath.to_owned(),
+                    _ => path.clone(),
+                }
+            })
     }
 
     /// Returns every mounted folder path for a chat.
@@ -2139,12 +2051,35 @@ impl ChatHistoryDelegate {
             ),
         );
         flow.set_value(messages);
-        self.emitChatHistoryState();
         didUpdate
     }
 
     #[allow(non_snake_case)]
-    /// Adds, updates, or persists a message for the current or supplied chat.
+    /// Commits completed prepared text with canonical retry detection, including messages hidden by summaries.
+    pub fn commitPreparedAssistantMessage(&mut self, chatId: &str, text: &str, timestamp: i64) -> Result<bool, String> {
+        let mut message = ChatMessage::new_with_markdown_timestamp("ai".into(), text.into(), timestamp);
+        message.sentAt = timestamp;
+        message.completedAt = operit_host_api::TimeUtils::currentTimeMillis();
+        self.commitPreparedAssistantMessageSnapshot(chatId, message)
+    }
+
+    /// Commits the complete prepared reply without replacing its author, model usage or generation timing.
+    pub fn commitPreparedAssistantMessageSnapshot(&mut self, chatId: &str, message: ChatMessage) -> Result<bool, String> {
+        let timestamp = message.timestamp;
+        self.requireChatExists(chatId)?;
+        if self.chatHistoryManager.loadChatMessageIndexPosition(chatId, timestamp).map_err(|error| error.to_string())?.is_some() {
+            let existing = self.chatHistoryManager.loadChatMessageVariant(chatId, timestamp, 0).map_err(|error| error.to_string())?;
+            if existing.sender != "ai" || existing.displayText() != message.displayText() {
+                return Err("Prepared message timestamp conflicts with an existing message".into());
+            }
+            return Ok(true);
+        }
+        let message = self.chatHistoryManager.addMessage(chatId.into(), message).map_err(|error| error.to_string())?;
+        ToolPkgChatMessageHookBridge::dispatchMessagePersisted(chatId, &message);
+        self.publishChatMessage(chatId, message);
+        Ok(false)
+    }
+
     pub fn addMessageToChat(&mut self, message: ChatMessage, chatIdOverride: Option<String>) {
         let Some(targetChatId) = chatIdOverride.or_else(|| self.currentChatIdFlow.value()) else {
             return;
@@ -2390,20 +2325,20 @@ impl ChatHistoryDelegate {
         &mut self,
         chatId: String,
         message: ChatMessage,
-        chatMetrics: Option<(i64, i64, i64)>,
+        currentWindowSize: Option<i64>,
     ) -> Result<SyncClock, String> {
         AppLogger::trace(
             "ChatFlowTrace",
             &format!(
-                "commit_assistant.start chatId={} metricsSet={} {}",
+                "commit_assistant.start chatId={} windowSizeSet={} {}",
                 chatId,
-                chatMetrics.is_some(),
+                currentWindowSize.is_some(),
                 chat_message_trace_summary(&message)
             ),
         );
         let clock = self
             .chatHistoryManager
-            .commitAssistantMessageSegment(chatId.clone(), message.clone(), chatMetrics)
+            .commitAssistantMessageSegment(chatId.clone(), message.clone(), currentWindowSize)
             .map_err(|error| error.to_string())?;
         let mut persistedMessage = self
             .chatHistoryManager
@@ -2464,7 +2399,6 @@ impl ChatHistoryDelegate {
                 self.clearChatFlow(&chatId);
             }
         }
-        self.emitChatHistoryState();
     }
 
     #[allow(non_snake_case)]
@@ -2490,9 +2424,6 @@ impl ChatHistoryDelegate {
                         .expect("ChatHistoryManager.clearChatMessages must succeed");
                     delegate.clearChatFlow(&chatId);
                 }
-            }
-            if delegate.currentChatIdFlow.value().as_ref() == Some(&chatId) {
-                delegate.emitChatHistoryState();
             }
             true
         })
@@ -2649,6 +2580,31 @@ mod tests {
 
         assert_eq!(loaded.contentStream, previous.contentStream);
         assert_eq!(loaded.parts, previous.parts);
+    }
+
+    /// A completed stored role reply must retire a stale stream retained by another delegate clone.
+    #[test]
+    fn persistence_refresh_keeps_completed_reply_instead_of_reviving_stale_stream() {
+        let source = Arc::new(CoreStreamSource::new(|_request| {
+            let (_sender, receiver) = CoreEventStream::channel();
+            Ok(receiver)
+        }));
+        let mut previous = ChatMessage::new_with_markdown_timestamp(
+            "ai".to_string(), "partial role reply".to_string(), 123,
+        );
+        previous.contentStream = Some(CoreStream::<MarkdownStreamEvent>::fromSourceWithId(
+            "stale-role-stream".to_string(), source,
+        ));
+        let mut loaded = ChatMessage::new_with_markdown_timestamp(
+            "ai".to_string(), "completed role reply".to_string(), 123,
+        );
+        loaded.completedAt = 456;
+        let completed = loaded.clone();
+
+        preserveLiveMessageStreams(&[previous], std::slice::from_mut(&mut loaded), None);
+
+        assert_eq!(loaded, completed);
+        assert!(loaded.contentStream.is_none());
     }
 
     /// Keeps the reloaded survivor's parts even when its index matches the deleted live revision.

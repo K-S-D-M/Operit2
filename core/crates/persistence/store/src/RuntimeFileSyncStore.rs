@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use operit_host_api::RuntimeStorageHost;
+use operit_util::FileUtils::FileUtils;
 use operit_util::RuntimeStorageLayout::{runtimeStorageOwnership, RuntimeStorageOwnership};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,11 +15,8 @@ use crate::SyncOperationStore::{
 pub const RUNTIME_FILE_SYNC_DOMAIN: &str = "runtime_file";
 const RUNTIME_FILE_SYNC_ENTITY_TYPE: &str = "file";
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeFileSyncReference {
-    pub contentHash: String,
-    pub size: i64,
-}
+pub use crate::SyncBlobIo::RuntimeFileSyncReference;
+pub(crate) use crate::SyncBlobIo::{validateBlobReference,validateContentHash,verifyBlob};
 
 /// File state carries metadata separately from content-addressed transport references.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,6 +62,14 @@ impl RuntimeFileSyncStore {
             && operation.semantics == SyncOperationSemantics::EntityState && matches!(operation.operation.as_str(), "upsert" | "delete")
     }
 
+    /// Observe durable originals once per page; failed file application remains pending.
+    pub fn prepareSyncedOperations(&self, operations: &[SyncOperation]) -> Result<(), String> {
+        let valid = operations.iter().filter(|op| Self::isCompleteState(op)
+            && requireSpaceFile(&op.entityId).is_ok() && FileUtils::isPortableFilePath(&op.entityId)
+            && Self::requiredBlob(op).is_ok()).cloned().collect::<Vec<_>>();
+        self.syncOperationStore.appendOperations(&valid).map_err(|e|e.to_string())
+    }
+
     /// Creates a runtime file synchronization store over one host and operation root.
     pub fn new(storageHost: Arc<dyn RuntimeStorageHost>, syncRootPath: impl Into<String>) -> Self {
         let syncRootPath = syncRootPath.into();
@@ -106,7 +112,7 @@ impl RuntimeFileSyncStore {
         self.storageHost
             .writeBytes(storagePath, content)
             .map_err(|error| error.to_string())?;
-        self.recordSnapshot(storagePath, content, initial)?;
+        if FileUtils::isPortableFilePath(storagePath) { self.recordSnapshot(storagePath, content, initial)?; }
         Ok(())
     }
 
@@ -116,7 +122,7 @@ impl RuntimeFileSyncStore {
         if crate::PluginStorage::ownsFile(self.storageHost.clone(),storagePath).map_err(|e|e.to_string())? {
             return Err("Registered database files require record-level storage operations".into());
         }
-        let reference = self.storeBlob(content)?;
+        let reference = RuntimeFileSyncReference { contentHash: contentHash(content), size: i64::try_from(content.len()).map_err(|_| "File is too large")? };
         let mut deviceId = self.syncOperationStore.localDeviceId().map_err(|error| error.to_string())?;
         let modifiedAt = Some(self.storageHost.modifiedAt(storagePath).map_err(|e| e.to_string())?);
         let mut payload = serde_json::to_value(RuntimeFileSnapshot { reference: reference.clone(), modifiedAt }).map_err(|e| e.to_string())?;
@@ -144,7 +150,7 @@ impl RuntimeFileSyncStore {
             let mut replaced = std::collections::BTreeSet::new();
             let managed = crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(self.storageHost.clone(), self.syncRootPath.clone());
             for path in paths {
-                if requireSpaceFile(&path).is_err() || crate::PluginStorage::ownsFile(self.storageHost.clone(),&path).map_err(|e|e.to_string())? { continue; }
+                if !FileUtils::isPortableFilePath(&path) || requireSpaceFile(&path).is_err() || crate::PluginStorage::ownsFile(self.storageHost.clone(),&path).map_err(|e|e.to_string())? { continue; }
                 let limit = if crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::manages(&path) {
                     match managed.captureLimit(&path)? { Some(limit) => Some(limit), None => continue }
                 } else { None };
@@ -170,19 +176,7 @@ impl RuntimeFileSyncStore {
         if crate::PluginStorage::ownsFile(self.storageHost.clone(),storagePath).map_err(|e|e.to_string())? {
             return Err("Registered database files require record-level storage operations".into());
         }
-        let mut next = if self
-            .storageHost
-            .exists(storagePath)
-            .map_err(|error| error.to_string())?
-        {
-            self.storageHost
-                .readBytes(storagePath)
-                .map_err(|error| error.to_string())?
-        } else {
-            Vec::new()
-        };
-        next.extend_from_slice(content);
-        self.writeBytes(storagePath, &next)
+        self.trackChanges(&[storagePath.into()], || self.storageHost.appendBytes(storagePath, content).map_err(|e| e.to_string()))
     }
 
     /// Deletes a Space file and records a synchronized tombstone.
@@ -193,7 +187,7 @@ impl RuntimeFileSyncStore {
         }
         if crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::manages(storagePath) {
             return crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(self.storageHost.clone(), self.syncRootPath.clone())
-                .track(|| {
+                .trackPaths(&[storagePath], || {
                     if self.storageHost.exists(storagePath).map_err(|e| e.to_string())? {
                         self.storageHost.delete(storagePath, false).map_err(|e| e.to_string())?;
                     }
@@ -209,6 +203,7 @@ impl RuntimeFileSyncStore {
     /// Records an observed deletion without deleting a possibly recreated local file.
     pub(crate) fn recordDeletion(&self, storagePath: &str) -> Result<(), String> {
         requireSpaceFile(storagePath)?;
+        if !FileUtils::isPortableFilePath(storagePath) { return Ok(()); }
         if crate::PluginStorage::ownsFile(self.storageHost.clone(),storagePath).map_err(|e|e.to_string())? {
             return Err("Registered database files require record-level storage operations".into());
         }
@@ -226,10 +221,7 @@ impl RuntimeFileSyncStore {
     /// Tracks VFS mutations using declared storage ownership, without knowledge of file consumers.
     /// Capturing before the operation preserves tombstones for recursive deletion and moves.
     pub fn trackChanges<T>(&self, paths: &[String], change: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-        // One outer scanner lock covers managed paths, including mutations of their
-        // ancestors. The inner capture deliberately skips them to avoid duplicate
-        // snapshots and bypassing their policy.
-        crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(self.storageHost.clone(), self.syncRootPath.clone()).track(|| {
+        let tracked = || {
             let before = self.captureFiles(paths)?;
             let result = change();
             let after = self.captureFiles(paths)?;
@@ -240,13 +232,21 @@ impl RuntimeFileSyncStore {
             }
             for path in before.keys().filter(|path| !after.contains_key(*path)) { self.recordDeletion(path)?; }
             result
-        })
+        };
+        let managed = paths.iter().filter(|path| crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::affectedBy(path)).collect::<Vec<_>>();
+        if !managed.is_empty() {
+            crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(self.storageHost.clone(), self.syncRootPath.clone()).trackPaths(&managed, tracked)
+        } else {
+            tracked()
+        }
     }
 
     /// Captures metadata for registered files under the requested VFS paths.
     fn captureFiles(&self, paths: &[String]) -> Result<std::collections::BTreeMap<String, (i64, i64)>, String> {
         let mut files = std::collections::BTreeMap::new();
         for path in paths {
+            if !FileUtils::isPortableFilePath(path) { continue; }
+            if crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::manages(path) { continue; }
             if !self.storageHost.exists(path).map_err(|e|e.to_string())? { continue; }
             let Some((parent, _)) = path.rsplit_once('/') else {
                 for entry in self.storageHost.list(path).map_err(|e|e.to_string())? { self.captureEntry(entry, &mut files)?; }
@@ -262,6 +262,7 @@ impl RuntimeFileSyncStore {
     /// Visits each listed entry once, excluding registered databases and device-local files.
     fn captureEntry(&self, entry: operit_host_api::RuntimeStorageEntry, files: &mut std::collections::BTreeMap<String, (i64, i64)>) -> Result<(), String> {
         let path = &entry.path;
+        if !FileUtils::isPortableFilePath(path) { return Ok(()); }
         if crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::manages(path) { return Ok(()); }
         if crate::PluginStorage::ownsFile(self.storageHost.clone(), path).map_err(|e|e.to_string())? { return Ok(()); }
         if entry.isDirectory {
@@ -284,6 +285,7 @@ impl RuntimeFileSyncStore {
         payload: serde_json::Value,
     ) -> Result<(), String> {
         requireSpaceFile(storagePath)?;
+        if !FileUtils::isPortableFilePath(storagePath) { return Ok(()); }
         if crate::PluginStorage::ownsFile(storageHost.clone(),storagePath).map_err(|e|e.to_string())? {
             return Err("Registered database files require record-level storage operations".into());
         }
@@ -299,28 +301,26 @@ impl RuntimeFileSyncStore {
                 let content = store.readBlob(&snapshot.reference)?;
                 storageHost.writeBytes(storagePath, &content).map_err(|e| e.to_string())?;
                 if let Some(modifiedAt) = snapshot.modifiedAt { storageHost.setModifiedAt(storagePath, modifiedAt).map_err(|e| e.to_string())?; }
-                storageHost.flushFile(storagePath).map_err(|e| e.to_string())
+                storageHost.flushFile(storagePath).map_err(|e| e.to_string())?;
+                store.indexMaterializedFile(storagePath, Some(&snapshot.reference))
             }
             "delete" => {
                 if storageHost.exists(storagePath).map_err(|e|e.to_string())? {
                     storageHost.delete(storagePath, false).map_err(|e|e.to_string())?;
                 }
-                Ok(())
+                store.indexMaterializedFile(storagePath, None)
             }
             other => Err(format!("unsupported runtime file sync operation: {other}")),
         }
     }
 
-    /// Returns the blob required by one runtime-file upsert operation.
+    /// Returns the content blob required by a transported operation or runtime-file upsert.
     pub fn requiredBlob(
         operation: &SyncOperation,
     ) -> Result<Option<RuntimeFileSyncReference>, String> {
-        if operation.entityType == "initialization" && operation.operation == "initialize" {
-            return operation.payload.get("transactionBlob").map(|reference| {
-                let reference = serde_json::from_value(reference.clone()).map_err(|e|e.to_string())?;
-                validateBlobReference(&reference)?;
-                Ok(reference)
-            }).transpose();
+        if operation.domain == RUNTIME_FILE_SYNC_DOMAIN && !FileUtils::isPortableFilePath(&operation.entityId) { return Ok(None); }
+        if let Some(reference) = crate::SyncBlobIo::transaction_reference(operation)? {
+            return Ok(Some(reference));
         }
         if operation.domain != RUNTIME_FILE_SYNC_DOMAIN {
             return Ok(None);
@@ -341,40 +341,63 @@ impl RuntimeFileSyncStore {
         }
     }
 
-    /// Initializers use the existing verified blob transport instead of exceeding an operation page.
+    /// Sends large immutable originals through the existing verified blob transport.
     pub fn prepareTransactionForTransport(&self, mut operation: SyncOperation) -> Result<SyncOperation,String> {
-        if operation.operation == "initialize" && operation.entityType == "initialization" {
-            let bytes = serde_json::to_vec(&operation).map_err(|e|e.to_string())?;
-            if bytes.len() > 32 * 1024 {
-                let reference = self.storeBlob(&bytes)?;
+        if crate::SyncBlobIo::transaction_reference(&operation)?.is_none() {
+            let (hash, size) = crate::Transaction::serialized_digest(&operation)?;
+            if size > 32 * 1024 {
+                let reference = self.storeJsonBlobWithDigest(&operation, hash, size)?;
                 operation.payload = serde_json::json!({"transactionBlob":reference});
             }
         }
         Ok(operation)
     }
 
+    /// Restores the verified original, leaving SQL initializers to their streaming reader.
     pub fn hydrateTransaction(&self, operation: SyncOperation) -> Result<SyncOperation,String> {
-        if operation.operation != "initialize" || operation.entityType != "initialization" { return Ok(operation); }
-        let Some(reference) = Self::requiredBlob(&operation)? else { return Ok(operation); };
-        let original: SyncOperation = serde_json::from_slice(&self.readBlob(&reference)?).map_err(|e|e.to_string())?;
-        let mut envelope = original.clone();
-        envelope.payload = operation.payload.clone();
-        if envelope != operation || crate::Transaction::compaction::Initialization::decode(&original)?.is_none() {
-            return Err("Initialization blob differs from its envelope".into());
+        if operation.domain == RUNTIME_FILE_SYNC_DOMAIN && !FileUtils::isPortableFilePath(&operation.entityId) { return Ok(operation); }
+        let Some(reference) = crate::SyncBlobIo::transaction_reference(&operation)? else { return Ok(operation); };
+        let initialization = operation.operation == "initialize" && operation.entityType == "initialization";
+        if initialization && matches!(operation.domain.as_str(), "chat"|"plugin_storage") { return Ok(operation); }
+        let mut original: SyncOperation = self.readJsonBlob(&reference)?;
+        // Only the tiny transport payload changes. Do not clone the complete transaction to compare headers.
+        let payload = std::mem::replace(&mut original.payload, operation.payload.clone());
+        let matches = original == operation;
+        original.payload = payload;
+        if !matches || (initialization && !crate::Transaction::compaction::Initialization::validate_identity(&original)?) {
+            return Err("Transaction blob differs from its envelope".into());
         }
         Ok(original)
     }
 
-    /// Checks local blob presence without reading or hashing its contents.
+    pub(crate) fn storeStream(&self,reference:&RuntimeFileSyncReference,reader:&mut dyn std::io::Read)->Result<(),String> {
+        crate::SyncBlobIo::write_stream(self.storageHost.as_ref(),&self.blobStoragePath(reference)?,reference,|writer|{
+            std::io::copy(reader,writer).map(|_|()).map_err(|e|e.to_string())
+        })
+    }
+
+    pub fn readStagedJson<T:serde::de::DeserializeOwned>(&self, reference:&RuntimeFileSyncReference) -> Result<(T,std::sync::Arc<crate::Transaction::sql_snapshot::SqlSnapshot>),String> {
+        validateBlobReference(reference)?;
+        crate::Transaction::sql_snapshot::read_staged(self.storageHost.clone(),&self.blobReadPath(&reference.contentHash)?,reference)
+    }
+
+    pub fn readSqlInitialization(&self, operation:&SyncOperation) -> Result<crate::Transaction::compaction::Initialization,String> {
+        let reference=Self::requiredBlob(operation)?.ok_or("Missing SQL initialization blob")?;
+        let (original,sql)=self.readStagedJson::<SyncOperation>(&reference)?;
+        crate::Transaction::sql_snapshot::validate_initialization(operation,original,sql)
+    }
+
+    /// Checks cached bytes or a live source, verifying sources whose metadata changed.
     pub fn hasBlob(&self, reference: &RuntimeFileSyncReference) -> Result<bool, String> {
-        self.storageHost.exists(&self.blobStoragePath(reference)?).map_err(|e|e.to_string())
+        validateBlobReference(reference)?;
+        Ok(self.storageHost.exists(&self.blobStoragePath(reference)?).map_err(|e|e.to_string())? || self.fileSource(&reference.contentHash)?.is_some())
     }
 
     /// Reads one bounded range from a verified content-addressed blob.
     pub fn readBlobChunk(&self, contentHash: &str, offset: i64, length: i64) -> Result<Vec<u8>, String> {
         let offset = u64::try_from(offset).map_err(|_| "blob chunk offset must not be negative")?;
         let length = usize::try_from(length).map_err(|_| "blob chunk length must not be negative or overflow")?;
-        self.storageHost.readBytesRange(&self.blobPath(contentHash)?, offset, length).map_err(|e|e.to_string())
+        self.storageHost.readBytesRange(&self.blobReadPath(contentHash)?, offset, length).map_err(|e|e.to_string())
     }
 
     /// Verifies and persists one complete content-addressed blob.
@@ -392,6 +415,7 @@ impl RuntimeFileSyncStore {
     /// Resolves the verified host storage path for one content-addressed blob.
     pub fn blobStoragePath(&self, reference: &RuntimeFileSyncReference) -> Result<String, String> {
         validateBlobReference(reference)?;
+        self.syncOperationStore.withJournal(|journal|journal.lease_blob(&reference.contentHash)).map_err(|e|e.to_string())?;
         self.blobPath(&reference.contentHash)
     }
 
@@ -408,15 +432,92 @@ impl RuntimeFileSyncStore {
         Ok(reference)
     }
 
+    /// Encodes directly into a private host file instead of constructing a second JSON buffer.
+    pub fn storeJsonBlob<T: serde::Serialize>(&self, value: &T) -> Result<RuntimeFileSyncReference, String> {
+        let (hash,size) = crate::Transaction::serialized_digest(value)?;
+        self.storeJsonBlobWithDigest(value,hash,size)
+    }
+
+    fn storeJsonBlobWithDigest<T: serde::Serialize>(&self, value: &T, contentHash: String, size: u64) -> Result<RuntimeFileSyncReference, String> {
+        let reference = RuntimeFileSyncReference { contentHash, size: i64::try_from(size).map_err(|_|"Synchronization blob is too large")? };
+        crate::SyncBlobIo::write_json(self.storageHost.as_ref(), &self.blobStoragePath(&reference)?, value, &reference)?;
+        Ok(reference)
+    }
+
+    /// Verifies all source bytes while decoding; only the decoded object and a fixed I/O buffer coexist.
+    pub fn readJsonBlob<T: serde::de::DeserializeOwned>(&self, reference: &RuntimeFileSyncReference) -> Result<T, String> {
+        validateBlobReference(reference)?;
+        crate::SyncBlobIo::read_json(self.storageHost.as_ref(), &self.blobReadPath(&reference.contentHash)?, reference)
+    }
+
     /// Reads and verifies one complete content-addressed blob.
     pub fn readBlob(&self, reference: &RuntimeFileSyncReference) -> Result<Vec<u8>, String> {
         validateBlobReference(reference)?;
         let content = self
             .storageHost
-            .readBytes(&self.blobPath(&reference.contentHash)?)
+            .readBytes(&self.blobReadPath(&reference.contentHash)?)
             .map_err(|error| format!("blob {}: {error}", reference.contentHash))?;
         verifyBlob(reference, &content)?;
         Ok(content)
+    }
+
+    /// Materialized remote bytes replace their temporary blob with the same live-file index.
+    pub(crate) fn indexMaterializedFile(&self, path: &str, reference: Option<&RuntimeFileSyncReference>) -> Result<(), String> {
+        self.indexMaterializedFiles(&[(path, reference)])
+    }
+
+    /// The durable page intent allows successful file indices to share one SQL commit.
+    pub(crate) fn indexMaterializedFiles(&self, files: &[(&str, Option<&RuntimeFileSyncReference>)]) -> Result<(), String> {
+        let sources = files.iter().map(|(path, reference)| {
+            requireSpaceFile(path)?;
+            reference.map(|reference| self.storageHost.modifiedAt(path).map(|modified_at|
+                crate::Transaction::FileSource { path: (*path).into(), reference: reference.clone(), modified_at }))
+                .transpose().map_err(|e| e.to_string())
+        }).collect::<Result<Vec<_>, String>>()?;
+        self.syncOperationStore.withJournal(|journal| journal.transaction(|tx| {
+            for ((path, _), source) in files.iter().zip(&sources) {
+                match source {
+                    Some(source) => crate::Transaction::Journal::index_file(tx, source)?,
+                    None => crate::Transaction::Journal::unindex_file(tx, path)?,
+                }
+            }
+            Ok(())
+        })).map_err(|e|e.to_string())?;
+        Ok(())
+    }
+
+    /// Resolves a live carrier only while its content identity remains valid.
+    fn fileSource(&self, hash: &str) -> Result<Option<crate::Transaction::FileSource>, String> {
+        Ok(self.syncOperationStore.withJournal(|journal| journal.file_sources(hash)).map_err(|e|e.to_string())?
+            .into_iter().find(|source| source.current(self.storageHost.as_ref()).unwrap_or(false)))
+    }
+
+    /// Pins the sender's carriers with durable file contents and one shared directory flush.
+    pub fn prepareBlobReads(&self, references: &[&RuntimeFileSyncReference]) -> Result<(), String> {
+        let paths = references.iter().map(|reference| {
+            validateBlobReference(reference)?;
+            self.blobReadPathWithFlush(&reference.contentHash, crate::SyncBlobIo::BlobFlush::File)
+        }).collect::<Result<Vec<_>, String>>()?;
+        self.storageHost.flushDirectories(&paths.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|e|e.to_string())
+    }
+
+    /// Pins verified live bytes in the leased immutable carrier before any range is served.
+    fn blobReadPath(&self, hash: &str) -> Result<String, String> {
+        self.blobReadPathWithFlush(hash, crate::SyncBlobIo::BlobFlush::All)
+    }
+
+    fn blobReadPathWithFlush(&self, hash: &str, flush: crate::SyncBlobIo::BlobFlush) -> Result<String, String> {
+        let path = self.blobPath(hash)?;
+        self.syncOperationStore.withJournal(|journal|journal.lease_blob(hash)).map_err(|e|e.to_string())?;
+        if !self.storageHost.exists(&path).map_err(|e|e.to_string())? {
+            if let Some(source) = self.fileSource(hash)? {
+                crate::SyncBlobIo::write_stream_with_flush(self.storageHost.as_ref(), &path, &source.reference, flush, |writer| {
+                    let mut reader = crate::LegacyTransactionImport::JournalReader::new(self.storageHost.as_ref(), &source.path, 0, source.reference.size as u64 + 1);
+                    std::io::copy(&mut reader, writer).map(|_|()).map_err(|e|e.to_string())
+                })?;
+            }
+        }
+        Ok(path)
     }
 
     /// Resolves one validated blob hash below the private synchronization root.
@@ -431,50 +532,9 @@ fn contentHash(content: &[u8]) -> String {
     format!("{:x}", Sha256::digest(content))
 }
 
-/// Validates one content-addressed blob reference.
-fn validateBlobReference(reference: &RuntimeFileSyncReference) -> Result<(), String> {
-    validateContentHash(&reference.contentHash)?;
-    if reference.size < 0 {
-        return Err("runtime file blob size must not be negative".to_string());
-    }
-    Ok(())
-}
-
-/// Validates a lowercase SHA-256 storage key.
-fn validateContentHash(contentHash: &str) -> Result<(), String> {
-    if contentHash.len() != 64
-        || !contentHash
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err("runtime file blob hash must be lowercase SHA-256 hex".to_string());
-    }
-    Ok(())
-}
-
-/// Verifies declared blob size and content identity.
-fn verifyBlob(reference: &RuntimeFileSyncReference, content: &[u8]) -> Result<(), String> {
-    validateBlobReference(reference)?;
-    let size = i64::try_from(content.len())
-        .map_err(|_| "runtime file size does not fit i64".to_string())?;
-    if size != reference.size {
-        return Err(format!(
-            "runtime file blob size mismatch: expected {}, got {size}",
-            reference.size
-        ));
-    }
-    let actualHash = contentHash(content);
-    if actualHash != reference.contentHash {
-        return Err(format!(
-            "runtime file blob hash mismatch: expected {}, got {actualHash}",
-            reference.contentHash
-        ));
-    }
-    Ok(())
-}
 
 /// Rejects an operation whose entity is outside the explicit Space file registry.
-fn requireSpaceFile(storagePath: &str) -> Result<(), String> {
+pub(crate) fn requireSpaceFile(storagePath: &str) -> Result<(), String> {
     if runtimeStorageOwnership(storagePath)? != RuntimeStorageOwnership::Space {
         return Err(format!(
             "runtime file is not registered for Space synchronization: {storagePath}"
@@ -482,6 +542,7 @@ fn requireSpaceFile(storagePath: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -492,151 +553,27 @@ mod tests {
         }
     }
 
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
-
-    use operit_host_api::{HostError, RuntimeStorageEntry};
+    use std::sync::Arc;
     use operit_util::RuntimeStorageLayout::{
         RUNTIME_CLIENT_LOG_PATH, RUNTIME_SYNC_DIR_PATH, RUNTIME_WEBSESSION_BROWSER_HISTORY_PATH,
     };
-
     use super::*;
     use crate::SyncOperationStore::SyncClock;
 
-    #[derive(Clone, Default)]
-    struct MemoryStorageHost {
-    journalHost: Arc<crate::transaction_test_host::TransactionJournalHost>,
-        files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
-        modified: Arc<Mutex<BTreeMap<String, i64>>>,
+    // Real range reads and atomic staging are part of the blob memory contract.
+    struct TestDirectory(std::path::PathBuf);
+    impl Drop for TestDirectory {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
     }
-
-    impl RuntimeStorageHost for MemoryStorageHost {
-    fn openTransactionDatabase(&self, path: &str) -> operit_host_api::HostResult<Box<dyn operit_host_api::RuntimeSqliteConnection>> {
-        self.journalHost.open(path)
-    }
-
-        /// Confirms synchronous in-memory publication without copying or rewriting bytes.
-        fn flushFile(&self, path: &str) -> operit_host_api::HostResult<()> {
-            if !self.exists(path)? {
-                return Err(operit_host_api::HostError::new("runtime storage entry not found"));
-            }
-            Ok(())
-        }
-
-        /// Reports no physical runtime root for the in-memory host.
-        fn runtimeRootDir(&self) -> Option<std::path::PathBuf> {
-            None
-        }
-
-        /// Reports no physical workspace root for the in-memory host.
-        fn workspaceRootDir(&self) -> Option<std::path::PathBuf> {
-            None
-        }
-
-        /// Reads one in-memory runtime storage object.
-        fn readBytes(&self, path: &str) -> operit_host_api::HostResult<Vec<u8>> {
-            self.files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?
-                .get(path)
-                .cloned()
-                .ok_or_else(|| HostError::new(format!("missing test file: {path}")))
-        }
-
-        /// Reads one bounded range from an in-memory runtime storage object.
-        fn readBytesRange(
-            &self,
-            path: &str,
-            offset: u64,
-            length: usize,
-        ) -> operit_host_api::HostResult<Vec<u8>> {
-            let content = self.readBytes(path)?;
-            let offset = usize::try_from(offset)
-                .map_err(|_| HostError::new("test range offset does not fit usize"))?;
-            if offset >= content.len() {
-                return Ok(Vec::new());
-            }
-            let end = offset
-                .checked_add(length)
-                .ok_or_else(|| HostError::new("test range length overflow"))?
-                .min(content.len());
-            Ok(content[offset..end].to_vec())
-        }
-
-        /// Atomically publishes one complete in-memory test entry.
-        fn writeBytesAtomically(&self, path: &str, content: &[u8]) -> operit_host_api::HostResult<()> {
-            self.writeBytes(path, content)
-        }
-
-        /// Reads a test file's tracked metadata.
-        fn modifiedAt(&self, path: &str) -> operit_host_api::HostResult<i64> {
-            self.modified.lock().unwrap().get(path).copied().ok_or_else(|| HostError::new("missing file metadata"))
-        }
-        /// Restores a test file's source metadata.
-        fn setModifiedAt(&self, path: &str, time: i64) -> operit_host_api::HostResult<()> {
-            self.modified.lock().unwrap().insert(path.into(), time);
-            Ok(())
-        }
-
-        /// Writes one in-memory runtime storage object.
-        fn writeBytes(&self, path: &str, content: &[u8]) -> operit_host_api::HostResult<()> {
-            self.files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?
-                .insert(path.to_string(), content.to_vec());
-            *self.modified.lock().unwrap().entry(path.into()).or_default() += 1;
-            Ok(())
-        }
-
-        /// Appends bytes to one in-memory runtime storage object.
-        fn appendBytes(&self, path: &str, content: &[u8]) -> operit_host_api::HostResult<()> {
-            self.files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?
-                .entry(path.to_string())
-                .or_default()
-                .extend_from_slice(content);
-            Ok(())
-        }
-
-        /// Deletes one in-memory runtime storage object.
-        fn delete(&self, path: &str, _recursive: bool) -> operit_host_api::HostResult<()> {
-            self.files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?
-                .remove(path);
-            Ok(())
-        }
-
-        /// Reports whether one in-memory runtime storage object exists.
-        fn exists(&self, path: &str) -> operit_host_api::HostResult<bool> {
-            Ok(self
-                .files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?
-                .contains_key(path))
-        }
-
-        /// Lists in-memory runtime storage objects below one prefix.
-        fn list(&self, prefix: &str) -> operit_host_api::HostResult<Vec<RuntimeStorageEntry>> {
-            Ok(self
-                .files
-                .lock()
-                .map_err(|error| HostError::new(error.to_string()))?
-                .iter()
-                .filter(|(path, _)| path.starts_with(prefix))
-                .map(|(path, content)| RuntimeStorageEntry {
-                    path: path.clone(),
-                    isDirectory: false,
-                    size: content.len() as i64,
-                })
-                .collect())
-        }
+    fn storage() -> (TestDirectory, Arc<operit_host_native_storage::NativeRuntimeStorageHost>) {
+        let root = std::env::temp_dir().join(format!("operit-file-sync-{}", uuid::Uuid::new_v4()));
+        let host = Arc::new(operit_host_native_storage::NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces")));
+        (TestDirectory(root), host)
     }
 
     #[test]
     fn reset_file_transactions_recaptures_current_bytes_and_deletions() {
-        let host = Arc::new(MemoryStorageHost::default());
+        let (_directory, host) = storage();
         let files = RuntimeFileSyncStore::new(host.clone(), RUNTIME_SYNC_DIR_PATH);
         let deleted = operit_util::RuntimeStorageLayout::RUNTIME_WEBSESSION_BROWSER_BOOKMARKS_PATH;
         files.writeBytes(RUNTIME_WEBSESSION_BROWSER_HISTORY_PATH,b"old").unwrap();
@@ -660,8 +597,8 @@ mod tests {
     /// Verifies upsert and delete operations reproduce the same registered file on another host.
     #[test]
     fn synchronizes_registered_file_snapshots_and_tombstones() {
-        let source = Arc::new(MemoryStorageHost::default());
-        let target = Arc::new(MemoryStorageHost::default());
+        let (_source_directory, source) = storage();
+        let (_target_directory, target) = storage();
         let path = RUNTIME_WEBSESSION_BROWSER_HISTORY_PATH;
         let sourceStore = RuntimeFileSyncStore::new(source.clone(), RUNTIME_SYNC_DIR_PATH);
         sourceStore
@@ -722,29 +659,64 @@ mod tests {
     /// Verifies a node-local file cannot enter the runtime file synchronization log.
     #[test]
     fn rejects_node_local_files() {
-        let host = Arc::new(MemoryStorageHost::default());
+        let (_directory, host) = storage();
         let store = RuntimeFileSyncStore::new(host, RUNTIME_SYNC_DIR_PATH);
         assert!(store.writeBytes(RUNTIME_CLIENT_LOG_PATH, b"log").is_err());
     }
+    /// Blob transport preserves ordinary and initialization identities under corrupt or forged delivery.
     #[test]
-    fn large_initialization_uses_verified_blobs_and_preserves_its_immutable_envelope() {
+    fn large_operations_use_verified_blobs_and_preserve_their_immutable_envelope() {
         use crate::Transaction::{Backend,Owner,Data,Snapshot,compaction::Initialization};
-        let source = RuntimeFileSyncStore::new(Arc::new(MemoryStorageHost::default()),RUNTIME_SYNC_DIR_PATH);
-        let target = RuntimeFileSyncStore::new(Arc::new(MemoryStorageHost::default()),RUNTIME_SYNC_DIR_PATH);
+        let (_source_directory, source_host) = storage();
+        let (_target_directory, target_host) = storage();
+        let source = RuntimeFileSyncStore::new(source_host,RUNTIME_SYNC_DIR_PATH);
+        let target = RuntimeFileSyncStore::new(target_host,RUNTIME_SYNC_DIR_PATH);
         let mut data = Data::empty(Owner {backend:Backend::DataStore,path:"runtime/config/preferences/blob.preferences.json".into(),format:1,layout:1});
         data.values.insert("large".into(),serde_json::json!("content".repeat(20_000)));
         let original = Initialization::from_snapshot(&Snapshot {damage:None,node:"a".into(),data,covered:Default::default(),generation:0}).operation("preferences",false).unwrap();
-        let wire = source.prepareTransactionForTransport(original.clone()).unwrap();
-        assert!(serde_json::to_vec(&wire).unwrap().len() < 1024);
-        let reference = RuntimeFileSyncStore::requiredBlob(&wire).unwrap().unwrap();
-        assert!(target.hydrateTransaction(wire.clone()).is_err());
-        target.writeBlob(&reference,&source.readBlob(&reference).unwrap()).unwrap();
-        assert_eq!(target.hydrateTransaction(wire.clone()).unwrap(),original);
-        let mut forged = wire; forged.createdAt += 1;
-        assert!(target.hydrateTransaction(forged).is_err());
-        target.storageHost.writeBytes(&target.blobStoragePath(&reference).unwrap(), &vec![0; reference.size as usize]).unwrap();
-        assert!(target.hasBlob(&reference).unwrap());
-        assert!(target.readBlob(&reference).is_err());
+        let mut chat = original.clone();
+        chat.domain = "chat".into(); chat.entityType = "message".into(); chat.operation = "upsert".into();
+        let mut plugin = chat.clone(); plugin.domain = "plugin_storage".into();
+        for original in [original, chat, plugin] {
+            let wire = source.prepareTransactionForTransport(original.clone()).unwrap();
+            assert_eq!(source.prepareTransactionForTransport(wire.clone()).unwrap(), wire);
+            assert_eq!(crate::Transaction::operation_digest(&wire).unwrap(), crate::Transaction::operation_digest(&original).unwrap());
+            assert!(serde_json::to_vec(&wire).unwrap().len() < 1024);
+            let reference = RuntimeFileSyncStore::requiredBlob(&wire).unwrap().unwrap();
+            assert!(target.hydrateTransaction(wire.clone()).is_err());
+            target.writeBlob(&reference,&source.readBlob(&reference).unwrap()).unwrap();
+            assert_eq!(target.hydrateTransaction(wire.clone()).unwrap(),original);
+            let path = target.blobStoragePath(&reference).unwrap();
+            let bytes = source.readBlob(&reference).unwrap();
+            for corrupt in [bytes[..bytes.len()-1].to_vec(), [bytes.as_slice(), b" "].concat(), [bytes.as_slice(), b"{}"].concat()] {
+                target.storageHost.writeBytes(&path, &corrupt).unwrap();
+                assert!(target.hydrateTransaction(wire.clone()).is_err());
+            }
+            target.writeBlob(&reference,&bytes).unwrap();
+            let mut forged = wire; forged.createdAt += 1;
+            assert!(target.hydrateTransaction(forged).is_err());
+            target.storageHost.writeBytes(&target.blobStoragePath(&reference).unwrap(), &vec![0; reference.size as usize]).unwrap();
+            assert!(target.hasBlob(&reference).unwrap());
+            assert!(target.readBlob(&reference).is_err());
+        }
+    }
+
+    #[test]
+    fn changing_json_never_publishes_a_partial_blob() {
+        struct Changing(std::cell::Cell<bool>);
+        impl serde::Serialize for Changing {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok,S::Error> {
+                serializer.serialize_str(&if self.0.replace(true) { "b" } else { "a" }.repeat(128 * 1024))
+            }
+        }
+        let (_directory, host) = storage();
+        let files = RuntimeFileSyncStore::new(host.clone(), RUNTIME_SYNC_DIR_PATH);
+        assert!(files.storeJsonBlob(&Changing(std::cell::Cell::new(false))).is_err());
+        assert!(host.list(&format!("{RUNTIME_SYNC_DIR_PATH}/blobs")).unwrap().is_empty());
     }
 
 }
+
+#[cfg(test)]
+#[path = "tests/FileContentIndexTests.rs"]
+mod file_content_index_tests;

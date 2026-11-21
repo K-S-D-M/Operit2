@@ -211,6 +211,11 @@ impl JsEnvironmentOwner {
 
 /// Defines the fixed Rust execution contract required by package JavaScript.
 pub trait JsExecutionHost: Send + Sync {
+    /// Imports an archive through the authenticated v1 chat history migrator bridge.
+    fn import_v1_migrator_archive(&self, _path: String) -> JsExecutionCompletion<Result<Value, String>> {
+        Box::pin(async { Err("The v1 chat archive importer is unavailable on this host".into()) })
+    }
+
     /// Captures immutable native caller state before crossing the JavaScript runtime scheduler.
     fn capture_tool_invocation_host(&self) -> Arc<dyn JsExecutionHost>;
 
@@ -317,8 +322,13 @@ pub trait JsExecutionHost: Send + Sync {
     fn open_compose_file_picker(&self, payload: &Value) -> Result<Value, String>;
 
     /// Controls a floating surface with identity supplied by the authenticated engine.
-    fn floating_window_command(&self, _payload: &Value) -> Result<Value, String> {
-        Err("Floating windows are unavailable on this host".into())
+    fn floating_window_command(&self, _payload: Value) -> JsExecutionFuture<Result<Value, String>> {
+        Box::pin(async { Err("Floating windows are unavailable on this host".into()) })
+    }
+
+    /// Reads or resolves approval requests for an authenticated permission presenter.
+    fn tool_permission_command(&self, _payload: Value) -> Result<Value, String> {
+        Err("Tool permission presentation is unavailable on this host".into())
     }
 
     /// Saves a UTF-8 export through the embedding application's file selector.
@@ -479,6 +489,8 @@ pub struct JsPackageToolCallResult {
 /// Captures an exact executable declaration together with its immutable runtime selection.
 #[derive(Clone, Debug)]
 pub struct JsPackageToolSelection {
+    /// Contains the registered package API contract, including the v1 default for legacy metadata.
+    pub api_version: String,
     /// Contains the selected registered declaration, including its authoritative script and parameter schema.
     pub definition: crate::package::PackageTool,
     /// Contains the selected conditional state when the registered package uses one.
@@ -580,6 +592,12 @@ pub struct ToolPkgMainRegistrationCapture {
     pub chatViewHooks: Vec<String>,
     #[serde(rename = "chatMessageHooks", default)]
     pub chatMessageHooks: Vec<String>,
+    /// Captures awaited message text transformations.
+    #[serde(rename = "messageTransformHooks", default)]
+    pub messageTransformHooks: Vec<String>,
+    /// Captures native display-program preparation handlers.
+    #[serde(default)]
+    pub messageStreamTransforms: Vec<String>,
     /// Captures real package-owned lifecycle handler definitions for the strict registration parser.
     #[serde(rename = "chatLifecycleHooks", default)]
     pub chatLifecycleHooks: Vec<String>,
@@ -593,6 +611,8 @@ pub struct ToolPkgMainRegistrationCapture {
     pub hostEventHooks: Vec<String>,
     #[serde(rename = "toolLifecycleHooks", default)]
     pub toolLifecycleHooks: Vec<String>,
+    #[serde(default)]
+    pub toolPermissionHooks: Vec<String>,
     #[serde(rename = "promptInputHooks", default)]
     pub promptInputHooks: Vec<String>,
     #[serde(rename = "promptHistoryHooks", default)]

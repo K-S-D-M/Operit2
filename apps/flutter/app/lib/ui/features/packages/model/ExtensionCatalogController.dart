@@ -395,7 +395,14 @@ class ExtensionCatalogController extends ChangeNotifier {
   /// Updates from the bundled copy or the marketplace entry the extension came from.
   Future<void> update(core_proxy.ExtensionCatalogEntry entry) {
     return _mutate(entryKey(entry), () async {
-      if (entry.updateState == 'available' && entry.source == 'bundled') {
+      if (entry.updateState == 'available' &&
+          (entry.source == 'bundled' || entry.source == 'builtin')) {
+        if (entry.kind == 'skill') {
+          await clients.application
+              .skillRepository()
+              .importBundledExternalSkill(skillName: entry.id);
+          return;
+        }
         final packageManager = clients.application.packageManager();
         if (entry.kind == 'toolpkg') {
           await packageManager.importBundledExternalToolPkgContainer(
@@ -437,7 +444,7 @@ class ExtensionCatalogController extends ChangeNotifier {
     });
   }
 
-  /// Imports a package file chosen by the user into [scope].
+  /// Imports a package file, keeping ToolPkg ownership selected by Core.
   Future<void> importPackageFile(
     String path, {
     required String scope,
@@ -450,15 +457,17 @@ class ExtensionCatalogController extends ChangeNotifier {
       if (requireToolPkg && !result.packageFormat.contains('toolpkg')) {
         throw StateError('所选文件不是 ToolPkg：$path');
       }
-      await clients.application.setExtensionScope(
-        kind: 'package',
-        id: result.packageName,
-        scope: scope,
-      );
+      if (result.packageFormat != 'toolpkg') {
+        await clients.application.setExtensionScope(
+          kind: 'package',
+          id: result.packageName,
+          scope: scope,
+        );
+      }
     });
   }
 
-  /// Asks the marketplace which installed entries have newer versions.
+  /// Refreshes bundled updates and asks the marketplace for newer installed versions.
   Future<void> checkUpdates() async {
     if (_checkingUpdates) {
       return;
@@ -466,6 +475,7 @@ class ExtensionCatalogController extends ChangeNotifier {
     _checkingUpdates = true;
     notifyListeners();
     try {
+      await refresh();
       final checks = await clients.application.checkExtensionCatalogUpdates();
       _marketUpdateEntryIds
         ..clear()

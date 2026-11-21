@@ -3,7 +3,7 @@ use operit_util::RuntimeStorageLayout::WORKSPACE_DIR_PATH;
 use serde_json::{json, Value};
 
 use crate::ui::features::chat::webview::workspace::WorkspaceTemplateAssets::WORKSPACE_TEMPLATE_ASSETS;
-use operit_tools::files::PathMapper::PathMapper;
+use operit_vfs::VfsPath;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectType {
@@ -24,7 +24,7 @@ pub fn createAndGetDefaultWorkspace(
     chatId: String,
     projectType: Option<String>,
 ) -> Result<String, String> {
-    workspaceSyncStore().track(|| createDefaultWorkspace(chatId, projectType))
+    workspaceSyncStore().trackPaths(&[getWorkspaceRelativePath(&chatId)], || createDefaultWorkspace(chatId, projectType))
 }
 
 fn workspaceSyncStore() -> operit_store::WorkspaceFileSyncStore::WorkspaceFileSyncStore {
@@ -43,17 +43,17 @@ fn createDefaultWorkspace(chatId: String, projectType: Option<String>) -> Result
     createProjectConfigIfNeeded(&workspaceRelativePath, projectType)?;
     operit_store::FileSyncPolicy::FileSyncPolicy::ensure(defaultRuntimeStorageHost().as_ref(), &workspaceRelativePath)?;
 
-    PathMapper::workspacePath(&chatId)
+    VfsPath::workspacePath(&chatId)
 }
 
 #[allow(non_snake_case)]
 pub fn createAndResetWorkspaceDirectory(chatId: String) -> Result<String, String> {
     let workspaceRelativePath = getWorkspaceRelativePath(&chatId);
     let storage = defaultRuntimeStorageHost();
-    workspaceSyncStore().track(|| storage
+    workspaceSyncStore().trackPaths(&[&workspaceRelativePath], || storage
         .delete(&workspaceRelativePath, true)
         .map_err(|error| error.to_string()))?;
-    PathMapper::workspacePath(&chatId)
+    VfsPath::workspacePath(&chatId)
 }
 
 /// Deletes app-owned folders and releases mounts unused by surviving workspaces.
@@ -64,11 +64,19 @@ pub(crate) fn deleteWorkspaceFiles(
     others: &[operit_model::Workspace::Workspace],
 ) -> Result<(), String> {
     let storage = defaultRuntimeStorageHost();
-    let registry = operit_tools::files::MountRegistry::MountRegistry::withStorage(storage.clone());
+    let registry = operit_vfs::MountRegistry::MountRegistry::withStorage(storage.clone());
     let mounts = registry.list()?;
+    let nodeId = operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::localNodeId();
+    let localPath = |folder: &operit_model::Workspace::WorkspaceFolder| {
+        match operit_util::FileUtils::FileUtils::splitQualifiedVfsPath(&folder.path) {
+            Some((owner, path)) if Some(owner) == nodeId.as_deref() => Some(path.to_owned()),
+            Some(_) => None,
+            None => Some(folder.path.clone()),
+        }
+    };
     let otherPaths = others
         .iter()
-        .flat_map(|other| other.folders.iter().map(|folder| folder.path.as_str()))
+        .flat_map(|other| other.folders.iter().filter_map(&localPath))
         .collect::<Vec<_>>();
     let overlaps = |left: &str, right: &str| {
         left == right
@@ -76,9 +84,9 @@ pub(crate) fn deleteWorkspaceFiles(
             || right.starts_with(&format!("{left}/"))
     };
     let mut ownedPaths = std::collections::BTreeSet::new();
-    for folder in &workspace.folders {
+    for folderPath in workspace.folders.iter().filter_map(&localPath) {
         let Some(relative) =
-            PathMapper::relativePath(PathMapper::workspaceCollectionPath(), &folder.path)?
+            VfsPath::relativePath(VfsPath::workspaceCollectionPath(), &folderPath)?
         else {
             continue;
         };
@@ -86,14 +94,14 @@ pub(crate) fn deleteWorkspaceFiles(
         if relative.is_empty() || relative.contains('/') {
             continue;
         }
-        PathMapper::workspacePath(&relative)?;
-        if !otherPaths.iter().any(|other| overlaps(&folder.path, other)) {
+        VfsPath::workspacePath(&relative)?;
+        if !otherPaths.iter().any(|other| overlaps(&folderPath, other)) {
             ownedPaths.insert(format!("{WORKSPACE_DIR_PATH}/{relative}"));
         }
     }
     for path in ownedPaths {
         if storage.exists(&path).map_err(|error| error.to_string())? {
-            workspaceSyncStore().track(|| {
+            workspaceSyncStore().trackPaths(&[&path], || {
                 storage
                     .delete(&path, true)
                     .map_err(|error| error.to_string())
@@ -105,7 +113,8 @@ pub(crate) fn deleteWorkspaceFiles(
         if workspace
             .folders
             .iter()
-            .any(|folder| overlaps(&folder.path, &path))
+            .filter_map(&localPath)
+            .any(|folderPath| overlaps(&folderPath, &path))
             && !otherPaths.iter().any(|other| overlaps(other, &path))
         {
             registry.remove(&path)?;

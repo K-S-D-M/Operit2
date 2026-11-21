@@ -3,7 +3,7 @@
 use super::ToolArguments::{decodeArguments, decodeConfigArguments, EmptyArguments, RequestArguments};
 use crate::tools::ToolInvocation::prepareInvocation;
 use crate::tools::ToolResultDataClasses::{
-    ToolResultData, TtsGetCurrentConfigIdResultData, TtsListConfigsResultData,
+    BooleanResultData, ToolResultData, TtsGetCurrentConfigIdResultData, TtsListConfigsResultData,
     TtsSetCurrentConfigIdResultData,
 };
 use crate::ToolExecutionManager::{
@@ -15,6 +15,7 @@ use crate::ToolExecutionManager::{
 pub(crate) enum TtsToolOperation {
     Synthesize,
     Speak,
+    Cancel,
     ListConfigs,
     GetCurrentConfigId,
     SetCurrentConfigId,
@@ -51,10 +52,21 @@ impl SharedToolExecutor for TtsToolExecutor {
                     checkAccess,
                     ToolEffect::WRITE,
                     async move {
-                        let result = context.host().runtimeSupport().speakSpeech(args.request)?;
+                        let result = context.host().runtimeSupport()
+                            .speakSpeech(args.request, context.host().authenticatedExtensionOwner.clone())
+                            .await?;
                         Ok(ToolResultData::TtsSpeakResultData(result))
                     },
                 ))
+            }
+            TtsToolOperation::Cancel => {
+                let args = decodeConfigArguments(request)?;
+                let owner = context.host().authenticatedExtensionOwner.as_deref()
+                    .ok_or("Named speech requires an authenticated plugin")?;
+                Ok(prepareInvocation(request, checkAccess, ToolEffect::WRITE, async move {
+                    let value = context.host().runtimeSupport().cancelSpeech(owner, &args.id)?;
+                    Ok(ToolResultData::BooleanResultData(BooleanResultData { value }))
+                }))
             }
             TtsToolOperation::ListConfigs => {
                 let _: EmptyArguments = decodeArguments(request)?;

@@ -1,4 +1,4 @@
-//! Final content comparison at a stable exchange boundary, excluding incomplete transfers.
+//! Final materialized-content correction also seals originals that cannot be replayed.
 use super::*;
 use operit_store::Transaction::{compare_manifests, digest, Manifest, Source};
 use operit_store::RuntimeFileSyncStore::FileCorrectionReference;
@@ -16,20 +16,8 @@ struct Report {
     skipped: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// Exchanging every known original does not prove equal contents on an older peer.
-pub(super) fn requireConsistencySupport(local: &Value, remote: &Value) -> Result<(), String> {
-    for (side, clock) in [("Local", local), ("Remote", remote)] {
-        if clock.get("consistencyVersion").and_then(Value::as_u64) != Some(7) {
-            return Err(format!(
-                "{side} peer cannot verify synchronized contents; a compatible version is required"
-            ));
-        }
-    }
-    Ok(())
-}
-
 impl SpacePersistenceSyncService {
-    async fn consistencyReports(&self, target: &str, deferred: &BTreeSet<String>) -> Result<(Report, Report), String> {
+    async fn consistencyReports(&self, target: &str) -> Result<(Report, Report), String> {
         let (remote, local) = tokio::join!(
             biased;
             callRemote(
@@ -40,25 +28,39 @@ impl SpacePersistenceSyncService {
             ),
             self.callLocal("syncConsistency", Value::Null),
         );
-        let (mut local, mut remote): (Report, Report) = (local?, remote?);
-        for report in [&mut local, &mut remote] { report.pendingOwners.extend(deferred.iter().cloned()); }
-        Ok((local, remote))
+        Ok((local?, remote?))
     }
 
     /// Structural damage selects the complete peer; every correction is verified before completion.
-    pub(super) async fn synchronizeConsistency(&self, target: &str, local_clock: &Value, remote_clock: &Value, deferred: &BTreeSet<String>, force: bool) -> Result<bool, String> {
-        let (local, remote) = self.consistencyReports(target, deferred).await?;
-        let local_receipt = serde_json::from_value(local_clock.clone()).map_err(|e|e.to_string())?;
-        let remote_receipt = serde_json::from_value(remote_clock.clone()).map_err(|e|e.to_string())?;
-        if !reportsAtExchange(&local, &remote, &local_receipt, &remote_receipt)? { return Ok(false); }
-        let plans = correctionPlans(&local, &remote, force);
-        let correctionCount = plans.len();
+    pub(super) async fn synchronizeConsistency(&self, target: &str, clocks: Option<(&Value, &Value)>, failed: &mut BTreeMap<String, BTreeSet<String>>) -> Result<bool, String> {
         let startedAt = currentTimeMillis();
+        let (local, remote) = self.consistencyReports(target).await?;
+        if let Some((a,b)) = clocks {
+            if !reportsAtExchange(&local, &remote, &serde_json::from_value(a.clone()).map_err(|e|e.to_string())?,
+                &serde_json::from_value(b.clone()).map_err(|e|e.to_string())?)? {
+                operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!("sync_consistency.recapture target={target} stage=exchange_boundary"));
+                return Ok(false);
+            }
+        }
+        let plans = correctionPlans(&local, &remote, failed)?;
+        let correctionCount = plans.len();
         for (a, b, choice) in plans {
             let source = if choice == Source::Local { a } else { b }.expect("source exists");
+            let reason = match (a, b) {
+                (None, Some(_)) => "local-missing",
+                (Some(_), None) => "remote-missing",
+                _ if a.is_some_and(|m|m.damaged) || b.is_some_and(|m|m.damaged) => "damaged",
+                _ if a.map(|m| &m.restoration) != b.map(|m| &m.restoration) => "restored-baseline",
+                _ if a.map(|m|m.contentBytes) != b.map(|m|m.contentBytes) => "content-size",
+                _ if a.and_then(|m|m.revision.as_ref()) == b.and_then(|m|m.revision.as_ref()) => "equal-revision-drift",
+                _ => "revision-drift",
+            };
+            let digest = |m: Option<&operit_store::Transaction::Manifest>| m.map(|m|
+                format!("{}{}", m.digest.get(..12).unwrap_or(&m.digest), if m.damaged {":damaged"} else {""}))
+                .unwrap_or_else(|| "missing".to_string());
             operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
-                "sync_consistency.correct target={target} mode=full_snapshot owner={} source={choice:?} damaged={} localRevision={:?} remoteRevision={:?}",
-                source.owner.path, a.is_some_and(|m|m.damaged) || b.is_some_and(|m|m.damaged), a.and_then(|m|m.revision.as_ref()), b.and_then(|m|m.revision.as_ref())));
+                "sync_consistency.correct target={target} mode=full_snapshot owner={} reason={reason} source={choice:?} localDigest={} remoteDigest={} localContentBytes={:?} remoteContentBytes={:?} damaged={} localRevision={:?} remoteRevision={:?}",
+                source.owner.path, digest(a), digest(b), a.map(|m|m.contentBytes), b.map(|m|m.contentBytes), a.is_some_and(|m|m.damaged) || b.is_some_and(|m|m.damaged), a.and_then(|m|m.revision.as_ref()), b.and_then(|m|m.revision.as_ref())));
             let correction: Result<bool, String> = async {
                 let other = if choice == Source::Local { b } else { a };
                 let superseded = match other {
@@ -67,7 +69,7 @@ impl SpacePersistenceSyncService {
                 };
                 let reference = FileCorrectionReference {
                     source: self.transferSnapshot(target, source, choice == Source::Local, false).await?, superseded,
-                    skipped: local.skipped.get(&source.owner.path).into_iter().chain(remote.skipped.get(&source.owner.path))
+                    skipped: local.skipped.get(&source.owner.path).into_iter().chain(remote.skipped.get(&source.owner.path)).chain(failed.get(&source.owner.path))
                         .flat_map(|ids|ids.iter().cloned()).collect(),
                 };
                 for local in [choice != Source::Local, choice == Source::Local] {
@@ -81,15 +83,22 @@ impl SpacePersistenceSyncService {
                 Ok(true)
             }.await;
             match correction {
-                Ok(true) => { operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
+                Ok(true) => { failed.remove(&source.owner.path); operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
                     "sync_consistency.applied target={target} mode=full_snapshot owner={} source={choice:?}", source.owner.path)); },
-                Ok(false) => return Ok(false),
-                Err(error) if snapshotChanged(&error) => return Ok(false),
+                Ok(false) => {
+                    operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!("sync_consistency.recapture target={target} owner={} stage=replace", source.owner.path));
+                    return Ok(false);
+                },
+                Err(error) if snapshotChanged(&error) => {
+                    operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!("sync_consistency.recapture target={target} owner={} stage=export", source.owner.path));
+                    return Ok(false);
+                },
                 Err(error) => return Err(error),
             }
         }
-        let (latest_local, latest_remote) = self.consistencyReports(target, deferred).await?;
-        if !reportsAtExchange(&latest_local, &latest_remote, &local_receipt, &remote_receipt)? { return Ok(false); }
+        // Only repairs invalidate the already verified content reports.
+        let (latest_local, latest_remote) = if correctionCount == 0 { (local, remote) }
+            else { self.consistencyReports(target).await? };
         let complete = verifyReports(&latest_local, &latest_remote)?;
         operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
             "sync_consistency.done target={target} mode=full_snapshot corrections={correctionCount} complete={complete} elapsedMs={}", currentTimeMillis() - startedAt));
@@ -104,7 +113,7 @@ impl SpacePersistenceSyncService {
         operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
             "sync_consistency.snapshot target={target} owner={} source={} coverageOnly={coverage_only} bytes={} hash={}",
             source.owner.path, if local { "local" } else { "remote" }, reference.size, reference.contentHash));
-        self.synchronizeBlobReferences(target, vec![reference.clone()]).await?;
+        self.synchronizeBlobReferences(target, vec![reference.clone()], &BTreeMap::new()).await?;
         Ok(reference)
     }
 
@@ -123,24 +132,28 @@ fn reportsAtExchange(local: &Report, remote: &Report, local_receipt: &SyncReceip
 }
 
 /// The union of inventories includes files that exist on only one endpoint.
-fn correctionPlans<'a>(local: &'a Report, remote: &'a Report, force: bool) -> Vec<(Option<&'a Manifest>, Option<&'a Manifest>, Source)> {
+fn correctionPlans<'a>(local: &'a Report, remote: &'a Report, failed: &BTreeMap<String, BTreeSet<String>>) -> Result<Vec<(Option<&'a Manifest>, Option<&'a Manifest>, Source)>, String> {
     let mut files = BTreeMap::new();
     for manifest in &local.manifests { files.entry((&manifest.owner.path,&manifest.owner.backend)).or_insert((None,None)).0 = Some(manifest); }
     for manifest in &remote.manifests { files.entry((&manifest.owner.path,&manifest.owner.backend)).or_insert((None,None)).1 = Some(manifest); }
-    files.into_iter().filter_map(|((path,_),(a,b))| {
-        if local.pendingOwners.contains(path) || remote.pendingOwners.contains(path) { return None; }
+    for path in failed.keys().chain(&local.pendingOwners).chain(&remote.pendingOwners).chain(local.skipped.keys()).chain(remote.skipped.keys()) {
+        if !files.keys().any(|(owner,_)| *owner == path) { return Err(format!("No complete synchronized file for failed owner: {path}")); }
+    }
+    let mut plans = Vec::new();
+    for ((path,_),(a,b)) in files {
         let choice = match (a,b) {
-            (Some(a),Some(b)) => compare_manifests(a,b).ok()?,
+            (Some(a),Some(b)) => compare_manifests(a,b)?,
             (Some(_),None) => Source::Local,
             (None,Some(_)) => Source::Remote,
             _ => unreachable!(),
         };
-        let choice = if choice == Source::Equal && (force || local.skipped.contains_key(path) || remote.skipped.contains_key(path)) {
-            let (a,b) = (a?,b?);
-            if (&a.revision,&a.node) >= (&b.revision,&b.node) { Source::Local } else { Source::Remote }
+        let choice = if choice == Source::Equal && (failed.contains_key(path) || local.pendingOwners.contains(path) || remote.pendingOwners.contains(path) || local.skipped.contains_key(path) || remote.skipped.contains_key(path)) {
+            let (a,b) = (a.expect("equal files exist"),b.expect("equal files exist"));
+            if (a.contentBytes,&a.revision,&a.node) >= (b.contentBytes,&b.revision,&b.node) { Source::Local } else { Source::Remote }
         } else { choice };
-        (choice != Source::Equal).then_some((a,b,choice))
-    }).collect()
+        if choice != Source::Equal { plans.push((a,b,choice)); }
+    }
+    Ok(plans)
 }
 
 /// Completion requires equal synchronized contents; data failures are never deferred.
@@ -148,23 +161,7 @@ fn verifyReports(local: &Report, remote: &Report) -> Result<bool, String> {
     if !local.errors.is_empty() || !remote.errors.is_empty() {
         return Err(format!("Consistency check has owner errors: local={:?}; remote={:?}", local.errors, remote.errors));
     }
-    if !local.pendingOwners.is_empty() || !remote.pendingOwners.is_empty() {
-        return Err("Consistency check has pending owners".into());
-    }
-    let complete = local.pendingOwners.is_empty() && remote.pendingOwners.is_empty()
-        && local.skipped.is_empty() && remote.skipped.is_empty();
-    for (a,b) in [(local,remote),(remote,local)] {
-        for manifest in &a.manifests {
-            let comparison = match b.manifests.iter().find(|other|other.owner.path == manifest.owner.path && other.owner.backend == manifest.owner.backend) {
-                Some(other) => compare_manifests(manifest,other),
-                None => Err(format!("Missing synchronized file: {}",manifest.owner.path)),
-            };
-            if matches!(comparison, Ok(Source::Equal)) { continue; }
-            comparison?;
-            return Err(format!("Synchronized file differs after correction: {}",manifest.owner.path));
-        }
-    }
-    Ok(complete)
+    Ok(correctionPlans(local,remote,&BTreeMap::new())?.is_empty())
 }
 
 #[cfg(test)]
@@ -187,16 +184,40 @@ mod tests {
         let healthy = report("a", "database", 1);
         let mut damaged = report("z", "database", 2);
         damaged.manifests[0].damaged = true;
+        damaged.manifests[0].contentBytes = u64::MAX;
         damaged.manifests[0].revision = Some(operit_store::Transaction::Revision {
             createdAt: 999, originDeviceId: "z".into(), sequence: 1 });
         for (a,b,choice) in [(&healthy,&damaged,Source::Local),(&damaged,&healthy,Source::Remote)] {
-            let plans = correctionPlans(a,b,false);
+            let plans = correctionPlans(a,b,&BTreeMap::new()).unwrap();
             assert_eq!(plans.len(),1);
             assert_eq!(plans[0].2,choice);
-            assert!(verifyReports(a,b).is_err());
+            assert!(!verifyReports(a,b).unwrap());
         }
         assert!(verifyReports(&damaged,&damaged).is_err());
         assert!(verifyReports(&healthy,&healthy).unwrap());
+    }
+
+    /// The fuller older file wins in either coordinator direction, independently for each owner.
+    #[test]
+    fn correction_prefers_more_content_before_business_revision() {
+        let mut phone = report("a", "models", 123456);
+        let mut desktop = report("z", "models", 1);
+        desktop.manifests[0].revision = Some(operit_store::Transaction::Revision {
+            createdAt: 999, originDeviceId: "z".into(), sequence: 1 });
+        assert!(phone.manifests[0].contentBytes > desktop.manifests[0].contentBytes);
+        phone.manifests.push(report("a", "chats", 1).manifests.remove(0));
+        desktop.manifests.push(report("z", "chats", 123456).manifests.remove(0));
+        for (local, remote, choices) in [(&phone, &desktop, [Source::Remote, Source::Local]),
+            (&desktop, &phone, [Source::Local, Source::Remote])] {
+            let plans = correctionPlans(local, remote, &BTreeMap::new()).unwrap();
+            assert_eq!(plans.iter().map(|(_,_,choice)| *choice).collect::<Vec<_>>(), choices);
+        }
+        let manifest = &phone.manifests[0];
+        let wire = serde_json::to_value(manifest).unwrap();
+        assert_eq!(serde_json::from_value::<Manifest>(wire.clone()).unwrap(), *manifest);
+        let mut obsolete = wire;
+        obsolete.as_object_mut().unwrap().remove("contentBytes");
+        assert!(serde_json::from_value::<Manifest>(obsolete).is_err());
     }
 
     /// Missing files, unequal contents and skipped originals all require complete-file correction.
@@ -204,20 +225,22 @@ mod tests {
     fn correction_covers_the_union_of_files_and_seals_skipped_history() {
         let mut local = report("a", "local", 1);
         let mut remote = report("b", "remote", 2);
-        assert_eq!(correctionPlans(&local,&remote,false).len(),2);
-        assert!(verifyReports(&local,&remote).is_err());
+        assert_eq!(correctionPlans(&local,&remote,&BTreeMap::new()).unwrap().len(),2);
+        assert!(!verifyReports(&local,&remote).unwrap());
         remote.manifests = local.manifests.clone();
-        assert!(correctionPlans(&local,&remote,false).is_empty());
-        assert_eq!(correctionPlans(&local,&remote,true).len(),1,"export/apply failures must seal a complete baseline even for equal contents");
+        assert!(correctionPlans(&local,&remote,&BTreeMap::new()).unwrap().is_empty());
         local.manifests[0].token = "different replay state".into();
         assert!(verifyReports(&local,&remote).unwrap());
         local.skipped.insert("local".into(), BTreeSet::from(["broken:1".into()]));
-        assert_eq!(correctionPlans(&local,&remote,false).len(),1);
+        local.manifests.push(report("a", "healthy-chat", 1).manifests.remove(0));
+        remote.manifests.push(local.manifests[1].clone());
+        assert_eq!(correctionPlans(&local,&remote,&BTreeMap::new()).unwrap().len(),1,"only the failed owner needs a new baseline");
+        assert_eq!(correctionPlans(&remote,&remote,&local.skipped).unwrap().len(),1,"transport failures seal only their explicit owner");
         assert!(!verifyReports(&local,&remote).unwrap());
         local.skipped.clear();
         remote.pendingOwners.insert("local".into());
-        assert!(correctionPlans(&local,&remote,false).is_empty());
-        assert!(verifyReports(&local,&remote).is_err());
+        assert_eq!(correctionPlans(&local,&remote,&BTreeMap::new()).unwrap().len(),1);
+        assert!(!verifyReports(&local,&remote).unwrap());
         remote.pendingOwners.clear();
         remote.errors.push("unreadable storage".into());
         assert!(verifyReports(&local,&remote).unwrap_err().contains("unreadable storage"));
@@ -248,14 +271,4 @@ mod tests {
         }
     }
 
-    /// Old peers cannot interpret damaged-file inventories or the complete synchronized schema.
-    #[test]
-    fn consistency_requires_the_current_protocol() {
-        let current = json!({"consistencyVersion":7});
-        assert!(requireConsistencySupport(&current,&current).is_ok());
-        for previous in (0..7).map(|version|json!({"consistencyVersion":version})).chain([Value::Null,json!({})]) {
-            assert!(requireConsistencySupport(&previous,&current).is_err());
-            assert!(requireConsistencySupport(&current,&previous).is_err());
-        }
-    }
 }

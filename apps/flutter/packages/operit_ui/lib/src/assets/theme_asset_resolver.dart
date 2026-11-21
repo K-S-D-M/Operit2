@@ -1,8 +1,8 @@
-import 'dart:async';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 
 import 'theme_image_decoder.dart';
 
@@ -16,6 +16,226 @@ abstract interface class ThemeDecodedImageResolver
     implements ThemeAssetResolver {
   ui.Image cloneImage(String reference);
   ui.Image? tryCloneImage(String reference);
+}
+
+enum ThemeAssetPurpose { background, bubble, other }
+
+enum ThemeAssetStage {
+  read,
+  decode,
+  videoOpen,
+  playback,
+  importAsset,
+  dispose;
+
+  String get label => this == importAsset ? 'import' : name;
+}
+
+enum ThemeAssetFailureKind { missing, empty, read, decode, media, timeout, unknown }
+
+/// Keeps the resource and request site when a backend supplies no Dart stack.
+class ThemeAssetFailure implements Exception {
+  const ThemeAssetFailure({
+    required this.reference,
+    required this.stage,
+    required this.kind,
+    required this.cause,
+    required this.originalStackTrace,
+    required this.requestStackTrace,
+    this.purpose = ThemeAssetPurpose.other,
+    this.themeRevision = 0,
+    this.themeId,
+    this.byteLength,
+    this.retainedPrevious = false,
+  });
+
+  /// Adds UI context without replacing the original storage or decoder failure.
+  factory ThemeAssetFailure.capture({
+    required String reference,
+    required ThemeAssetStage stage,
+    required ThemeAssetFailureKind kind,
+    required Object cause,
+    required StackTrace originalStackTrace,
+    required StackTrace requestStackTrace,
+    ThemeAssetPurpose purpose = ThemeAssetPurpose.other,
+    int? byteLength,
+    bool retainedPrevious = false,
+  }) {
+    if (cause is ThemeAssetFailure) {
+      return cause.withContext(
+        purpose: purpose,
+        retainedPrevious: retainedPrevious,
+      );
+    }
+    return ThemeAssetFailure(
+      reference: reference,
+      stage: stage,
+      kind: kind,
+      cause: cause,
+      originalStackTrace: originalStackTrace,
+      requestStackTrace: requestStackTrace,
+      purpose: purpose,
+      byteLength: byteLength,
+      retainedPrevious: retainedPrevious,
+    );
+  }
+
+  final String reference;
+  final ThemeAssetPurpose purpose;
+  final int themeRevision;
+  final String? themeId;
+  final ThemeAssetStage stage;
+  final ThemeAssetFailureKind kind;
+  final int? byteLength;
+  final Object cause;
+  final StackTrace originalStackTrace;
+  final StackTrace requestStackTrace;
+  final bool retainedPrevious;
+
+  bool get hasOriginalStack => originalStackTrace.toString().trim().isNotEmpty;
+
+  ThemeAssetFailure withContext({
+    ThemeAssetPurpose? purpose,
+    int? themeRevision,
+    String? themeId,
+    bool? retainedPrevious,
+  }) => ThemeAssetFailure(
+    reference: reference,
+    stage: stage,
+    kind: kind,
+    cause: cause,
+    originalStackTrace: originalStackTrace,
+    requestStackTrace: requestStackTrace,
+    purpose: purpose ?? this.purpose,
+    themeRevision: themeRevision ?? this.themeRevision,
+    themeId: themeId ?? this.themeId,
+    byteLength: byteLength,
+    retainedPrevious: retainedPrevious ?? this.retainedPrevious,
+  );
+
+  String get key => '$themeRevision|${purpose.name}|${stage.label}|$reference';
+
+  /// Data URIs can contain the entire video; omit the payload from diagnostics.
+  static String safeReference(String value) => value.replaceAll(
+    RegExp(r'data:[^\s\)\]\}\x22\x27]+', caseSensitive: false),
+    '<data URI>',
+  );
+
+  String get details => '$this\n'
+      'Original Dart stack: ${hasOriginalStack ? safeReference(originalStackTrace.toString()) : "<empty>"}\n'
+      'Request Dart stack (not a native stack): ${safeReference(requestStackTrace.toString())}';
+
+  @override
+  String toString() => 'Theme asset failure '
+      'reference=${safeReference(reference)} purpose=${purpose.name} '
+      'revision=$themeRevision theme=${safeReference(themeId ?? "unknown")} '
+      'stage=${stage.label} kind=${kind.name} bytes=${byteLength ?? "unknown"} '
+      'retainedPrevious=$retainedPrevious cause=${safeReference(cause.toString())}';
+}
+
+/// Owns transient failures and retry epochs, never appearance preferences.
+class ThemeAssetDiagnostics extends ChangeNotifier {
+  final Map<(Object?, String), ThemeAssetFailure> _failures = {};
+  final Map<String, int> _retryEpochs = {};
+  int _themeRevision = 0;
+  String? _themeId;
+  Set<String>? _activeReferences;
+  bool _notificationScheduled = false;
+  bool _disposed = false;
+
+  int get themeRevision => _themeRevision;
+  String? get themeId => _themeId;
+  List<ThemeAssetFailure> get failures {
+    final unique = <String, ThemeAssetFailure>{};
+    for (final failure in _failures.values) {
+      if (!failure.retainedPrevious || !unique.containsKey(failure.key)) {
+        unique[failure.key] = failure;
+      }
+    }
+    return List.unmodifiable(unique.values);
+  }
+  int retryEpoch(String reference) => _retryEpochs[reference] ?? 0;
+
+  /// Clears only failures for resources no longer used by this appearance.
+  void updateContext({
+    required int themeRevision,
+    String? themeId,
+    Set<String>? activeReferences,
+  }) {
+    if (_disposed) return;
+    _themeRevision = themeRevision;
+    _themeId = themeId;
+    _activeReferences = activeReferences == null ? null : Set.unmodifiable(activeReferences);
+    if (activeReferences != null) {
+      _removeWhere((_, failure) => !activeReferences.contains(failure.reference));
+    }
+  }
+
+  /// Consumers share one notice but retain independent retry eligibility.
+  void report(ThemeAssetFailure failure, {Object? owner}) {
+    if (_disposed) return;
+    if (_activeReferences != null && !_activeReferences!.contains(failure.reference)) return;
+    final contextual = failure.withContext(
+      themeRevision: _themeRevision,
+      themeId: _themeId,
+    );
+    final key = (owner, contextual.key);
+    if (_failures.containsKey(key)) return;
+    _failures[key] = contextual;
+    _notify();
+  }
+
+  void resolve(
+    String reference, {
+    ThemeAssetPurpose purpose = ThemeAssetPurpose.other,
+    Object? owner,
+  }) {
+    if (_disposed) return;
+    _removeWhere((key, failure) =>
+      key.$1 == owner && failure.reference == reference && failure.purpose == purpose);
+  }
+
+  /// Unmounting one consumer cannot clear a different consumer's failure.
+  void release(Object owner) => _removeWhere((key, _) => key.$1 == owner);
+
+  void _removeWhere(bool Function((Object?, String), ThemeAssetFailure) matches) {
+    if (_disposed) return;
+    final before = _failures.length;
+    _failures.removeWhere(matches);
+    if (_failures.length != before) _notify();
+  }
+
+  /// A new epoch bypasses a failed image-cache entry for the same logical path.
+  void retry(String reference) {
+    if (_disposed || !_failures.values.any((f) => f.reference == reference)) {
+      return;
+    }
+    _retryEpochs[reference] = retryEpoch(reference) + 1;
+    _removeWhere((_, failure) => failure.reference == reference);
+  }
+
+  void _notify() {
+    if (_disposed) return;
+    if (SchedulerBinding.instance.schedulerPhase == SchedulerPhase.persistentCallbacks) {
+      if (_notificationScheduled) return;
+      _notificationScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _notificationScheduled = false;
+        if (!_disposed) notifyListeners();
+      });
+      WidgetsBinding.instance.scheduleFrame();
+    } else {
+      notifyListeners();
+    }
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _failures.clear();
+    _retryEpochs.clear();
+    super.dispose();
+  }
 }
 
 class MemoryThemeAssetResolver implements ThemeAssetResolver {
@@ -36,27 +256,41 @@ class MemoryThemeAssetResolver implements ThemeAssetResolver {
   }
 }
 
-class ThemeAssetScope extends InheritedWidget {
+class ThemeAssetScope extends InheritedNotifier<ThemeAssetDiagnostics> {
   const ThemeAssetScope({
     super.key,
     required this.resolver,
+    ThemeAssetDiagnostics? diagnostics,
     required super.child,
-  });
+  }) : super(notifier: diagnostics);
 
   final ThemeAssetResolver resolver;
+  ThemeAssetDiagnostics? get diagnostics => notifier;
+
+  static ThemeAssetScope? maybeOf(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<ThemeAssetScope>();
 
   static ThemeAssetResolver of(BuildContext context) {
-    final scope = context.dependOnInheritedWidgetOfExactType<ThemeAssetScope>();
+    final scope = maybeOf(context);
     if (scope == null) {
       throw StateError('ThemeAssetScope is required to render theme assets');
     }
     return scope.resolver;
   }
 
+  static ThemeAssetDiagnostics? diagnosticsOf(BuildContext context) =>
+      maybeOf(context)?.diagnostics;
+
   @override
   bool updateShouldNotify(ThemeAssetScope oldWidget) =>
-      !identical(resolver, oldWidget.resolver);
+      !identical(resolver, oldWidget.resolver) || super.updateShouldNotify(oldWidget);
 }
+
+/// Builds from an owned image clone. [isCurrent] is false while retaining an
+/// older image, so callers can retain the rendering parameters that belong to it.
+typedef ThemeImageWidgetBuilder = Widget Function(
+  BuildContext context, ui.Image? image, bool isCurrent,
+);
 
 /// An explicit resolver is required; this widget never fetches a URI or a file.
 class ResolvedThemeImage extends StatefulWidget {
@@ -64,12 +298,18 @@ class ResolvedThemeImage extends StatefulWidget {
     super.key,
     required this.resolver,
     required this.reference,
-    required this.fit,
+    this.fit = BoxFit.cover,
+    this.builder,
+    this.purpose = ThemeAssetPurpose.background,
+    this.diagnostics,
   });
 
   final ThemeAssetResolver resolver;
   final String reference;
   final BoxFit fit;
+  final ThemeImageWidgetBuilder? builder;
+  final ThemeAssetPurpose purpose;
+  final ThemeAssetDiagnostics? diagnostics;
 
   @override
   State<ResolvedThemeImage> createState() => _ResolvedThemeImageState();
@@ -77,70 +317,175 @@ class ResolvedThemeImage extends StatefulWidget {
 
 class _ResolvedThemeImageState extends State<ResolvedThemeImage> {
   ui.Image? _image;
-  Object? _loadError;
-  StackTrace? _loadStack;
+  ImageStream? _stream;
+  ImageStreamListener? _listener;
+  _ThemeAssetImageProvider? _provider;
+  ThemeAssetDiagnostics? _diagnostics;
+  ThemeAssetResolver? _boundResolver;
+  String? _boundReference;
+  int _epoch = -1;
   int _loadToken = 0;
+  bool _streamComplete = true;
+  bool _imageIsCurrent = false;
+  ThemeAssetFailure? _lastFailure;
 
   @override
-  void initState() {
-    super.initState();
-    _bind();
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _setDiagnostics(widget.diagnostics ?? ThemeAssetScope.diagnosticsOf(context));
+    _syncBinding();
   }
 
   @override
   void didUpdateWidget(covariant ResolvedThemeImage oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.reference != widget.reference ||
-        !identical(oldWidget.resolver, widget.resolver)) {
-      _bind();
+    _setDiagnostics(widget.diagnostics ?? ThemeAssetScope.diagnosticsOf(context));
+    _syncBinding();
+  }
+
+  void _setDiagnostics(ThemeAssetDiagnostics? diagnostics) {
+    if (identical(_diagnostics, diagnostics)) return;
+    _diagnostics?.removeListener(_handleRetry);
+    _diagnostics?.release(this);
+    _diagnostics = diagnostics;
+    _diagnostics?.addListener(_handleRetry);
+    _epoch = _diagnostics?.retryEpoch(widget.reference) ?? 0;
+    final failure = _lastFailure;
+    if (failure != null) _diagnostics?.report(failure, owner: this);
+  }
+
+  void _handleRetry() {
+    if (mounted && (_diagnostics?.retryEpoch(widget.reference) ?? 0) != _epoch) {
+      setState(_syncBinding);
     }
   }
 
-  void _bind() {
+  /// A repaint or another failed resource never reloads this image.
+  void _syncBinding() {
+    final epoch = _diagnostics?.retryEpoch(widget.reference) ?? 0;
+    if (identical(_boundResolver, widget.resolver) &&
+        _boundReference == widget.reference &&
+        _epoch == epoch) {
+      return;
+    }
     final token = ++_loadToken;
-    _image?.dispose();
-    _image = null;
-    _loadError = null;
-    _loadStack = null;
+    _imageIsCurrent = false;
+    _lastFailure = null;
+    _detach();
+    if (_boundReference == widget.reference && _epoch != epoch && _provider != null) {
+      PaintingBinding.instance.imageCache.evict(_provider!);
+    }
+    _boundResolver = widget.resolver;
+    _boundReference = widget.reference;
+    _epoch = epoch;
+    _diagnostics?.release(this);
+    _provider = null;
     final resolver = widget.resolver;
+    final reference = widget.reference;
+    final requestStack = StackTrace.current;
     if (resolver is ThemeDecodedImageResolver) {
-      _image = resolver.tryCloneImage(widget.reference);
-    } else {
-      unawaited(_loadBytes(resolver, token));
-    }
-  }
-
-  Future<void> _loadBytes(ThemeAssetResolver resolver, int token) async {
-    try {
-      final bytes = await resolver.readBytes(widget.reference);
-      final image = await decodeThemeImageBytes(widget.reference, bytes);
-      if (!mounted || token != _loadToken) {
-        image.dispose();
-        return;
+      try {
+        final image = resolver.tryCloneImage(reference);
+        if (image == null) throw StateError('Decoded theme asset is missing: $reference');
+        _replace(image, synchronous: true);
+      } catch (error, stack) {
+        _report(error, stack, requestStack, reference);
       }
-      setState(() => _image = image);
-    } catch (error, stack) {
-      if (!mounted || token != _loadToken) return;
-      setState(() {
-        _loadError = error;
-        _loadStack = stack;
-      });
+      return;
     }
+    _provider = _ThemeAssetImageProvider(resolver, reference, epoch);
+    _streamComplete = false;
+    _stream = _provider!.resolve(createLocalImageConfiguration(context));
+    _listener = ImageStreamListener(
+      (info, synchronous) {
+        if (!mounted || token != _loadToken) {
+          info.dispose();
+          return;
+        }
+        _streamComplete = true;
+        final image = info.image.clone();
+        info.dispose();
+        _replace(image, synchronous: synchronous);
+      },
+      onError: (Object error, StackTrace? stack) {
+        if (mounted && token == _loadToken) {
+          _streamComplete = true;
+          _report(error, stack ?? StackTrace.empty, requestStack, reference);
+        }
+      },
+    );
+    _stream!.addListener(_listener!);
   }
 
+  void _replace(ui.Image image, {required bool synchronous}) {
+    final previous = _image;
+    _imageIsCurrent = true;
+    _lastFailure = null;
+    if (synchronous) {
+      _image = image;
+    } else {
+      setState(() => _image = image);
+    }
+    previous?.dispose();
+    _diagnostics?.resolve(widget.reference, purpose: widget.purpose, owner: this);
+  }
+
+  void _report(Object error, StackTrace stack, StackTrace requestStack, String reference) {
+    final failure = ThemeAssetFailure.capture(
+      reference: reference,
+      stage: ThemeAssetStage.decode,
+      kind: ThemeAssetFailureKind.decode,
+      cause: error,
+      originalStackTrace: stack,
+      requestStackTrace: requestStack,
+      purpose: widget.purpose,
+      retainedPrevious: _image != null,
+    );
+    _lastFailure = failure;
+    _diagnostics?.report(failure, owner: this);
+  }
+
+  void _detach() {
+    final stream = _stream;
+    final listener = _listener;
+    if (stream != null && listener != null) {
+      // A pending completer can report a late error even after the widget leaves.
+      // Drain it without retaining this State or publishing an obsolete failure.
+      if (!_streamComplete) {
+        late final ImageStreamListener drain;
+        drain = ImageStreamListener(
+          (info, _) {
+            info.dispose();
+            stream.removeListener(drain);
+          },
+          onError: (Object error, StackTrace? stack) => stream.removeListener(drain),
+        );
+        stream.addListener(drain);
+      }
+      stream.removeListener(listener);
+    }
+    _stream = null;
+    _listener = null;
+    _streamComplete = true;
+  }
+
+  /// Releases only the prepared image clone owned by this widget.
   @override
   void dispose() {
     _loadToken++;
+    _diagnostics?.removeListener(_handleRetry);
+    _diagnostics?.release(this);
+    _detach();
     _image?.dispose();
     super.dispose();
   }
 
+  /// Lets Flutter synchronously reuse decoded runtime images across page mounts.
   @override
   Widget build(BuildContext context) {
-    if (_loadError != null) {
-      Error.throwWithStackTrace(_loadError!, _loadStack!);
-    }
     final image = _image;
+    final builder = widget.builder;
+    if (builder != null) return builder(context, image, _imageIsCurrent);
     if (image == null) return const SizedBox.expand();
     return SizedBox.expand(
       child: RawImage(
@@ -151,4 +496,68 @@ class _ResolvedThemeImageState extends State<ResolvedThemeImage> {
       ),
     );
   }
+}
+
+/// Shares in-flight reads and decoded images within Flutter's bounded image cache.
+class _ThemeAssetImageProvider extends ImageProvider<_ThemeAssetImageProvider> {
+  /// Identifies one immutable asset within its resolver's lifetime.
+  const _ThemeAssetImageProvider(this.resolver, this.reference, this.epoch);
+
+  final ThemeAssetResolver resolver;
+  final String reference;
+  final int epoch;
+
+  /// Makes cache hits available during the first build of a newly mounted preview.
+  @override
+  Future<_ThemeAssetImageProvider> obtainKey(
+    ImageConfiguration configuration,
+  ) => SynchronousFuture<_ThemeAssetImageProvider>(this);
+
+  /// Uses the same validated static-image decoder as prepared theme visuals.
+  @override
+  ImageStreamCompleter loadImage(
+    _ThemeAssetImageProvider key,
+    ImageDecoderCallback decode,
+  ) => OneFrameImageStreamCompleter(key._load());
+
+  /// Reads and decodes once for all listeners of this resolver and asset.
+  Future<ImageInfo> _load() async {
+    final requestStack = StackTrace.current;
+    var stage = ThemeAssetStage.read;
+    var kind = ThemeAssetFailureKind.read;
+    int? byteLength;
+    try {
+      final bytes = await resolver.readBytes(reference);
+      byteLength = bytes.length;
+      if (bytes.isEmpty) {
+        kind = ThemeAssetFailureKind.empty;
+        throw StateError('Theme asset is empty: $reference');
+      }
+      stage = ThemeAssetStage.decode;
+      kind = ThemeAssetFailureKind.decode;
+      return ImageInfo(image: await decodeThemeImageBytes(reference, bytes));
+    } catch (error, stack) {
+      PaintingBinding.instance.imageCache.evict(this);
+      throw ThemeAssetFailure.capture(
+        reference: reference,
+        stage: stage,
+        kind: kind,
+        cause: error,
+        originalStackTrace: stack,
+        requestStackTrace: requestStack,
+        byteLength: byteLength,
+      );
+    }
+  }
+
+  /// Keeps identical references from different runtime owners isolated.
+  @override
+  bool operator ==(Object other) =>
+      other is _ThemeAssetImageProvider &&
+      identical(resolver, other.resolver) &&
+      reference == other.reference && epoch == other.epoch;
+
+  /// Matches the resolver identity and asset reference used by equality.
+  @override
+  int get hashCode => Object.hash(identityHashCode(resolver), reference, epoch);
 }

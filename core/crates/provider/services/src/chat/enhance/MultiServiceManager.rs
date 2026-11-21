@@ -6,6 +6,7 @@ use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::chat::llmprovider::AIService::{AIService, AiServiceError};
+use crate::chat::llmprovider::ApiKeyProvider::KeyGetter;
 use crate::chat::llmprovider::AIServiceFactory::{
     AIServiceFactory, ApiKeyProviderSpec, ProviderCreateParams, ProviderCreateRequest,
     ProviderServiceKind, ProviderServiceSpec,
@@ -32,7 +33,7 @@ use crate::chat::llmprovider::RequestConcurrencyRegistry::RequestConcurrencyRegi
 use crate::chat::llmprovider::ToolPkgJsAiProviderService::ToolPkgJsAiProviderService;
 use crate::runtime_support::ProviderRuntimeContext;
 use operit_model::FunctionType::FunctionType;
-use operit_model::ModelConfigData::{ApiProviderType, ResolvedModelConfig};
+use operit_model::ModelConfigData::{ApiProviderType, ModelCapabilities, ResolvedModelConfig};
 use operit_model::ModelParameter::ModelParameter;
 
 /// Shared, asynchronously locked handle around a concrete model provider service.
@@ -60,7 +61,6 @@ struct ModelServiceInstance {
 
 /// Mutable service registry state protected by the manager mutex.
 struct MultiServiceManagerState {
-    pub rootDir: PathBuf,
     runtime_context: ProviderRuntimeContext,
     serviceInstances: HashMap<FunctionType, FunctionServiceInstance>,
     modelServiceInstances: HashMap<String, ModelServiceInstance>,
@@ -69,10 +69,9 @@ struct MultiServiceManagerState {
 
 impl MultiServiceManager {
     /// Creates a manager rooted at the supplied runtime data directory.
-    pub fn new(root_dir: PathBuf, runtime_context: ProviderRuntimeContext) -> Self {
+    pub fn new(runtime_context: ProviderRuntimeContext) -> Self {
         Self {
             inner: Arc::new(Mutex::new(MultiServiceManagerState {
-                rootDir: root_dir,
                 runtime_context,
                 serviceInstances: HashMap::new(),
                 modelServiceInstances: HashMap::new(),
@@ -85,11 +84,7 @@ impl MultiServiceManager {
     pub fn from_runtime_context(
         runtime_context: ProviderRuntimeContext,
     ) -> Result<Self, AiServiceError> {
-        let root_dir = runtime_context
-            .support()
-            .dataDir()
-            .map_err(AiServiceError::RequestFailed)?;
-        Ok(Self::new(root_dir, runtime_context))
+        Ok(Self::new(runtime_context))
     }
 
     /// Returns a cached or newly created service for a functional model binding.
@@ -104,12 +99,12 @@ impl MultiServiceManager {
         let binding = inner
             .runtime_context
             .support()
-            .modelBindingForFunction(inner.rootDir.clone(), functionType.clone())
+            .modelBindingForFunction(functionType.clone())
             .map_err(AiServiceError::RequestFailed)?;
         let config = inner
             .runtime_context
             .support()
-            .resolvedModelConfig(inner.rootDir.clone(), &binding.providerId, &binding.modelId)
+            .resolvedModelConfig(&binding.providerId, &binding.modelId)
             .map_err(AiServiceError::RequestFailed)?;
         if !Self::functionServiceMatchesBinding(
             inner.serviceInstances.get(&functionType),
@@ -154,7 +149,7 @@ impl MultiServiceManager {
         let config = inner
             .runtime_context
             .support()
-            .resolvedModelConfig(inner.rootDir.clone(), &providerId, &modelId)
+            .resolvedModelConfig(&providerId, &modelId)
             .map_err(AiServiceError::RequestFailed)?;
         if !Self::modelServiceMatchesConfig(inner.modelServiceInstances.get(&serviceKey), &config) {
             let service = Self::createServiceFromResolvedConfigLocked(&inner, config.clone())?;
@@ -199,12 +194,12 @@ impl MultiServiceManager {
         let binding = inner
             .runtime_context
             .support()
-            .modelBindingForFunction(inner.rootDir.clone(), functionType.clone())
+            .modelBindingForFunction(functionType.clone())
             .map_err(AiServiceError::RequestFailed)?;
         let config = inner
             .runtime_context
             .support()
-            .resolvedModelConfig(inner.rootDir.clone(), &binding.providerId, &binding.modelId)
+            .resolvedModelConfig(&binding.providerId, &binding.modelId)
             .map_err(AiServiceError::RequestFailed)?;
         let modelParameters = config.parameters.clone();
         if !Self::functionServiceMatchesBinding(
@@ -257,7 +252,7 @@ impl MultiServiceManager {
         let config = inner
             .runtime_context
             .support()
-            .resolvedModelConfig(inner.rootDir.clone(), &providerId, &modelId)
+            .resolvedModelConfig(&providerId, &modelId)
             .map_err(AiServiceError::RequestFailed)?;
         let modelParameters = config.parameters.clone();
         if !Self::modelServiceMatchesConfig(inner.modelServiceInstances.get(&serviceKey), &config) {
@@ -299,11 +294,17 @@ impl MultiServiceManager {
         let config = inner
             .runtime_context
             .support()
-            .resolvedModelConfig(inner.rootDir.clone(), &providerId, &modelId)
+            .resolvedModelConfig(&providerId, &modelId)
             .map_err(AiServiceError::RequestFailed)?;
         let modelParameters = config.parameters.clone();
         let service = Self::createServiceFromResolvedConfigLocked(&inner, config.clone())?;
         Ok((config, modelParameters, service))
+    }
+
+    /// Creates an uncached service for an explicit draft configuration.
+    pub fn createServiceForConfig(&self, config: ResolvedModelConfig) -> Result<Box<dyn AIService>, AiServiceError> {
+        let inner = self.inner.lock().expect("MultiServiceManager mutex poisoned");
+        Self::createServiceFromResolvedConfigLocked(&inner, config)
     }
 
     /// Cancels all active streams across cached services.
@@ -448,7 +449,7 @@ impl MultiServiceManager {
             Some(instance) => {
                 instance.providerId == providerId
                     && instance.modelId == modelId
-                    && instance.config == *config
+                    && Self::sameRequestConfig(&instance.config, config)
             }
             None => false,
         }
@@ -460,9 +461,24 @@ impl MultiServiceManager {
         config: &ResolvedModelConfig,
     ) -> bool {
         match instance {
-            Some(instance) => instance.config == *config,
+            Some(instance) => Self::sameRequestConfig(&instance.config, config),
             None => false,
         }
+    }
+
+    /// Excludes key health bookkeeping from cache identity while retaining credential and status edits.
+    fn sameRequestConfig(left: &ResolvedModelConfig, right: &ResolvedModelConfig) -> bool {
+        let normalize = |config: &ResolvedModelConfig| {
+            let mut config = config.clone();
+            config.currentKeyIndex = 0;
+            for entry in &mut config.apiKeyPool {
+                entry.usageCount = 0;
+                entry.lastUsed = 0;
+                entry.errorCount = 0;
+            }
+            config
+        };
+        normalize(left) == normalize(right)
     }
 
     /// Collects unique cached service handles while the state lock is held.
@@ -506,12 +522,12 @@ impl MultiServiceManager {
         let maxConcurrentRequests = config.maxConcurrentRequests.max(0);
         let modelId = config.modelId.clone();
         let spec = AIServiceFactory::create_service(ProviderCreateRequest {
-            config,
+            config: config.clone(),
             provider_type: providerType.clone(),
             provider_type_id: providerTypeId,
             tool_pkg_provider_registered: toolPkgProviderRegistered,
         })?;
-        let rawService = Self::instantiateServiceLocked(inner, spec)?;
+        let rawService = Self::instantiateServiceLocked(&inner.runtime_context, spec)?;
 
         if requestLimitPerMinute == 0 && maxConcurrentRequests == 0 {
             return Ok(rawService);
@@ -544,13 +560,13 @@ impl MultiServiceManager {
 
     /// Instantiates the concrete provider implementation described by a factory spec.
     fn instantiateServiceLocked(
-        inner: &MultiServiceManagerState,
+        runtime_context: &ProviderRuntimeContext,
         spec: ProviderServiceSpec,
     ) -> Result<Box<dyn AIService>, AiServiceError> {
         match spec.params {
             ProviderCreateParams::LocalModelProvider { model_binding, settings } => Ok(Box::new(
                 crate::chat::llmprovider::LocalModelProvider::LocalChatAIProvider::new(
-                    model_binding, settings, inner.runtime_context.clone(),
+                    model_binding, settings, runtime_context.clone(),
                 ),
             )),
             ProviderCreateParams::OpenAIProvider {
@@ -565,7 +581,7 @@ impl MultiServiceManager {
                 enable_tool_call,
             } => Ok(Box::new(OpenAIProvider::new_with_capabilities(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -587,7 +603,7 @@ impl MultiServiceManager {
                 enable_tool_call,
             } => Ok(Box::new(DeepseekProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -596,7 +612,7 @@ impl MultiServiceManager {
                 supports_video,
                 builtin_tools,
                 enable_tool_call,
-                inner.runtime_context.clone(),
+                runtime_context.clone(),
             ))),
             ProviderCreateParams::OpenAIResponsesProvider {
                 responses_api_endpoint,
@@ -611,7 +627,7 @@ impl MultiServiceManager {
                 enable_tool_call,
             } => Ok(Box::new(OpenAIResponsesProvider::new(
                 responses_api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 responses_provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -620,10 +636,11 @@ impl MultiServiceManager {
                 supports_video,
                 builtin_tools,
                 enable_tool_call,
-                inner.runtime_context.clone(),
+                runtime_context.clone(),
             ))),
             ProviderCreateParams::OpenCodeProvider {
                 api_endpoint,
+                provider_id,
                 api_key_provider,
                 model_name,
                 custom_headers,
@@ -635,7 +652,8 @@ impl MultiServiceManager {
                 enable_tool_call,
             } => Ok(Box::new(OpenCodeProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                provider_id,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 custom_headers.into_iter().collect(),
                 protocol,
@@ -644,7 +662,7 @@ impl MultiServiceManager {
                 supports_video,
                 builtin_tools,
                 enable_tool_call,
-                inner.runtime_context.clone(),
+                runtime_context.clone(),
             )?)),
             ProviderCreateParams::ClaudeProvider {
                 api_endpoint,
@@ -657,7 +675,7 @@ impl MultiServiceManager {
             } => Ok(Box::new(
                 ClaudeProvider::new(
                     api_endpoint,
-                    Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                    Self::createKeyGetter(runtime_context, api_key_provider),
                     model_name,
                     provider_type.name().to_string(),
                     custom_headers.into_iter().collect(),
@@ -675,7 +693,7 @@ impl MultiServiceManager {
                 builtin_tools,
             } => Ok(Box::new(GeminiProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -695,7 +713,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(OllamaProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -717,7 +735,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(KimiProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -739,7 +757,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(MimoProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -761,7 +779,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(MistralProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -783,7 +801,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(OpenRouterProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -791,7 +809,7 @@ impl MultiServiceManager {
                 supports_audio,
                 supports_video,
                 enable_tool_call,
-                inner.runtime_context.clone(),
+                runtime_context.clone(),
             ))),
             ProviderCreateParams::FourRouterProvider {
                 api_endpoint,
@@ -806,7 +824,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(FourRouterProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -828,7 +846,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(NousPortalProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -836,7 +854,7 @@ impl MultiServiceManager {
                 supports_audio,
                 supports_video,
                 enable_tool_call,
-                inner.runtime_context.clone(),
+                runtime_context.clone(),
             ))),
             ProviderCreateParams::DoubaoAIProvider {
                 api_endpoint,
@@ -851,7 +869,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(DoubaoAIProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -873,7 +891,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(NvidiaAIProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -895,7 +913,7 @@ impl MultiServiceManager {
                 ..
             } => Ok(Box::new(QwenAIProvider::new(
                 api_endpoint,
-                Self::resolveApiKeyProviderLocked(inner, api_key_provider)?,
+                Self::createKeyGetter(runtime_context, api_key_provider),
                 model_name,
                 qwen_provider_type.name().to_string(),
                 custom_headers.into_iter().collect(),
@@ -903,60 +921,38 @@ impl MultiServiceManager {
                 supports_audio,
                 supports_video,
                 enable_tool_call,
-                inner.runtime_context.clone(),
+                runtime_context.clone(),
             ))),
             ProviderCreateParams::ToolPkgJsAiProviderService {
                 provider_type_id,
-                provider_id,
-                model_id,
+                config,
             } => {
-                let provider = inner
-                    .runtime_context
+                let provider = runtime_context
                     .support()
                     .toolPkgAiProvider(&provider_type_id)
                     .ok_or_else(|| {
                         AiServiceError::ProviderNotImplemented(provider_type_id.clone())
                     })?;
-                let config = inner
-                    .runtime_context
-                    .support()
-                    .resolvedModelConfig(inner.rootDir.clone(), &provider_id, &model_id)
-                    .map_err(AiServiceError::RequestFailed)?;
+                let keyGetter = Self::createKeyGetter(runtime_context, AIServiceFactory::api_key_provider(&config));
                 Ok(Box::new(ToolPkgJsAiProviderService::new(
                     config,
                     provider,
-                    inner.runtime_context.clone(),
+                    runtime_context.clone(),
+                    keyGetter,
                 )))
             }
         }
     }
 
-    /// Resolves the API-key provider spec into the concrete key source used by providers.
-    fn resolveApiKeyProviderLocked(
-        inner: &MultiServiceManagerState,
+    /// Creates the credential getter without selecting or reading a key during service construction.
+    fn createKeyGetter(
+        runtime_context: &ProviderRuntimeContext,
         apiKeyProvider: ApiKeyProviderSpec,
-    ) -> Result<String, AiServiceError> {
+    ) -> KeyGetter {
         match apiKeyProvider {
-            ApiKeyProviderSpec::SingleApiKeyProvider { api_key } => Ok(api_key),
+            ApiKeyProviderSpec::SingleApiKeyProvider { api_key } => api_key.into(),
             ApiKeyProviderSpec::MultiApiKeyProvider { provider_id } => {
-                let provider = inner
-                    .runtime_context
-                    .support()
-                    .providerProfile(inner.rootDir.clone(), &provider_id)
-                    .map_err(AiServiceError::RequestFailed)?;
-                let index = usize::try_from(provider.currentKeyIndex)
-                    .map_err(|error| AiServiceError::RequestFailed(error.to_string()))?;
-                let keyInfo = provider.apiKeyPool.get(index).ok_or_else(|| {
-                    AiServiceError::RequestFailed(format!(
-                        "apiKeyPool index out of range: providerId={provider_id}, index={index}"
-                    ))
-                })?;
-                if !keyInfo.isEnabled {
-                    return Err(AiServiceError::RequestFailed(format!(
-                        "apiKeyPool entry disabled: providerId={provider_id}, index={index}"
-                    )));
-                }
-                Ok(keyInfo.key.clone())
+                KeyGetter::new(provider_id, runtime_context.clone())
             }
         }
     }
@@ -982,12 +978,12 @@ impl MultiServiceManager {
         let binding = inner
             .runtime_context
             .support()
-            .modelBindingForFunction(inner.rootDir.clone(), functionType)
+            .modelBindingForFunction(functionType)
             .map_err(AiServiceError::RequestFailed)?;
         inner
             .runtime_context
             .support()
-            .resolvedModelConfig(inner.rootDir.clone(), &binding.providerId, &binding.modelId)
+            .resolvedModelConfig(&binding.providerId, &binding.modelId)
             .map_err(AiServiceError::RequestFailed)
     }
 
@@ -1004,7 +1000,7 @@ impl MultiServiceManager {
         inner
             .runtime_context
             .support()
-            .resolvedModelConfig(inner.rootDir.clone(), &providerId, &modelId)
+            .resolvedModelConfig(&providerId, &modelId)
             .map_err(AiServiceError::RequestFailed)
     }
 
@@ -1023,21 +1019,38 @@ impl MultiServiceManager {
         format!("{providerId}:{modelId}")
     }
 
-    /// Reports whether the chat model binding supports direct image input.
+    /// Queries capability availability without constructing an auxiliary model service.
+    fn modelCapabilitiesForFunction(
+        &self,
+        functionType: FunctionType,
+    ) -> Result<Option<ModelCapabilities>, AiServiceError> {
+        let context = self
+            .inner
+            .lock()
+            .expect("MultiServiceManager mutex poisoned")
+            .runtime_context
+            .clone();
+        context
+            .support()
+            .modelCapabilitiesForFunction(functionType)
+            .map_err(AiServiceError::RequestFailed)
+    }
+
+    /// Reports whether the image-recognition function binding supports image input.
     pub fn hasImageRecognitionConfigured(&mut self) -> Result<bool, AiServiceError> {
-        let config = self.getModelConfigForFunction(FunctionType::IMAGE_RECOGNITION)?;
-        Ok(config.capabilities.directImage)
+        let capabilities = self.modelCapabilitiesForFunction(FunctionType::IMAGE_RECOGNITION)?;
+        Ok(capabilities.is_some_and(|value| value.directImage))
     }
 
-    /// Reports whether the chat model binding supports direct audio input.
+    /// Reports whether the audio-recognition function binding supports audio input.
     pub fn hasAudioRecognitionConfigured(&mut self) -> Result<bool, AiServiceError> {
-        let config = self.getModelConfigForFunction(FunctionType::AUDIO_RECOGNITION)?;
-        Ok(config.capabilities.directAudio)
+        let capabilities = self.modelCapabilitiesForFunction(FunctionType::AUDIO_RECOGNITION)?;
+        Ok(capabilities.is_some_and(|value| value.directAudio))
     }
 
-    /// Reports whether the chat model binding supports direct video input.
+    /// Reports whether the video-recognition function binding supports video input.
     pub fn hasVideoRecognitionConfigured(&mut self) -> Result<bool, AiServiceError> {
-        let config = self.getModelConfigForFunction(FunctionType::VIDEO_RECOGNITION)?;
-        Ok(config.capabilities.directVideo)
+        let capabilities = self.modelCapabilitiesForFunction(FunctionType::VIDEO_RECOGNITION)?;
+        Ok(capabilities.is_some_and(|value| value.directVideo))
     }
 }

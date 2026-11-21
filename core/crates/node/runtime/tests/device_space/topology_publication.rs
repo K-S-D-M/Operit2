@@ -1,5 +1,43 @@
 use super::*;
 
+/// Negotiation rejections appear even when the cached profile still advertises compatibility.
+#[tokio::test]
+async fn protocol_rejection_projects_an_unavailable_connection_without_mutating_profiles() {
+    let _guard = routeTestGlobalLock().lock().await;
+    installTestRuntimeScheduler();
+    let (a, access) = approvalService("protocol-projection-a");
+    let (b, _) = approvalService("protocol-projection-b");
+    mergedChainFixture(&[&a, &b]);
+    let peer = ApprovalMeshPeer::new(a.localNodeId());
+    peer.link(&b);
+    peer.disconnectPeer(&b.localNodeId()).await.unwrap();
+    let failure = CoreLinkError::new("PEER_PROTOCOL_MISMATCH", "Negotiated peer is incompatible");
+    peer.protocolFailures.lock().unwrap().insert(b.localNodeId(), failure.clone());
+    peer.protocolFailures.lock().unwrap().insert("foreign-peer".into(), failure.clone());
+    a.installNodeServices(NodeServices::new(peer.clone())).unwrap();
+    let profiles = a.spaceStore.deviceProfiles().unwrap();
+
+    let topology = access.deviceSpaceTopology().unwrap();
+    assert_eq!(topology.connections.len(), 1);
+    assert_eq!(topology.connections[0].status,
+        crate::RuntimeRemoteLinkService::RuntimeDeviceSpaceConnectionStatus::VersionMismatch);
+    assert!(topology.connections[0].reason.contains(&failure.message));
+    assert!(!topology.devices.iter().find(|device| device.deviceId == b.localNodeId()).unwrap().online);
+    assert_eq!(a.spaceStore.deviceProfiles().unwrap(), profiles);
+
+    crate::NodeSpaceService::space_topology::publishLocalTopology(
+        &a.spaceStore, &a.networkControlStore, &a.localNodeId(), &BTreeSet::from([b.localNodeId()]),
+    ).unwrap();
+    assert_eq!(access.deviceSpaceTopology().unwrap().connections, topology.connections);
+
+    peer.link(&b);
+    let topology = access.deviceSpaceTopology().unwrap();
+    assert_eq!(topology.connections.len(), 1);
+    assert!(topology.devices.iter().find(|device| device.deviceId == b.localNodeId()).unwrap().online);
+    assert!(topology.connections.iter().all(|connection|
+        connection.status != crate::RuntimeRemoteLinkService::RuntimeDeviceSpaceConnectionStatus::VersionMismatch));
+}
+
 /// Publishes every device's adjacency through the production helper, then carries the
 /// records the way the Space snapshot exchange does.
 fn publishTree(routers: &[CoreNodeRouter], peers: &[Arc<ApprovalMeshPeer>]) {
@@ -70,6 +108,27 @@ async fn tree_topology_publication_routes_between_leaves() {
     }
 
     publishTree(&routers, &peers);
+
+    for (router, service) in routers.iter().zip(&access) {
+        assert_eq!(
+            router.spaceStore.deviceConnections().unwrap().len(),
+            4,
+            "routing must retain both endpoints' directed announcements"
+        );
+        let projection = service.deviceSpaceTopology().unwrap();
+        assert_eq!(
+            projection.connections.len(),
+            2,
+            "each physical link must appear once from every device's perspective"
+        );
+        assert!(
+            projection
+                .connections
+                .iter()
+                .all(|connection| connection.firstDeviceId < connection.secondDeviceId),
+            "connection endpoint order must be stable across devices"
+        );
+    }
 
     let middleRecord = serde_json::to_value(
         routers[1]
@@ -158,6 +217,29 @@ async fn tree_topology_publication_routes_between_leaves() {
         localEdge.status,
         crate::RuntimeRemoteLinkService::RuntimeDeviceSpaceConnectionStatus::Online
     );
+
+    // Snapshot exchange can deliver the owners' announcements at different times.
+    // Either endpoint alone must still project the same device pair. Reachability
+    // may change because routing continues to use the directed announcements.
+    let endpointPairs = |service: &RuntimeRemoteLinkService| {
+        service
+            .deviceSpaceTopology()
+            .unwrap()
+            .connections
+            .into_iter()
+            .map(|connection| (connection.firstDeviceId, connection.secondDeviceId))
+            .collect::<Vec<_>>()
+    };
+    let before = access
+        .iter()
+        .map(|service| endpointPairs(service))
+        .collect::<Vec<_>>();
+    routers[1].spaceStore.setDirectPeers(Vec::new()).unwrap();
+    propagateTopology(&routers);
+    for ((router, service), expected) in routers.iter().zip(&access).zip(before) {
+        assert_eq!(router.spaceStore.deviceConnections().unwrap().len(), 2);
+        assert_eq!(endpointPairs(service), expected);
+    }
 }
 
 /// Verifies a dropped direct link is pruned from the announcement and stops routing.

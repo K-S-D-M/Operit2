@@ -37,6 +37,7 @@ class RuntimeMethodChannelRouter(
     }
 
     fun clear() {
+        androidPlatformChannel.clear()
         documentInputChannel.clear()
         runtimeChannel?.setMethodCallHandler(null)
         runtimeChannel = null
@@ -57,8 +58,9 @@ class RuntimeMethodChannelRouter(
         return androidPlatformChannel.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
-    /** Delivers one Android document picker result to the document input channel. */
+    /** Delivers Android results to the owner of the uninstall, settings, or picker request. */
     fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?): Boolean {
+        if (ownerSystemChannel.onActivityResult(requestCode, resultCode)) return true
         if (androidPlatformChannel.onActivityResult(requestCode)) return true
         return documentInputChannel.onActivityResult(requestCode, resultCode, data)
     }

@@ -16,7 +16,6 @@ import '../../features/chat/components/NewChatIntro.dart';
 import '../../theme/OperitTheme.dart';
 import '../navigation/AppNavigationModels.dart';
 import '../layout/SidebarDockController.dart';
-import '../layout/NavigationLayoutMetrics.dart';
 import '../screens/ScreenRouteRegistry.dart';
 import '../../common/components/SwipeActions.dart';
 import 'NavigationDrawerAppearance.dart';
@@ -120,6 +119,7 @@ class CollapsedDrawerContent extends StatelessWidget {
                   padding: EdgeInsets.only(top: topPadding),
                   child: Center(
                     child: AppUpdateBadge(
+                      showIndicator: false,
                       child: OperitLogoMark(
                         size: 34,
                         color: appearance.statusAvailableColor,
@@ -272,27 +272,36 @@ class SidebarInfoCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsetsDirectional.fromSTEB(20, 4, 14, 4),
-      child: Row(
-        children: [
-          Expanded(
-            child: Align(
-              alignment: AlignmentDirectional.centerStart,
-              child: AppUpdateBadge(
-                child: Text(
-                  brandName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                    color: appearance.titleColor,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 0,
+      child: LayoutBuilder(
+        builder: (context, constraints) => Row(
+          children: [
+            Expanded(
+              child: Align(
+                alignment: AlignmentDirectional.centerStart,
+                child: AppUpdateBadge(
+                  child: Text(
+                    brandName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      color: appearance.titleColor,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0,
+                    ),
                   ),
                 ),
               ),
             ),
-          ),
-          ?trailing,
-        ],
+            if (trailing != null)
+              ConstrainedBox(
+                // Reserve brand space even with several plugin tabs.
+                constraints: BoxConstraints(
+                  maxWidth: constraints.maxWidth * 2 / 3,
+                ),
+                child: trailing!,
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -420,6 +429,7 @@ class ConversationDrawerItem extends StatefulWidget {
     required this.onDetach,
     this.onSearchMessages,
     this.onViewFavorites,
+    this.childToggle,
     this.nested = false,
     this.workspaceStyle = false,
   });
@@ -445,6 +455,7 @@ class ConversationDrawerItem extends StatefulWidget {
   final bool Function(core_proxy.ChatHistoryListItem) canAcceptDrop;
   final bool canDetach;
   final VoidCallback onDetach;
+  final Widget? childToggle;
   final bool nested;
   final bool workspaceStyle;
 
@@ -518,6 +529,7 @@ class _ConversationDrawerItemState extends State<ConversationDrawerItem>
             appearance: appearance,
             workspaceStyle: workspaceStyle,
             nested: widget.nested,
+            metadata: widget.childToggle,
             pinned: history.pinned,
             locked: history.locked,
             dragHovering: candidateData.isNotEmpty,
@@ -620,27 +632,27 @@ class _ConversationDrawerItemState extends State<ConversationDrawerItem>
 }
 
 class PluginNavigationDrawerItem extends StatelessWidget {
+  /// Creates a plugin navigation item and its optional phone drag lifecycle.
   const PluginNavigationDrawerItem({
     super.key,
     required this.entry,
     required this.selected,
     required this.appearance,
     required this.onClick,
+    this.onDockDragChanged,
   });
 
   final NavigationEntrySpec entry;
   final bool selected;
   final NavigationDrawerAppearance appearance;
   final VoidCallback onClick;
+  final ValueChanged<bool>? onDockDragChanged;
 
   static const double _endPadding = 12;
 
+  /// Builds the navigation row inside its sidebar drag source.
   @override
   Widget build(BuildContext context) {
-    final dockController =
-        MediaQuery.sizeOf(context).width >= navigationTabletBreakpoint
-        ? SidebarDockScope.maybeOf(context)
-        : null;
     final shape = BorderRadius.circular(12);
     final contentColor = selected
         ? appearance.selectedContentColor
@@ -695,26 +707,30 @@ class PluginNavigationDrawerItem extends StatelessWidget {
         ),
       ),
     );
-    if (dockController == null) {
-      return item;
-    }
-    return _PrimarySidebarDragSource(entry: entry, child: item);
+    return _PrimarySidebarDragSource(
+      entry: entry,
+      onDockDragChanged: onDockDragChanged,
+      child: item,
+    );
   }
 }
 
 class _PrimarySidebarDragSource extends StatelessWidget {
-  const _PrimarySidebarDragSource({required this.entry, required this.child});
+  /// Creates a primary dock item that can accept incoming plugin drops.
+  const _PrimarySidebarDragSource({
+    required this.entry,
+    required this.onDockDragChanged,
+    required this.child,
+  });
 
   final NavigationEntrySpec entry;
+  final ValueChanged<bool>? onDockDragChanged;
   final Widget child;
 
   /// Builds a primary sidebar drag source and reorder drop target.
   @override
   Widget build(BuildContext context) {
-    final controller =
-        MediaQuery.sizeOf(context).width >= navigationTabletBreakpoint
-        ? SidebarDockScope.maybeOf(context)
-        : null;
+    final controller = SidebarDockScope.maybeOf(context);
     if (controller == null) {
       return child;
     }
@@ -754,17 +770,33 @@ class _PrimarySidebarDragSource extends StatelessWidget {
         if (!controller.canMove(entry.entryId, SidebarDockLocation.secondary)) {
           return decoratedChild;
         }
-        return Draggable<SidebarDockDragPayload>(
-          data: SidebarDockDragPayload(entryId: entry.entryId),
-          feedback: Material(
-            elevation: 8,
-            color: Colors.transparent,
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 260),
-              child: Opacity(opacity: 0.92, child: child),
-            ),
+        final data = SidebarDockDragPayload(entryId: entry.entryId);
+        final feedback = Material(
+          elevation: 8,
+          color: Colors.transparent,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 260),
+            child: Opacity(opacity: 0.92, child: child),
           ),
-          childWhenDragging: Opacity(opacity: 0.32, child: child),
+        );
+        final placeholder = Opacity(opacity: 0.32, child: child);
+        final onDragChanged = onDockDragChanged;
+        if (onDragChanged != null) {
+          return LongPressDraggable<SidebarDockDragPayload>(
+            maxSimultaneousDrags: 1,
+            data: data,
+            feedback: feedback,
+            childWhenDragging: placeholder,
+            onDragStarted: () => onDragChanged(true),
+            onDragCompleted: () => onDragChanged(false),
+            onDraggableCanceled: (_, _) => onDragChanged(false),
+            child: decoratedChild,
+          );
+        }
+        return Draggable<SidebarDockDragPayload>(
+          data: data,
+          feedback: feedback,
+          childWhenDragging: placeholder,
           child: decoratedChild,
         );
       },

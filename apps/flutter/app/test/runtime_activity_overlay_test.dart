@@ -63,19 +63,21 @@ class _Bridge extends OperitRuntimeBridge {
 core.SpaceSyncProgress progress({
   core.SpaceSyncStatus status = core.SpaceSyncStatus.syncing,
   core.SpaceSyncStage stage = core.SpaceSyncStage.records,
+  int? startedAt,
   int fileBytes = 0,
   int fileSize = 0,
   int completedRecords = 1200,
   int? totalRecords,
   int pendingRecords = 0,
   String? error,
+  bool retryScheduled = true,
   String peer = 'tablet',
 }) {
   final now = DateTime.now().millisecondsSinceEpoch;
   return core.SpaceSyncProgress(
     spaceId: 'space',
     peerNodeId: peer,
-    startedAt: now - 10000,
+    startedAt: startedAt ?? now - 10000,
     updatedAt: now,
     status: status,
     stage: stage,
@@ -86,7 +88,9 @@ core.SpaceSyncProgress progress({
     transferredBytes: 2097152,
     fileBytes: fileBytes,
     fileSize: fileSize,
-    retryAt: status == core.SpaceSyncStatus.waiting ? now + 2000 : null,
+    retryAt: status == core.SpaceSyncStatus.waiting && retryScheduled
+        ? now + 2000
+        : null,
     error: error,
   );
 }
@@ -133,12 +137,15 @@ void main() {
     await tester.pump();
   }
 
-  Future<void> emitPackages(WidgetTester tester) async {
+  Future<void> emitPackages(
+    WidgetTester tester, {
+    bool forceExpanded = false,
+  }) async {
     bridge.emit(
       'pluginLoadingProgressFlow',
-      const core.PluginLoadingProgress(
+      core.PluginLoadingProgress(
         visible: true,
-        forceExpanded: false,
+        forceExpanded: forceExpanded,
         progress: 0.4,
         phase: 'loading',
         currentTask: '工具包',
@@ -243,7 +250,7 @@ void main() {
       tester,
       progress(completedRecords: 500, totalRecords: 10000),
     );
-    expect(find.text('500 / 10000 条 · 5%'), findsOneWidget);
+    expect(find.text(' 500/10000'), findsOneWidget);
     expect(
       tester
           .widget<LinearProgressIndicator>(find.byType(LinearProgressIndicator))
@@ -266,7 +273,7 @@ void main() {
       ]);
       await tester.pump();
       await tester.pump();
-      expect(find.text('600 / 4000 条 · 15%'), findsOneWidget);
+      expect(find.text(' 600/4000'), findsOneWidget);
       expect(
         tester
             .widget<LinearProgressIndicator>(
@@ -279,7 +286,7 @@ void main() {
   );
 
   testWidgets(
-    'failed records keep their real pending count and expose the error without hovering',
+    'sync errors stay collapsed and reveal pending details only on tap',
     (tester) async {
       await mount(tester);
       await emitSync(
@@ -289,9 +296,18 @@ void main() {
           completedRecords: 9999,
           totalRecords: 10000,
           pendingRecords: 1,
+          retryScheduled: false,
           error: 'plugin_storage: Invalid or duplicate remote key',
         ),
       );
+      expect(find.text('后台任务'), findsNothing);
+      expect(find.text(' 9999/10000'), findsOneWidget);
+      expect(
+        find.text('plugin_storage: Invalid or duplicate remote key'),
+        findsNothing,
+      );
+      await tester.tap(find.text(' 9999/10000'));
+      await tester.pump();
       expect(find.text('后台任务'), findsOneWidget);
       expect(find.text('9999 / 10000 条 · 99% · 待应用 1 条'), findsOneWidget);
       expect(
@@ -299,6 +315,8 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('同步完成'), findsNothing);
+      expect(find.text('部分数据尚未处理完成'), findsOneWidget);
+      expect(find.textContaining('自动重试'), findsNothing);
       await tester.pump(const Duration(seconds: 3));
       expect(find.text('后台任务'), findsNothing);
     },
@@ -330,7 +348,41 @@ void main() {
           .value,
       0.25,
     );
-    expect(find.text('1.0 MB / 4.0 MB'), findsOneWidget);
+    expect(find.text(' 1.0 MB/4.0 MB'), findsOneWidget);
+  });
+
+  testWidgets('file transfer stays visible when record totals are known', (tester) async {
+    await mount(tester);
+    await emitSync(tester, progress(
+      stage: core.SpaceSyncStage.files, fileBytes: 1048576, fileSize: 4194304,
+      completedRecords: 500, totalRecords: 10000,
+    ));
+    expect(find.text(' 1.0 MB/4.0 MB'), findsOneWidget);
+    expect(tester.widget<LinearProgressIndicator>(find.byType(LinearProgressIndicator)).value, 0.25);
+    await tester.tap(find.text('正在同步'));
+    await tester.pump();
+    expect(find.text('500 / 10000 条 · 5%'), findsOneWidget);
+    expect(find.text('正在传输并校验文件'), findsOneWidget);
+  });
+
+  testWidgets('confirmed progress animates within real bounds and checking remains active', (tester) async {
+    await mount(tester);
+    final started = DateTime.now().millisecondsSinceEpoch - 10000;
+    double? value() => tester.widget<LinearProgressIndicator>(find.byType(LinearProgressIndicator)).value;
+    await emitSync(tester, progress(startedAt: started, completedRecords: 200, totalRecords: 1000));
+    await emitSync(tester, progress(startedAt: started, completedRecords: 800, totalRecords: 1000));
+    expect(value(), 0.2);
+    await tester.pump(const Duration(milliseconds: 150));
+    expect(value(), inExclusiveRange(0.2, 0.8));
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(value(), 0.8);
+    await emitSync(tester, progress(startedAt: started, stage: core.SpaceSyncStage.checking,
+      completedRecords: 1000, totalRecords: 1000));
+    expect(value(), isNull);
+    expect(find.text('同步完成'), findsNothing);
+    await tester.tap(find.text('正在同步'));
+    await tester.pump();
+    expect(find.text('正在检查数据差异'), findsOneWidget);
   });
 
   testWidgets(
@@ -356,10 +408,19 @@ void main() {
     'packages and sync share one surface; skip only affects packages',
     (tester) async {
       await mount(tester);
-      await emitPackages(tester);
+      await emitPackages(tester, forceExpanded: true);
       expect(find.text('加载扩展'), findsOneWidget);
+      expect(find.text('后台任务'), findsNothing);
+      expect(tester.getSize(find.byType(LinearProgressIndicator)).width, lessThan(156));
+      expect(
+        tester.getSize(find.ancestor(
+          of: find.byType(LinearProgressIndicator),
+          matching: find.byType(Material),
+        ).first),
+        predicate<Size>((size) => size.width < 156 && size.height == 36),
+      );
       await emitSync(tester, progress());
-      expect(find.text('+1'), findsOneWidget);
+      expect(find.text(' +1'), findsOneWidget);
       expect(find.byType(LinearProgressIndicator), findsOneWidget);
       await tester.tap(find.text('正在同步'));
       await tester.pump();

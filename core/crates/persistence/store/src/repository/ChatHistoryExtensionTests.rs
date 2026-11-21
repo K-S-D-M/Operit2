@@ -39,6 +39,33 @@ fn chatTarget() -> PluginExtensionTarget {
     }
 }
 
+/// Copies committed WAL contents and restores every database table through the same shared store.
+#[test]
+fn database_file_copy_preserves_all_tables_and_live_readers() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, database) = fixture("daily-database-backup");
+    database.store().executeBatch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE backup_private_data(value TEXT); INSERT INTO backup_private_data VALUES('before');").unwrap();
+    manager.updateChatTitle("extensions-chat".into(), "Committed in WAL".into()).unwrap();
+    let host = crate::RuntimeStorageHost::defaultRuntimeStorageHost();
+    let key = crate::RuntimeStorageHost::runtimeStoragePath(database.store().path());
+    let bytes = database.store().withDatabaseFile(|| Ok(host.readBytes(&key)?)).unwrap();
+    assert!(bytes.starts_with(b"SQLite format 3\0"));
+    let lease = database.store().beginChatExecution("extensions-chat").unwrap();
+    assert!(database.restoreDatabaseFile(|| Ok(())).is_err());
+    lease.release().unwrap();
+    manager.updateChatTitle("extensions-chat".into(), "After backup".into()).unwrap();
+    database.store().executeBatch("UPDATE backup_private_data SET value='after'").unwrap();
+    database.restoreDatabaseFile(|| Ok(host.writeBytes(&key, &bytes)?)).unwrap();
+    assert_eq!(database.store().queryScalar::<String>("SELECT title FROM chats", vec![]).unwrap(), "Committed in WAL");
+    assert_eq!(database.store().queryScalar::<String>("SELECT value FROM backup_private_data", vec![]).unwrap(), "before");
+    assert_eq!(database.store().queryScalar::<i64>("SELECT count(*) FROM message_variants", vec![]).unwrap(), 3);
+    let variant = database.messageVariantDao().getVariantForMessage("extensions-chat", 42, 3).unwrap().unwrap();
+    assert_eq!(variant.pluginExtensions["actor"], json!({"revision": 3}));
+    assert_eq!(database.store().queryScalar::<i64>("PRAGMA foreign_keys", vec![]).unwrap(), 1);
+    assert!(database.store().withDatabaseFile::<()>(|| Err(crate::SqliteStore::SqliteStoreError::Message("copy failed".into()))).is_err());
+    assert_eq!(database.store().queryScalar::<String>("SELECT value FROM backup_private_data", vec![]).unwrap(), "before");
+}
+
 /// Selects an exact persisted message revision without implicit selected-state resolution.
 fn messageTarget(index: i32) -> PluginExtensionTarget {
     PluginExtensionTarget::Message {
@@ -46,6 +73,42 @@ fn messageTarget(index: i32) -> PluginExtensionTarget {
         messageTimestamp: 42,
         variantIndex: index,
     }
+}
+
+/// Verifies complete index coverage, bounded previews and exact positions without hydrating message bodies.
+#[test]
+fn locator_index_covers_full_history_with_bounded_content_and_global_positions() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = fixture("locator-index");
+    for index in 0..200 {
+        let mut message = ChatMessage::new_with_markdown_timestamp(
+            if index % 3 == 0 { "user".into() } else { "ai".into() },
+            format!("message-{index} {} {}", "x".repeat(4096), if index >= 180 { "needle" } else { "ordinary" }),
+            1000 + index,
+        );
+        message.isFavorite = index % 7 == 0;
+        manager.addMessage("extensions-chat".into(), message).unwrap();
+    }
+    let index = manager.loadChatMessageLocatorPreviews("extensions-chat".into(), "".into()).unwrap();
+    assert_eq!(index.len(), 201);
+    assert_eq!(index[0].timestamp, 42);
+    assert_eq!(index.last().unwrap().timestamp, 1199);
+    assert_eq!(index.last().unwrap().messageIndex, Some(200));
+    assert!(index.iter().all(|entry| entry.previewContent.chars().count() <= 48));
+    assert!(index[1..].iter().all(|entry| entry.contentLength > 4096));
+    assert_eq!(index.iter().filter(|entry| entry.isFavorite).count(), 29);
+    assert!(serde_json::to_vec(&index).unwrap().len() < 201 * 512);
+    let matches = manager.loadChatMessageLocatorPreviews("extensions-chat".into(), "needle".into()).unwrap();
+    assert_eq!(matches.len(), 20);
+    assert_eq!(matches[0].messageIndex, Some(181));
+    assert_eq!(matches.last().unwrap().timestamp, 1199);
+    assert!(matches.iter().all(|entry| entry.previewContent.contains("needle")));
+    assert_eq!(manager.loadChatMessageIndexPosition("extensions-chat", 1199).unwrap(), Some(200));
+    assert_eq!(manager.loadChatMessageIndexPosition("extensions-chat", 900).unwrap(), None);
+    assert_eq!(manager.loadChatMessageDepths("extensions-chat", &[1199, 1180, 1199]).unwrap(), [0, 19, 0]);
+    assert!(manager.hasUserMessageAfter("extensions-chat", 1197).unwrap());
+    assert!(!manager.hasUserMessageAfter("extensions-chat", 1198).unwrap());
+    assert!(!manager.hasUserMessageAfter("missing-chat", 0).unwrap());
 }
 
 /// Verifies simultaneous owner updates preserve both namespaces on every real record kind.
@@ -172,7 +235,7 @@ fn promotion_reordering_and_projection_follow_variant_snapshots() {
         .selectMessageVariant("extensions-chat".to_string(), 42, 1)
         .unwrap();
     assert_eq!(
-        manager.loadChatMessages("extensions-chat").unwrap()[0].pluginExtensions,
+        manager.loadChatMessagesRange("extensions-chat".to_string(), "asc".to_string(), 0, 79).unwrap()[0].pluginExtensions,
         promoted
     );
     manager
@@ -201,7 +264,7 @@ fn promotion_reordering_and_projection_follow_variant_snapshots() {
         .selectMessageVariant("extensions-chat".to_string(), 42, 1)
         .unwrap();
     assert_eq!(
-        manager.loadChatMessages("extensions-chat").unwrap()[0].pluginExtensions,
+        manager.loadChatMessagesRange("extensions-chat".to_string(), "asc".to_string(), 0, 79).unwrap()[0].pluginExtensions,
         last
     );
 }
@@ -387,7 +450,7 @@ fn draft_transaction_failure_leaves_no_chat_or_opening_record() {
     assert!(database.chatDao().getChatById(&id).unwrap().is_none());
     assert!(database
         .messageDao()
-        .getMessagesForChat(&id)
+        .getMessagesForChatAsc(&id, 80)
         .unwrap()
         .is_empty());
 }
@@ -556,8 +619,10 @@ fn assistant_presentation_survives_reload_and_final_commit() {
         PRESENTATION_EXTENSION.into(),
         serde_json::to_value(&presentation).unwrap(),
     );
+    message.inputTokens = 10;
+    message.outputTokens = 20;
     manager
-        .commitAssistantMessageSegment("extensions-chat".into(), message, Some((10, 20, 30)))
+        .commitAssistantMessageSegment("extensions-chat".into(), message, Some(30))
         .unwrap();
     let reloaded = manager
         .loadChatMessageVariant("extensions-chat", 42, 0)

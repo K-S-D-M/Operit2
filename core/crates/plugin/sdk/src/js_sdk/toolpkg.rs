@@ -515,6 +515,7 @@ pub enum ToolPkgHookEventName {
     Variant5(ToolPkgChatInputEventName),
     Variant6(ToolPkgChatViewEventName),
     Variant16(ToolPkgChatMessageEventName),
+    Variant23(ToolPkgMessageTransformEventName),
     Variant21(ToolPkgChatLifecycleEventName),
     Variant17(ToolPkgChatMessageMenuItemEventName),
     Variant18(ToolPkgChatRuntimeEventName),
@@ -530,6 +531,7 @@ pub enum ToolPkgHookEventName {
     Variant19(ToolPkgCoreCommandEventName),
     Variant15(ToolPkgHostEventName),
     Variant20(ToolPkgHookEventNameVariant20),
+    Variant24(ToolPkgToolPermissionEventName),
 }
 /// Accepts a JSON result, no result, or asynchronous completion from a generic hook.
 pub enum ToolPkgHookReturn {
@@ -1064,6 +1066,8 @@ pub struct ToolPkgPromptHookEventPayload {
     pub stage: Option<String>,
     /// Identifies the conversation associated with the event.
     pub chatId: Option<String>,
+    /// Provides the workspace path associated with the conversation.
+    pub workspacePath: Option<String>,
     /// Identifies the host function participating in prompt construction.
     pub functionType: Option<String>,
     /// Identifies the prompt-building function active for this hook.
@@ -1098,6 +1102,8 @@ pub struct ToolPkgToolPromptHookEventPayload {
     pub stage: Option<String>,
     /// Identifies the conversation associated with the event.
     pub chatId: Option<String>,
+    /// Provides the workspace path associated with the conversation.
+    pub workspacePath: Option<String>,
     /// Identifies the host function participating in prompt construction.
     pub functionType: Option<String>,
     /// Identifies the prompt-building function active for this hook.
@@ -2153,6 +2159,9 @@ pub enum ToolPkgNavigationSurface {
     /// Registers a package-owned page opened inside the workspace independently of sidebar docking.
     #[serde(rename = "workspace")]
     Workspace,
+    /// Opens files whose suffix matches a lowercase entry in params.extensions, without a leading dot.
+    #[serde(rename = "workspace_file")]
+    WorkspaceFile,
     /// Embeds package-owned Compose content on the workspace home surface.
     #[serde(rename = "workspace_home")]
     WorkspaceHome,
@@ -3054,9 +3063,20 @@ pub struct ToolPkgPublicApiRegistration<TPayload, TResult> {
     /// Handles a request in the provider's main runtime.
     pub function: Arc<dyn Fn(ToolPkgPublicApiEvent<TPayload>) -> JsFuture<TResult> + Send + Sync>,
 }
-/// Window geometry in logical pixels; position uses the host desktop's top-left origin.
+/// Bounds returned by a native accessibility provider in screen coordinates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolPkgFloatingScreenBounds {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+/// Window geometry in logical pixels, or an explicit native screen rectangle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolPkgFloatingWindowOptions {
+    /// Native accessibility bounds; takes precedence over logical geometry.
+    /// Pixels on Windows/Android, screen points on macOS, AT-SPI desktop units on X11. System scope only.
+    pub screenBounds: Option<ToolPkgFloatingScreenBounds>,
     /// Sets the left coordinate, when positioning is supported.
     pub x: Option<f64>,
     /// Sets the top coordinate, when positioning is supported.
@@ -3081,9 +3101,32 @@ pub struct ToolPkgFloatingWindowOpenOptions {
     /// Selects one of this plugin's registered Compose UI routes.
     pub route: String,
     /// Supplies the UI session's initial state.
-    pub state: Option<ToolPkgJsonObject>,
+    pub state: Option<JsObject>,
+    /// Fills the current scope: primary display for system windows, full view for application windows.
+    pub fill: Option<bool>,
     /// Configures geometry and interaction flags.
     pub options: Option<ToolPkgFloatingWindowOptions>,
+}
+/// Declares the content of one managed window; route and fill stay fixed while it exists.
+pub struct ToolPkgFloatingWindowContent {
+    pub route: String,
+    /// Shallow-merges supplied JSON state into the live UI session.
+    pub state: Option<JsObject>,
+    pub fill: Option<bool>,
+    /// Applies supplied options without resetting other options or the UI session.
+    pub options: Option<ToolPkgFloatingWindowOptions>,
+}
+/// Reports presentation availability without requesting system authorization implicitly.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum ToolPkgFloatingWindowSetResult {
+    #[serde(rename = "shown")]
+    Shown,
+    #[serde(rename = "closed")]
+    Closed,
+    #[serde(rename = "permission_required")]
+    PermissionRequired,
+    #[serde(rename = "unsupported")]
+    Unsupported,
 }
 /// Reports the actual presentation scope and host capabilities.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3107,9 +3150,25 @@ pub struct ToolPkgFloatingWindowInfo {
     pub visible: bool,
     pub options: ToolPkgFloatingWindowOptions,
 }
+/// Configures one bounded microphone capture in an owned window.
+pub struct ToolPkgFloatingWindowRecordingOptions {
+    /// Sets the capture limit in milliseconds (1000–20000, default 15000).
+    pub maxDurationMs: Option<u32>,
+    /// Stops after this much trailing silence (300–3000 ms) once speech is detected.
+    pub silenceMs: Option<u32>,
+}
+/// Carries a complete speech recording ready for STT.
+pub struct ToolPkgFloatingWindowRecording {
+    pub audio: Vec<u8>,
+    pub fileName: String,
+    pub contentType: String,
+}
 /// Controls general floating windows independently of launcher widgets.
 pub struct ToolPkgFloatingWindowApi;
 pub trait ToolPkgFloatingWindowApiMethods: Send + Sync {
+    /// Creates, updates and shows one window, or closes it for null content; repeated calls are safe.
+    /// The host serializes lifecycle changes. Unavailable hosts return an explicit status; other errors reject.
+    fn set(&self, id: String, content: JsNullable<ToolPkgFloatingWindowContent>) -> JsFuture<ToolPkgFloatingWindowSetResult>;
     /// Queries capabilities without opening a window or displaying a permission prompt.
     fn capabilities(&self) -> JsFuture<ToolPkgFloatingWindowCapabilities>;
     /// Opens the host's overlay permission settings when required; query capabilities again afterwards.
@@ -3117,7 +3176,7 @@ pub trait ToolPkgFloatingWindowApiMethods: Send + Sync {
     /// Creates a transparent live route session. IDs are local to the executing plugin.
     fn open(&self, options: ToolPkgFloatingWindowOpenOptions) -> JsFuture<ToolPkgFloatingWindowInfo>;
     /// Applies partial window options and shallow-merges optional UI state without recreating the session.
-    fn update(&self, id: String, options: ToolPkgFloatingWindowOptions, state: Option<ToolPkgJsonObject>) -> JsFuture<ToolPkgFloatingWindowInfo>;
+    fn update(&self, id: String, options: ToolPkgFloatingWindowOptions, state: Option<JsObject>) -> JsFuture<ToolPkgFloatingWindowInfo>;
     /// Shows an owned window without resetting its UI session.
     fn show(&self, id: String) -> JsFuture<ToolPkgFloatingWindowInfo>;
     /// Hides an owned window while retaining its UI session.
@@ -3126,14 +3185,83 @@ pub trait ToolPkgFloatingWindowApiMethods: Send + Sync {
     fn close(&self, id: String) -> JsFuture<()>;
     /// Lists only the executing plugin's live windows.
     fn list(&self) -> JsFuture<Vec<ToolPkgFloatingWindowInfo>>;
+    /// Captures WAV audio while the owned window is visible; returns null when discarded.
+    fn record(&self, id: String, options: Option<ToolPkgFloatingWindowRecordingOptions>) -> JsFuture<JsNullable<ToolPkgFloatingWindowRecording>>;
+    /// Reads the normalized microphone level (0 to 1) for this owned window; zero while idle.
+    fn recordingLevel(&self, id: String) -> JsFuture<f64>;
+    /// Ends active capture and delivers its WAV to the pending record call.
+    fn finishRecording(&self, id: String) -> JsFuture<()>;
+    /// Discards active capture without returning audio.
+    fn cancelRecording(&self, id: String) -> JsFuture<()>;
 }
 /// Groups runtime presentation services for plugin-owned user interfaces.
 pub struct ToolPkgUiApi {
     /// Controls live floating windows independently of launcher widgets.
     pub floatingWindows: ToolPkgFloatingWindowApi,
 }
+/// Carries one exact argument displayed to the user before tool execution.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolPkgToolPermissionParameter {
+    pub name: String,
+    pub value: String,
+}
+/// Identifies the tool and its public arguments awaiting approval.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolPkgToolPermissionTool {
+    pub name: String,
+    pub parameters: Vec<ToolPkgToolPermissionParameter>,
+}
+/// Identifies one pending request across every chat and approval surface.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolPkgToolPermissionRequest {
+    pub requestId: String,
+    pub chatId: String,
+    pub tool: ToolPkgToolPermissionTool,
+    pub description: String,
+    pub requestedAtMillis: i64,
+}
+/// Names the decisions supported by the existing runtime approval broker.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ToolPkgToolPermissionDecision {
+    #[serde(rename = "allow")]
+    Allow,
+    #[serde(rename = "deny")]
+    Deny,
+    #[serde(rename = "allow_session")]
+    AllowSession,
+}
+/// Exposes current approvals to enabled packages registering a permission hook.
+pub struct ToolPkgToolPermissionApi;
+pub trait ToolPkgToolPermissionApiMethods: Send + Sync {
+    /// Lists unresolved requests in creation order, across chats.
+    fn list(&self) -> JsFuture<Vec<ToolPkgToolPermissionRequest>>;
+    /// Resolves an existing request once, using its exact chat and request identity.
+    fn respond(&self, chatId: String, requestId: String, result: ToolPkgToolPermissionDecision) -> JsFuture<()>;
+}
+/// Carries the complete pending snapshot after creation, resolution, timeout or cancellation.
+pub struct ToolPkgToolPermissionEventPayload {
+    pub requests: Vec<ToolPkgToolPermissionRequest>,
+}
+/// Names a pending approval snapshot notification.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum ToolPkgToolPermissionEventName {
+    #[serde(rename = "requests_changed")]
+    RequestsChanged,
+}
+/// Combines dispatch metadata with pending tool approvals.
+pub struct ToolPkgToolPermissionHookEvent {
+    pub base_hook_event_base:
+        ToolPkgHookEventBase<ToolPkgToolPermissionEventName, ToolPkgToolPermissionEventPayload>,
+}
+/// Registers a trusted approval presenter and replays the current pending snapshot.
+pub struct ToolPkgToolPermissionHookRegistration {
+    pub id: String,
+    pub function: Arc<dyn Fn(ToolPkgToolPermissionHookEvent) -> ToolPkgHookReturn + Send + Sync>,
+}
 /// Provides runtime and registration services for the current ToolPkg package.
 pub struct ToolPkgRegistry {
+    /// Observes and resolves tool approvals independently of their presentation surface.
+    pub toolPermissions: ToolPkgToolPermissionApi,
     /// Groups runtime presentation services for plugin-owned user interfaces.
     pub ui: ToolPkgUiApi,
     /// Exposes inter-context messaging for this ToolPkg registry.
@@ -3188,6 +3316,10 @@ pub trait ToolPkgRegistryMethods: Send + Sync {
     fn registerChatViewHook(&self, definition: ToolPkgChatViewHookRegistration) -> ();
     /// Registers a callback for persisted chat message notifications.
     fn registerChatMessageHook(&self, definition: ToolPkgChatMessageHookRegistration) -> ();
+    /// Registers an awaited text transformation before persistence.
+    fn registerMessageTransformHook(&self, definition: ToolPkgMessageTransformHookRegistration) -> ();
+    /// Prepares an ordered native display program once per message, outside the chunk loop.
+    fn registerMessageStreamTransform(&self, definition: ToolPkgMessageStreamTransformRegistration) -> ();
     /// Registers the sole awaited before-create hook for this package's own extension namespace.
     fn registerChatLifecycleHook(&self, definition: ToolPkgChatLifecycleHookRegistration) -> ();
     /// Registers a context-menu item for chat messages.
@@ -3216,6 +3348,8 @@ pub trait ToolPkgRegistryMethods: Send + Sync {
     ) -> ();
     /// Registers a callback for tool permission and execution stages.
     fn registerToolLifecycleHook(&self, definition: ToolPkgToolLifecycleHookRegistration) -> ();
+    /// Observes pending approval changes; enables the package's permission presentation API.
+    fn registerToolPermissionHook(&self, definition: ToolPkgToolPermissionHookRegistration) -> ();
     /// Registers a callback around user-input processing.
     fn registerPromptInputHook(&self, definition: ToolPkgPromptInputHookRegistration) -> ();
     /// Registers a callback around prompt-history preparation.
@@ -3278,4 +3412,126 @@ pub trait ToolPkgRegistryMethods: Send + Sync {
 pub struct ToolPkgRouteOptions {
     /// Zero-based position of the method's Binding key argument.
     pub binding: usize,
+}
+
+/// Names the message persistence boundary; display uses native program preparation.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum ToolPkgMessageTransformEventName {
+    #[serde(rename = "before_persist")]
+    BeforePersist,
+}
+/// Supplies one semantic text part without granting access to tool-call structure.
+pub struct ToolPkgMessageTransformPayload {
+    /// Identifies the actual conversation.
+    pub chatId: String,
+    /// Identifies the message revision being processed.
+    pub timestamp: f64,
+    /// Identifies the canonical source (user or ai).
+    pub sender: String,
+    /// Identifies the authenticated execution participant when available.
+    pub participantId: Option<String>,
+    /// Identifies this semantic part within the message.
+    pub partId: String,
+    /// Identifies markdown or thinking content.
+    pub kind: String,
+    /// Contains the complete current text, including explicit empty content.
+    pub text: String,
+    /// Counts conversational messages after this message, with zero for a new message.
+    pub depth: i32,
+    /// Reports a user edit rather than initial generation or display.
+    pub isEdit: bool,
+}
+/// Combines the transform stage with its typed text payload.
+pub struct ToolPkgMessageTransformHookEvent {
+    /// Carries the host-selected boundary and current text.
+    pub base_hook_event_base: ToolPkgHookEventBase<ToolPkgMessageTransformEventName, ToolPkgMessageTransformPayload>,
+}
+/// Returns replacement text or explicitly declines to transform it.
+pub enum ToolPkgMessageTransformHookOutput { Variant1(String), Null, Void }
+/// Accepts an immediate replacement or an awaited transformation.
+pub enum ToolPkgMessageTransformHookReturn {
+    Variant1(String), Null, Void,
+    Variant4(JsFuture<ToolPkgMessageTransformHookOutput>),
+}
+/// Registers one ordered text transformer owned by a package.
+pub struct ToolPkgMessageTransformHookRegistration {
+    /// Identifies this handler within its owner.
+    pub id: String,
+    /// Receives complete text and returns a replacement, null, or undefined.
+    pub function: Arc<dyn Fn(ToolPkgMessageTransformHookEvent) -> ToolPkgMessageTransformHookReturn + Send + Sync>,
+}
+
+/// Supplies one immutable message context within a display preparation batch.
+pub struct ToolPkgMessageStreamTransformContext {
+    /// Identifies the canonical message.
+    pub timestamp: f64,
+    /// Identifies the canonical sender.
+    pub sender: String,
+    /// Identifies the selected participant when present.
+    pub participantId: Option<String>,
+    /// Counts later conversational messages.
+    pub depth: i32,
+    /// Reports an explicit edit.
+    pub isEdit: bool,
+}
+/// Shares one configuration read across an ordered display window or one live message.
+pub struct ToolPkgMessageStreamTransformPayload {
+    /// Identifies the conversation shared by the batch.
+    pub chatId: String,
+    /// Preserves input order; each context requires one returned native program.
+    pub messages: Vec<ToolPkgMessageStreamTransformContext>,
+}
+/// Prepares a native program without receiving or retaining generated text.
+pub struct ToolPkgMessageStreamTransformEvent {
+    /// Carries the prepare_display boundary and immutable message context.
+    pub base_hook_event_base: ToolPkgHookEventBase<String, ToolPkgMessageStreamTransformPayload>,
+}
+/// Declares one native Rust-regex replacement for selected semantic text kinds.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPkgTextTransformRule {
+    /// Uses Rust regex syntax; unsupported assertions and empty matches are rejected.
+    pub pattern: String,
+    /// Expands $0, numbered captures and $<name>; literals remain literal.
+    pub replacement: String,
+    /// Selects g, i, m, s or u flags.
+    #[serde(default)]
+    pub flags: String,
+    /// Selects markdown, thinking, or both.
+    pub kinds: Vec<String>,
+    /// Removes literal substrings from each captured value.
+    #[serde(default)]
+    pub trimStrings: Vec<String>,
+}
+/// Executes ordered replacements entirely in Rust after plugin preparation.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPkgTextTransformProgram {
+    /// Applies rules in order with independent streaming state for each text part.
+    pub rules: Vec<ToolPkgTextTransformRule>,
+}
+/// Shares each distinct program once and assigns it to ordered message contexts.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPkgTextTransformBatch {
+    /// Contains the unique ordered replacement pipelines.
+    pub programs: Vec<ToolPkgTextTransformProgram>,
+    /// Selects one program index for each input context in order.
+    pub messagePrograms: Vec<u32>,
+}
+/// Returns shared native programs or declines the entire batch.
+pub enum ToolPkgMessageStreamTransformOutput {
+    Variant1(ToolPkgTextTransformBatch), Null, Void,
+}
+/// Accepts immediate or asynchronous preparation, never per-chunk callbacks.
+pub enum ToolPkgMessageStreamTransformReturn {
+    Variant1(ToolPkgTextTransformBatch), Null, Void,
+    Variant4(JsFuture<ToolPkgMessageStreamTransformOutput>),
+}
+/// Registers one package-owned native display-program preparer.
+pub struct ToolPkgMessageStreamTransformRegistration {
+    /// Identifies this preparer within its package.
+    pub id: String,
+    /// Resolves configuration and context once, before native matching begins.
+    pub function: Arc<dyn Fn(ToolPkgMessageStreamTransformEvent) -> ToolPkgMessageStreamTransformReturn + Send + Sync>,
 }

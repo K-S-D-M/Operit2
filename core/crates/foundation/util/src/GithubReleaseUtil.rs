@@ -1,19 +1,19 @@
-use operit_host_api::HostManager::{defaultHostRuntimeTaskSchedulerHost, defaultHttpHost};
+use crate::UpdateHttp::{request as requestUpdateHttp, requestOptional, UpdateHttpEvent};
+use operit_host_api::HostManager::{defaultHttpHost, HostManager};
 use operit_host_api::{
-    HttpDownloadControl, HttpDownloadFileRequest, HttpDownloadRequest, HttpRequestData,
+    ApplicationUpdatePackage, HttpDownloadControl, HttpRequestData, RuntimeStorageHost,
+    RuntimeStorageWriteSession, SystemOperationHost,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering as CmpOrdering;
 
 const GITHUB_RELEASE_OWNER: &str = "AAswordman";
 const GITHUB_RELEASE_REPO: &str = "Operit2";
+const GITHUB_PATCH_REPO: &str = "Operit2-nightly";
 const GITHUB_RELEASE_PAGE_SIZE: usize = 30;
-#[cfg(not(target_arch = "wasm32"))]
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
 #[derive(Debug, Clone, Default)]
@@ -28,7 +28,23 @@ pub struct ReleaseInfo {
     pub downloadUrl: String,
     pub releaseNotes: String,
     pub releasePageUrl: String,
+    pub packageSha256: Option<String>,
+    pub fullPackageAvailable: bool,
+    pub patchAssetNames: Vec<String>,
+    pub updateManifest: Option<ReleaseManifestAsset>,
 }
+
+/// GitHub-authenticated metadata for the selected package's incremental transfers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseManifestAsset {
+    pub name: String,
+    pub url: String,
+    pub digest: String,
+}
+
+#[cfg(test)]
+#[path = "GithubReleaseDownloadTests.rs"]
+mod downloadTests;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Product, platform, and architecture tuple used to select update assets.
@@ -37,6 +53,7 @@ pub struct FullUpdateTarget {
     pub platform: String,
     pub arch: String,
     macosInstallerType: Option<String>,
+    windowsMsi: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,12 +75,62 @@ pub enum FullUpdateProgressEvent {
         totalBytes: u64,
         speedBytesPerSec: u64,
     },
+    PreparationProgress {
+        phase: UpdatePreparationPhase,
+        completedBytes: u64,
+        totalBytes: u64,
+    },
+}
+
+/// Identifies measurable local work separately from network transfer progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePreparationPhase {
+    VerifyingBase,
+    VerifyingPatch,
+    ExpandingBase,
+    VerifyingExpandedBase,
+    ApplyingPatch,
+    RestoringPackage,
+    VerifyingPackage,
+    SavingPackage,
+}
+
+impl UpdatePreparationPhase {
+    /// Exposes stable phase identifiers to all clients without platform inference.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifyingBase => "verifying_base",
+            Self::VerifyingPatch => "verifying_patch",
+            Self::ExpandingBase => "expanding_base",
+            Self::VerifyingExpandedBase => "verifying_expanded_base",
+            Self::ApplyingPatch => "applying_patch",
+            Self::RestoringPackage => "restoring_package",
+            Self::VerifyingPackage => "verifying_package",
+            Self::SavingPackage => "saving_package",
+        }
+    }
+
+    /// Names local stages for terminal clients without exposing container internals.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::VerifyingBase => "Verifying original package",
+            Self::VerifyingPatch => "Verifying update patch",
+            Self::ExpandingBase => "Preparing original package",
+            Self::VerifyingExpandedBase => "Verifying prepared files",
+            Self::ApplyingPatch => "Applying update patch",
+            Self::RestoringPackage => "Generating update package",
+            Self::VerifyingPackage => "Verifying update package",
+            Self::SavingPackage => "Saving update package",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// High-level stage of full update preparation.
 pub enum FullUpdateStage {
+    SelectingSource,
     DownloadingPackage,
+    ReconstructingPackage,
     Ready,
 }
 
@@ -107,6 +174,8 @@ struct GitHubRelease {
 struct GitHubReleaseAsset {
     name: String,
     browser_download_url: String,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 #[allow(non_snake_case)]
@@ -127,48 +196,23 @@ impl GithubReleaseUtil {
     ) -> Result<FullUpdateStatus, String> {
         let current = parseVersion(currentVersion)?;
         let channel = channelForCurrentVersion(&current);
-        let Some(releaseInfo) = Self::findLatestReleaseInfo(
-            GITHUB_RELEASE_OWNER,
-            GITHUB_RELEASE_REPO,
-            target,
-            channel,
-            authorizationHeader,
-        )
-        .await?
-        else {
-            return Ok(FullUpdateStatus::UpToDate);
-        };
-        if Self::compareVersions(&releaseInfo.version, currentVersion)? > 0 {
-            Ok(FullUpdateStatus::Available(releaseInfo))
-        } else {
-            Ok(FullUpdateStatus::UpToDate)
-        }
-    }
-
-    /// Checks GitHub releases synchronously for a newer full update.
-    pub fn checkForFullUpdateBlocking(
-        currentVersion: &str,
-        target: FullUpdateTarget,
-    ) -> Result<FullUpdateStatus, String> {
-        Self::checkForFullUpdateBlockingWithAuthHeader(currentVersion, target, None)
-    }
-
-    /// Checks GitHub releases synchronously with an explicit authorization header.
-    pub fn checkForFullUpdateBlockingWithAuthHeader(
-        currentVersion: &str,
-        target: FullUpdateTarget,
-        authorizationHeader: Option<String>,
-    ) -> Result<FullUpdateStatus, String> {
-        let current = parseVersion(currentVersion)?;
-        let channel = channelForCurrentVersion(&current);
-        let Some(releaseInfo) = Self::findLatestReleaseInfoBlocking(
-            GITHUB_RELEASE_OWNER,
-            GITHUB_RELEASE_REPO,
-            target,
-            channel,
-            authorizationHeader.as_deref(),
-        )?
-        else {
+        let (release, patches) = tokio::try_join!(
+            Self::findLatestReleaseInfo(
+                GITHUB_RELEASE_OWNER,
+                GITHUB_RELEASE_REPO,
+                target.clone(),
+                channel,
+                authorizationHeader.clone(),
+            ),
+            Self::findLatestReleaseInfo(
+                GITHUB_RELEASE_OWNER,
+                GITHUB_PATCH_REPO,
+                target,
+                channel,
+                authorizationHeader,
+            ),
+        )?;
+        let Some(releaseInfo) = mergeReleaseInfo(release, patches)? else {
             return Ok(FullUpdateStatus::UpToDate);
         };
         if Self::compareVersions(&releaseInfo.version, currentVersion)? > 0 {
@@ -210,6 +254,7 @@ impl GithubReleaseUtil {
         }
     }
 
+    /// Reads release pages asynchronously through the configured HTTP Host.
     async fn findLatestReleaseInfo(
         repoOwner: &str,
         repoName: &str,
@@ -217,47 +262,52 @@ impl GithubReleaseUtil {
         channel: FullUpdateChannel,
         authorizationHeader: Option<String>,
     ) -> Result<Option<ReleaseInfo>, String> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = repoOwner;
-            let _ = repoName;
-            let _ = target;
-            let _ = channel;
-            let _ = authorizationHeader;
-            return Err("full update release query is not available in wasm runtime".to_string());
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let owner = repoOwner.to_string();
-            let repo = repoName.to_string();
-            runHostBlocking(move || {
-                Self::findLatestReleaseInfoBlocking(
-                    &owner,
-                    &repo,
-                    target,
-                    channel,
-                    authorizationHeader.as_deref(),
-                )
-            })
-            .await?
-        }
+        let authorizationHeader = authorizationHeader.as_deref();
+        selectLatestReleaseInfoFromPages(&target, channel, |page| async move {
+            let url = format!(
+                "{GITHUB_API_BASE}/repos/{repoOwner}/{repoName}/releases?page={page}&per_page={GITHUB_RELEASE_PAGE_SIZE}"
+            );
+            let mut request = updateHttpRequest(&url, "GET");
+            request.headers = vec![
+                ("User-Agent".into(), "Operit-MCP-Client".into()),
+                ("Accept".into(), "application/vnd.github.v3+json".into()),
+            ];
+            if let Some(header) = authorizationHeader {
+                request.headers.push(("Authorization".into(), header.to_string()));
+            }
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let body = bytes.clone();
+            requestUpdateHttp(defaultHttpHost(), request, HttpDownloadControl::new(), move |event| {
+                if let UpdateHttpEvent::Bytes(chunk) = event {
+                    let mut bytes = body.lock().map_err(|error| error.to_string())?;
+                    if bytes.len().saturating_add(chunk.len()) > 16 * 1024 * 1024 {
+                        return Err("Release metadata exceeds the response size limit".into());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(())
+            }).await?;
+            let releases: Vec<GitHubRelease> = serde_json::from_slice(
+                &bytes.lock().map_err(|error| error.to_string())?
+            ).map_err(|error| error.to_string())?;
+            Ok(releases)
+        }).await.map_err(|error| format!("{repoOwner}/{repoName}: {error}"))
     }
 
-    /// Downloads a full update package asynchronously and reports progress.
+    /// Downloads into virtual runtime storage and returns its logical storage path.
     pub async fn downloadAndPrepareFullUpdateWithProgress<F>(
         packageUrl: String,
         packageFileName: String,
-        workDir: PathBuf,
+        context: &HostManager,
         onEvent: F,
-    ) -> Result<PathBuf, String>
+    ) -> Result<String, String>
     where
         F: Fn(FullUpdateProgressEvent) + Send + Sync + 'static,
     {
         Self::downloadAndPrepareFullUpdateControlled(
             packageUrl,
             packageFileName,
-            workDir,
+            context,
             HttpDownloadControl::new(),
             onEvent,
         )
@@ -268,23 +318,61 @@ impl GithubReleaseUtil {
     pub async fn downloadAndPrepareFullUpdateControlled<F>(
         packageUrl: String,
         packageFileName: String,
-        workDir: PathBuf,
+        context: &HostManager,
         control: HttpDownloadControl,
         onEvent: F,
-    ) -> Result<PathBuf, String>
+    ) -> Result<String, String>
     where
         F: Fn(FullUpdateProgressEvent) + Send + Sync + 'static,
     {
-        runHostBlocking(move || {
-            Self::downloadAndPrepareFullUpdateControlledBlocking(
-                &packageUrl,
-                &packageFileName,
-                &workDir,
-                control,
-                onEvent,
-            )
-        })
-        .await?
+        validateUpdatePackageSource(&packageUrl, &packageFileName)?;
+        ensureDownloadActive(&control)?;
+        let storage = context
+            .runtimeStorageHost
+            .clone()
+            .ok_or("RuntimeStorageHost is required for updates")?;
+        let attempt = format!(
+            "{}/{}",
+            crate::RuntimeStorageLayout::RUNTIME_APPLICATION_UPDATES_DIR_PATH,
+            uuid::Uuid::new_v4()
+        );
+        if storage
+            .exists(&attempt)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("Update attempt storage path already exists".into());
+        }
+        let mut cleanup = DownloadAttempt {
+            storage,
+            path: attempt.clone(),
+            published: false,
+        };
+        let packageFile = format!("{attempt}/{packageFileName}");
+        let events = Arc::new(onEvent);
+        events(FullUpdateProgressEvent::StageChanged {
+            stage: FullUpdateStage::DownloadingPackage,
+            message: "Downloading full update package".into(),
+        });
+        ensureDownloadActive(&control)?;
+        let progress = events.clone();
+        downloadUpdatePackage(
+            &packageUrl,
+            &packageFile,
+            &packageFileName,
+            context,
+            control.clone(),
+            None,
+            move |event| progress(event),
+        )
+        .await?;
+        ensureDownloadActive(&control)?;
+        events(FullUpdateProgressEvent::StageChanged {
+            stage: FullUpdateStage::Ready,
+            message: "Full update package is ready".into(),
+        });
+        ensureDownloadActive(&control)?;
+        cleanup.published = true;
+        Ok(packageFile)
     }
 
     /// Compares two semantic versions.
@@ -300,178 +388,87 @@ impl GithubReleaseUtil {
         Ok(channelForCurrentVersion(&parseVersion(version)?))
     }
 
-    /// Fetches the latest release info synchronously for a target asset and channel.
-    pub fn fetchLatestReleaseInfoBlocking(
-        repoOwner: &str,
-        repoName: &str,
-        target: FullUpdateTarget,
-        channel: FullUpdateChannel,
-    ) -> Result<ReleaseInfo, String> {
-        Self::fetchLatestReleaseInfoBlockingWithAuthHeader(
-            repoOwner, repoName, target, channel, None,
-        )
-    }
-
-    /// Fetches the latest release info synchronously with an explicit authorization header.
-    pub fn fetchLatestReleaseInfoBlockingWithAuthHeader(
-        repoOwner: &str,
-        repoName: &str,
-        target: FullUpdateTarget,
-        channel: FullUpdateChannel,
-        authorizationHeader: Option<String>,
-    ) -> Result<ReleaseInfo, String> {
-        let targetAssetName = target.assetName()?;
-        match Self::findLatestReleaseInfoBlocking(
-            repoOwner,
-            repoName,
-            target,
-            channel,
-            authorizationHeader.as_deref(),
-        )? {
-            Some(releaseInfo) => Ok(releaseInfo),
-            None => Err(missingTargetAssetMessage(
-                repoOwner,
-                repoName,
-                channel,
-                &targetAssetName,
-            )),
-        }
-    }
-
-    /// Fetches release metadata through the configured Host HTTP capability.
-    fn findLatestReleaseInfoBlocking(
-        repoOwner: &str,
-        repoName: &str,
-        target: FullUpdateTarget,
-        channel: FullUpdateChannel,
-        authorizationHeader: Option<&str>,
-    ) -> Result<Option<ReleaseInfo>, String> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = repoOwner;
-            let _ = repoName;
-            let _ = target;
-            let _ = channel;
-            let _ = authorizationHeader;
-            return Err("full update release query is not available in wasm runtime".to_string());
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            selectLatestReleaseInfoFromPages(&target, channel, |page| {
-                let url = format!(
-                    "{GITHUB_API_BASE}/repos/{repoOwner}/{repoName}/releases?page={page}&per_page={GITHUB_RELEASE_PAGE_SIZE}"
-                );
-                let mut request = updateHttpRequest(&url, "GET");
-                request.headers = vec![
-                    ("User-Agent".into(), "Operit-MCP-Client".into()),
-                    ("Accept".into(), "application/vnd.github.v3+json".into()),
-                ];
-                if let Some(authHeader) = authorizationHeader {
-                    request
-                        .headers
-                        .push(("Authorization".into(), authHeader.into()));
-                }
-                let response = defaultHttpHost()
-                    .executeHttpRequest(request)
-                    .map_err(|error| error.to_string())?;
-                if !(200..300).contains(&response.statusCode) {
-                    return Err(format!(
-                        "HTTP {}: {}",
-                        response.statusCode, response.statusMessage
-                    ));
-                }
-                serde_json::from_slice::<Vec<GitHubRelease>>(&response.body)
-                    .map_err(|error| error.to_string())
-            })
-        }
-    }
-
-    /// Downloads a full update package synchronously and reports progress.
-    pub fn downloadAndPrepareFullUpdateBlocking<F>(
-        packageUrl: &str,
-        packageFileName: &str,
-        workDir: &Path,
-        onEvent: F,
-    ) -> Result<PathBuf, String>
-    where
-        F: Fn(FullUpdateProgressEvent) + Send + Sync + 'static,
-    {
-        Self::downloadAndPrepareFullUpdateControlledBlocking(
-            packageUrl,
-            packageFileName,
-            workDir,
-            HttpDownloadControl::new(),
-            onEvent,
-        )
-    }
-
-    /// Creates an isolated attempt directory, removes failed/partial files and only returns a verified package.
-    pub fn downloadAndPrepareFullUpdateControlledBlocking<F>(
-        packageUrl: &str,
-        packageFileName: &str,
-        workDir: &Path,
+    /// Loads one exact historical patch release through the caller's cancellable HTTP Host.
+    pub(crate) async fn fetchPatchRelease(
+        version: &str,
+        assetName: &str,
+        context: &HostManager,
         control: HttpDownloadControl,
-        onEvent: F,
-    ) -> Result<PathBuf, String>
-    where
-        F: Fn(FullUpdateProgressEvent) + Send + Sync + 'static,
-    {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = (packageUrl, packageFileName, workDir, control, onEvent);
-            Err("Native updates are unavailable in a browser".into())
+    ) -> Result<Option<ReleaseInfo>, String> {
+        parseVersion(version)?;
+        let url = format!("{GITHUB_API_BASE}/repos/{GITHUB_RELEASE_OWNER}/{GITHUB_PATCH_REPO}/releases/tags/v{version}");
+        let mut request = updateHttpRequest(&url, "GET");
+        request
+            .headers
+            .push(("Accept".into(), "application/vnd.github+json".into()));
+        let body = Arc::new(Mutex::new(Vec::new()));
+        let sink = body.clone();
+        let present = requestOptional(
+            context
+                .httpHost
+                .clone()
+                .ok_or("HttpHost is required for updates")?,
+            request,
+            control,
+            move |event| {
+                if let UpdateHttpEvent::Bytes(bytes) = event {
+                    let mut body = sink.lock().map_err(|error| error.to_string())?;
+                    if body.len().saturating_add(bytes.len()) > 4 * 1024 * 1024 {
+                        return Err("Historical release metadata exceeds size limit".into());
+                    }
+                    body.extend_from_slice(&bytes);
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        if !present {
+            return Ok(None);
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            validateUpdatePackageSource(packageUrl, packageFileName)?;
-            if control.isCancelled() {
-                return Err("UPDATE_CANCELLED".into());
-            }
-            fs::create_dir_all(workDir).map_err(|e| e.to_string())?;
-            let token = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_nanos();
-            let attempt = workDir.join(format!("{}-{token}", std::process::id()));
-            fs::create_dir(&attempt).map_err(|e| e.to_string())?;
-            let packageFile = attempt.join(packageFileName);
-            let events = Arc::new(onEvent);
-            let result = (|| {
-                events(FullUpdateProgressEvent::StageChanged {
-                    stage: FullUpdateStage::DownloadingPackage,
-                    message: "Downloading full update package".into(),
-                });
-                if control.isCancelled() {
-                    return Err("UPDATE_CANCELLED".into());
-                }
-                let totalBytes = fetchContentLength(packageUrl)?;
-                downloadUpdatePackage(packageUrl, &packageFile, totalBytes, control.clone(), {
-                    let events = events.clone();
-                    move |event| events(event)
-                })?;
-                if control.isCancelled() {
-                    return Err("UPDATE_CANCELLED".into());
-                }
-                if fs::metadata(&packageFile).map_err(|e| e.to_string())?.len() != totalBytes {
-                    return Err("Update package is incomplete".into());
-                }
-                validateDownloadedUpdatePackage(&packageFile, packageFileName)?;
-                events(FullUpdateProgressEvent::StageChanged {
-                    stage: FullUpdateStage::Ready,
-                    message: "Full update package is ready".into(),
-                });
-                Ok(packageFile)
-            })();
-            if result.is_err() || control.isCancelled() {
-                let _ = fs::remove_dir_all(attempt);
-            }
-            if control.isCancelled() {
-                return Err("UPDATE_CANCELLED".into());
-            }
-            result
+        let release: GitHubRelease =
+            serde_json::from_slice(&body.lock().map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        if release.draft {
+            return Ok(None);
         }
+        if release.tag_name != format!("v{version}") {
+            return Err("Historical release tag disagrees with requested version".into());
+        }
+        validateReleaseChannelMarker(&release, &parseVersion(version)?)?;
+        if !release
+            .assets
+            .iter()
+            .any(|asset| asset.name == format!("{assetName}.update.json"))
+        {
+            return Ok(None);
+        }
+        releaseInfo(release, assetName.to_owned()).map(Some)
     }
+}
+
+/// Combines matching-version installers and patches while preserving newer package-only releases.
+#[allow(non_snake_case)]
+fn mergeReleaseInfo(
+    release: Option<ReleaseInfo>,
+    patches: Option<ReleaseInfo>,
+) -> Result<Option<ReleaseInfo>, String> {
+    let (mut release, patches) = match (release, patches) {
+        (Some(release), Some(patches)) => (release, patches),
+        (only, None) | (None, only) => return Ok(only),
+    };
+    match GithubReleaseUtil::compareVersions(&release.version, &patches.version)? {
+        value if value < 0 => return Ok(Some(patches)),
+        value if value > 0 => return Ok(Some(release)),
+        _ => {}
+    }
+    if release.assetName != patches.assetName {
+        return Err("Update repositories disagree on the target package".into());
+    }
+    if patches.updateManifest.is_some() {
+        release.updateManifest = patches.updateManifest;
+        release.patchAssetNames = patches.patchAssetNames;
+    }
+    Ok(Some(release))
 }
 
 #[allow(non_snake_case)]
@@ -484,54 +481,39 @@ impl FullUpdateTarget {
             platform: platform.to_string(),
             arch: arch.to_string(),
             macosInstallerType: None,
+            windowsMsi: false,
         })
     }
 
-    /// Creates a CLI update target for the current host.
-    pub fn cliForCurrentHost() -> Result<Self, String> {
-        Self::new("cli", currentDesktopPlatform()?, currentDesktopArch()?)
+    /// Resolves installation identity through the local system host.
+    pub fn appForHost(host: &dyn SystemOperationHost) -> Result<Option<Self>, String> {
+        host.applicationUpdateTarget()
+            .map_err(|error| error.to_string())?
+            .map(Self::fromApplicationTarget)
+            .transpose()
     }
 
-    /// Resolves the installed app target in Rust; clients never choose platform/ABI/distribution.
-    pub fn appForCurrentHost() -> Result<Option<Self>, String> {
-        if cfg!(target_arch = "wasm32") || cfg!(target_os = "ios") || cfg!(target_env = "ohos") {
-            return Ok(None);
-        }
-        let platform = std::env::consts::OS;
-        if !matches!(platform, "android" | "macos" | "windows" | "linux") {
-            return Ok(None);
-        }
-        let arch = match (platform, std::env::consts::ARCH) {
-            ("android", "aarch64") => "arm64-v8a",
-            ("android", "arm") => "armeabi-v7a",
-            (_, arch) => arch,
-        };
-        let target = Self::app(platform, arch)?;
-        #[cfg(target_os = "macos")]
-        {
-            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-            let contents = executable
-                .parent()
-                .and_then(Path::parent)
-                .ok_or("Application bundle metadata is unavailable")?;
-            let metadata = std::process::Command::new("/usr/bin/plutil")
-                .args(["-extract", "OperitDistributionType", "raw", "-o", "-"])
-                .arg(contents.join("Info.plist"))
-                .output()
-                .map_err(|e| e.to_string())?;
-            if !metadata.status.success() {
-                return Err("Cannot read this macOS application's distribution metadata".into());
+    /// Maps host-owned package identities to the shared release naming rules.
+    pub fn fromApplicationTarget(
+        target: operit_host_api::ApplicationUpdateTarget,
+    ) -> Result<Self, String> {
+        match target.package {
+            ApplicationUpdatePackage::AndroidApk => Self::app("android", &target.arch),
+            ApplicationUpdatePackage::WindowsZip => Self::app("windows", &target.arch),
+            ApplicationUpdatePackage::WindowsMsi => {
+                let mut result = Self::app("windows", &target.arch)?;
+                if result.arch != "x86_64" {
+                    return Err("Windows MSI releases are only available for x86_64".into());
+                }
+                result.windowsMsi = true;
+                Ok(result)
             }
-            return target
-                .withMacosInstaller(String::from_utf8_lossy(&metadata.stdout).trim())
-                .map(Some);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(Some(target))
+            ApplicationUpdatePackage::LinuxTarGz => Self::app("linux", &target.arch),
+            ApplicationUpdatePackage::MacosPkg { buildType } => {
+                Self::app("macos", &target.arch)?.withMacosInstaller(&buildType)
+            }
         }
     }
-
     /// Creates an app update target for a platform and architecture.
     pub fn app(platform: &str, arch: &str) -> Result<Self, String> {
         Self::new("app", platform, arch)
@@ -574,7 +556,11 @@ impl FullUpdateTarget {
             self.platform,
             arch,
             releaseVersion.trim().trim_start_matches('v'),
-            packageExtension(&self.product, &self.platform)?
+            if self.windowsMsi {
+                "msi"
+            } else {
+                packageExtension(&self.product, &self.platform)?
+            }
         ))
     }
 }
@@ -622,25 +608,6 @@ fn packageExtension(product: &str, platform: &str) -> Result<&'static str, Strin
         ("app", "windows" | "macos" | "ios") | ("cli", "windows") => Ok("zip"),
         ("app", "linux") | ("cli", "linux" | "macos") => Ok("tar.gz"),
         _ => Err(format!("Unsupported update target: {product}/{platform}")),
-    }
-}
-
-#[allow(non_snake_case)]
-fn currentDesktopPlatform() -> Result<&'static str, String> {
-    match std::env::consts::OS {
-        "windows" => Ok("windows"),
-        "linux" => Ok("linux"),
-        "macos" => Ok("macos"),
-        other => Err(format!("Unsupported desktop update platform: {other}")),
-    }
-}
-
-#[allow(non_snake_case)]
-fn currentDesktopArch() -> Result<&'static str, String> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok("x86_64"),
-        "aarch64" => Ok("aarch64"),
-        other => Err(format!("Unsupported desktop update arch: {other}")),
     }
 }
 
@@ -867,14 +834,18 @@ fn validateReleaseChannelMarker(
 
 /// Loads older release pages only until a compatible target package is found.
 #[allow(non_snake_case)]
-fn selectLatestReleaseInfoFromPages(
+async fn selectLatestReleaseInfoFromPages<F, Fut>(
     target: &FullUpdateTarget,
     channel: FullUpdateChannel,
-    mut fetchPage: impl FnMut(u32) -> Result<Vec<GitHubRelease>, String>,
-) -> Result<Option<ReleaseInfo>, String> {
+    mut fetchPage: F,
+) -> Result<Option<ReleaseInfo>, String>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<GitHubRelease>, String>>,
+{
     let mut page = 1;
     loop {
-        let batch = fetchPage(page)?;
+        let batch = fetchPage(page).await?;
         let isLastPage = batch.len() < GITHUB_RELEASE_PAGE_SIZE;
         if let Some(release) = selectLatestReleaseInfo(batch, target, channel)? {
             return Ok(Some(release));
@@ -886,25 +857,28 @@ fn selectLatestReleaseInfoFromPages(
     }
 }
 
-/// Selects the newest release containing the exact target asset.
+/// Selects the newest release containing the exact full asset or its authenticated manifest.
 #[allow(non_snake_case)]
 fn selectLatestReleaseInfo(
     releases: Vec<GitHubRelease>,
     target: &FullUpdateTarget,
     channel: FullUpdateChannel,
 ) -> Result<Option<ReleaseInfo>, String> {
-    let mut selected: Option<(ParsedVersion, GitHubRelease, GitHubReleaseAsset)> = None;
+    let mut selected: Option<(ParsedVersion, GitHubRelease, String)> = None;
     for release in releases {
         if release.draft {
             continue;
         }
         let expectedAssetName = target.assetNameForVersion(&release.tag_name)?;
-        let Some(packageAsset) = release
+        let hasPackage = release
             .assets
             .iter()
-            .find(|asset| asset.name == expectedAssetName)
-            .cloned()
-        else {
+            .any(|asset| asset.name == expectedAssetName);
+        let hasManifest = release
+            .assets
+            .iter()
+            .any(|asset| asset.name == format!("{expectedAssetName}.update.json"));
+        if !hasPackage && !hasManifest {
             continue;
         };
         let parsed = parseVersion(&release.tag_name)?;
@@ -919,18 +893,60 @@ fn selectLatestReleaseInfo(
             None => true,
         };
         if replace {
-            selected = Some((parsed, release, packageAsset));
+            selected = Some((parsed, release, expectedAssetName));
         }
     }
-    Ok(
-        selected.map(|(_, latestRelease, packageAsset)| ReleaseInfo {
-            version: latestRelease.tag_name.trim_start_matches('v').to_string(),
-            assetName: packageAsset.name.clone(),
-            downloadUrl: packageAsset.browser_download_url.clone(),
-            releaseNotes: latestRelease.body.unwrap_or_default(),
-            releasePageUrl: latestRelease.html_url,
-        }),
-    )
+    selected
+        .map(|(_, release, assetName)| releaseInfo(release, assetName))
+        .transpose()
+}
+
+/// Converts a validated release and exact platform asset into authenticated transfer metadata.
+#[allow(non_snake_case)]
+fn releaseInfo(latestRelease: GitHubRelease, assetName: String) -> Result<ReleaseInfo, String> {
+    let packageAsset = latestRelease
+        .assets
+        .iter()
+        .find(|asset| asset.name == assetName);
+    let manifestName = format!("{assetName}.update.json");
+    let updateManifest = latestRelease
+        .assets
+        .iter()
+        .find(|asset| asset.name == manifestName)
+        .map(|asset| ReleaseManifestAsset {
+            name: asset.name.clone(),
+            url: asset.browser_download_url.clone(),
+            digest: asset.digest.clone().unwrap_or_default(),
+        });
+    let downloadUrl = match packageAsset {
+        Some(asset) => asset.browser_download_url.clone(),
+        None => updateManifest
+            .as_ref()
+            .ok_or("Update manifest is missing")?
+            .url
+            .strip_suffix(".update.json")
+            .ok_or("Invalid manifest asset download URL")?
+            .to_owned(),
+    };
+    let patchPrefix = format!("{assetName}.from-");
+    Ok(ReleaseInfo {
+        version: latestRelease.tag_name.trim_start_matches('v').to_string(),
+        assetName,
+        downloadUrl,
+        releaseNotes: latestRelease.body.unwrap_or_default(),
+        releasePageUrl: latestRelease.html_url,
+        packageSha256: packageAsset.and_then(|asset| asset.digest.clone()),
+        fullPackageAvailable: packageAsset.is_some(),
+        patchAssetNames: latestRelease
+            .assets
+            .iter()
+            .filter(|asset| {
+                asset.name.starts_with(&patchPrefix) && asset.name.ends_with(".patch.gz")
+            })
+            .map(|asset| asset.name.clone())
+            .collect(),
+        updateManifest,
+    })
 }
 
 #[allow(non_snake_case)]
@@ -952,30 +968,39 @@ impl std::fmt::Display for FullUpdateChannel {
     }
 }
 
-/// Executes synchronous update orchestration on the configured Host blocking capacity.
-async fn runHostBlocking<T: Send + 'static>(
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, String> {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    defaultHostRuntimeTaskSchedulerHost()
-        .scheduleHostRuntimeTask(
-            "full-update",
-            Box::new(move || {
-                let _ = sender.send(work());
-            }),
-        )
-        .map_err(|error| error.to_string())?;
-    receiver
-        .await
-        .map_err(|error| format!("full update task stopped: {error}"))
+/// Rejects cancellation before opening or publishing a package.
+pub(crate) fn ensureDownloadActive(control: &HttpDownloadControl) -> Result<(), String> {
+    if control.isCancelled() {
+        Err("UPDATE_CANCELLED".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) struct DownloadAttempt {
+    pub(crate) storage: Arc<dyn RuntimeStorageHost>,
+    pub(crate) path: String,
+    pub(crate) published: bool,
+}
+impl Drop for DownloadAttempt {
+    /// Removes only this attempt on errors, cancellation or a dropped future.
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = self.storage.delete(&self.path, true);
+        }
+    }
 }
 
 /// Validates the release source before creating a native file. Shared by app and CLI downloads.
-fn validateUpdatePackageSource(url: &str, name: &str) -> Result<(), String> {
+pub(crate) fn validateUpdatePackageSource(url: &str, name: &str) -> Result<(), String> {
     validatePackageFileName(name)?;
-    let prefix = "https://github.com/AAswordman/Operit2/releases/download/";
-    let path = url
-        .strip_prefix(prefix)
+    let path = [GITHUB_RELEASE_REPO, GITHUB_PATCH_REPO]
+        .iter()
+        .find_map(|repo| {
+            url.strip_prefix(&format!(
+                "https://github.com/{GITHUB_RELEASE_OWNER}/{repo}/releases/download/"
+            ))
+        })
         .ok_or("Update URL must reference this project's HTTPS release assets")?;
     let (tag, asset) = path.split_once('/').ok_or("Missing release tag/asset")?;
     if tag.is_empty() || asset != name || !name.starts_with("operit2-") || name.contains(['?', '#'])
@@ -986,21 +1011,22 @@ fn validateUpdatePackageSource(url: &str, name: &str) -> Result<(), String> {
 }
 
 /// Rejects HTML error pages and mismatched archives before any installer sees them.
-#[cfg(not(target_arch = "wasm32"))]
-fn validateDownloadedUpdatePackage(path: &Path, name: &str) -> Result<(), String> {
-    use std::io::Read;
-    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut prefix = [0; 4];
-    file.read_exact(&mut prefix).map_err(|e| e.to_string())?;
+pub(crate) fn validateDownloadedUpdatePackage(prefix: &[u8], name: &str) -> Result<(), String> {
+    let length = if name.ends_with(".msi") { 8 } else { 4 };
+    if prefix.len() < length {
+        return Err("Downloaded update package is too short".into());
+    }
     let valid = if name.ends_with(".pkg") {
-        prefix == *b"xar!"
-    } else if name.ends_with(".tar.gz") {
+        prefix[..4] == *b"xar!"
+    } else if name.ends_with(".msi") {
+        prefix[..8] == [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]
+    } else if name.ends_with(".tar.gz") || name.ends_with(".patch.gz") {
         prefix[..2] == [0x1f, 0x8b]
     } else if [".zip", ".apk", ".hap", ".ipa"]
         .iter()
         .any(|ext| name.ends_with(ext))
     {
-        prefix == *b"PK\x03\x04"
+        prefix[..4] == *b"PK\x03\x04"
     } else {
         false
     };
@@ -1012,7 +1038,7 @@ fn validateDownloadedUpdatePackage(path: &Path, name: &str) -> Result<(), String
 }
 
 /// Builds update network policy once for requests routed through Host HTTP.
-fn updateHttpRequest(url: &str, method: &str) -> HttpRequestData {
+pub(crate) fn updateHttpRequest(url: &str, method: &str) -> HttpRequestData {
     HttpRequestData {
         url: url.into(),
         method: method.into(),
@@ -1029,97 +1055,270 @@ fn updateHttpRequest(url: &str, method: &str) -> HttpRequestData {
     }
 }
 
-/// Requires an explicit package length before publishing download progress.
-fn fetchContentLength(url: &str) -> Result<u64, String> {
-    let response = defaultHttpHost()
-        .executeHttpRequest(updateHttpRequest(url, "HEAD"))
-        .map_err(|error| error.to_string())?;
-    if !(200..300).contains(&response.statusCode) {
-        return Err(format!(
-            "HTTP {}: {}",
-            response.statusCode, response.statusMessage
-        ));
+struct StagedUpdate {
+    writer: Option<Box<dyn RuntimeStorageWriteSession>>,
+    prefix: Vec<u8>,
+    received: u64,
+    total: u64,
+    hash: Sha256,
+}
+impl Drop for StagedUpdate {
+    /// Explicitly discards uncommitted data on every Host, including browser storage.
+    fn drop(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.discard();
+        }
     }
-    let length = response
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .ok_or("Update response has no Content-Length")?
-        .1
-        .parse::<u64>()
-        .map_err(|error| error.to_string())?;
-    if length == 0 {
-        return Err("Update package Content-Length must be positive".into());
-    }
-    Ok(length)
 }
 
-/// Downloads on the shared Host network pool and derives progress from received bytes.
-fn downloadUpdatePackage<F>(
+/// Commits complete transfers; signed containers receive header checks and patches are verified during reconstruction.
+pub(crate) async fn downloadUpdatePackage<F>(
     url: &str,
-    out: &Path,
-    totalBytes: u64,
+    out: &str,
+    name: &str,
+    context: &HostManager,
     control: HttpDownloadControl,
+    expectedHash: Option<&str>,
     onEvent: F,
 ) -> Result<(), String>
 where
     F: Fn(FullUpdateProgressEvent) + Send + Sync + 'static,
 {
-    let path = out
-        .to_str()
-        .ok_or("Update package path must be UTF-8")?
-        .to_owned();
+    downloadPackageResource(
+        url,
+        out,
+        name,
+        context,
+        control,
+        false,
+        expectedHash,
+        onEvent,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Downloads an optional patch while distinguishing removal from failed transfers.
+pub(crate) async fn downloadOptionalUpdatePackage<F>(
+    url: &str,
+    out: &str,
+    name: &str,
+    context: &HostManager,
+    control: HttpDownloadControl,
+    expectedHash: Option<&str>,
+    onEvent: F,
+) -> Result<bool, String>
+where
+    F: Fn(FullUpdateProgressEvent) + Send + Sync + 'static,
+{
+    downloadPackageResource(
+        url,
+        out,
+        name,
+        context,
+        control,
+        true,
+        expectedHash,
+        onEvent,
+    )
+    .await
+}
+
+/// Selects the fastest measured source and discards failed attempts before trying the next one.
+async fn downloadPackageResource<F>(
+    url: &str,
+    out: &str,
+    name: &str,
+    context: &HostManager,
+    control: HttpDownloadControl,
+    optional: bool,
+    expectedHash: Option<&str>,
+    onEvent: F,
+) -> Result<bool, String>
+where
+    F: Fn(FullUpdateProgressEvent) + Send + Sync + 'static,
+{
     let events = Arc::new(onEvent);
-    let progressEvents = events.clone();
-    let scheduler = defaultHostRuntimeTaskSchedulerHost();
-    let now = scheduler
+    let selecting = || {
+        events(FullUpdateProgressEvent::StageChanged {
+            stage: FullUpdateStage::SelectingSource,
+            message: "Automatically selecting a download source".into(),
+        })
+    };
+    selecting();
+    let sources =
+        crate::UpdateSources::ranked(url, name, context, control.clone(), optional).await?;
+    let mut lastError = None;
+    let mut absent = sources.is_empty();
+    for source in sources {
+        ensureDownloadActive(&control)?;
+        events(FullUpdateProgressEvent::StageChanged {
+            stage: FullUpdateStage::DownloadingPackage,
+            message: "Downloading update".into(),
+        });
+        let progress = events.clone();
+        match downloadPackageFromSource(
+            &source,
+            out,
+            name,
+            context,
+            control.clone(),
+            optional,
+            expectedHash,
+            move |event| progress(event),
+        )
+        .await
+        {
+            Ok(true) => return Ok(true),
+            Ok(false) => absent = true,
+            Err(error) => {
+                ensureDownloadActive(&control)?;
+                crate::AppLogger::AppLogger::w(
+                    "ApplicationUpdate",
+                    &format!("Download source failed: {source}: {error}"),
+                );
+                lastError = Some(error);
+            }
+        }
+        selecting();
+    }
+    ensureDownloadActive(&control)?;
+    if let Some(error) = lastError {
+        return Err(error);
+    }
+    if optional && absent {
+        return Ok(false);
+    }
+    Err("No download source could provide the update".into())
+}
+
+/// Streams one resource transactionally and commits only a complete response.
+async fn downloadPackageFromSource<F>(
+    url: &str,
+    out: &str,
+    name: &str,
+    context: &HostManager,
+    control: HttpDownloadControl,
+    optional: bool,
+    expectedHash: Option<&str>,
+    onEvent: F,
+) -> Result<bool, String>
+where
+    F: Fn(FullUpdateProgressEvent) + Send + Sync + 'static,
+{
+    let writes = context
+        .runtimeStorageWriteHost
+        .as_ref()
+        .ok_or("RuntimeStorageWriteHost is required for updates")?;
+    let http = context
+        .httpHost
+        .clone()
+        .ok_or("HttpHost is required for updates")?;
+    let scheduler = context
+        .hostRuntimeTaskSchedulerHost
+        .clone()
+        .ok_or("Host clock is required for updates")?;
+    let state = Arc::new(Mutex::new(StagedUpdate {
+        writer: Some(
+            writes
+                .createWriteSession(out)
+                .map_err(|error| error.to_string())?,
+        ),
+        prefix: Vec::with_capacity(8),
+        received: 0,
+        total: 0,
+        hash: Sha256::new(),
+    }));
+    let sink = state.clone();
+    let mut lastTime = scheduler
         .monotonicTimeMillis()
         .map_err(|error| error.to_string())?;
-    let clock = std::sync::Mutex::new((now, 0u64));
-    defaultHttpHost()
-        .downloadFiles(
-            HttpDownloadRequest {
-                downloadId: format!("full-update:{path}"),
-                files: vec![HttpDownloadFileRequest {
-                    fileId: "package".into(),
-                    url: url.into(),
-                    targetPath: path,
-                    headers: vec![("User-Agent".into(), "Operit".into())],
-                    expectedBytes: totalBytes,
-                }],
-                maxConcurrency: 1,
-                connectTimeoutSeconds: 30,
-                readTimeoutSeconds: 120,
-                followRedirects: true,
-                ignoreSsl: false,
-                proxyHost: String::new(),
-                proxyPort: 0,
-            },
-            control,
-            Arc::new(move |progress| {
-                let mut clock = clock
-                    .lock()
-                    .expect("update progress clock must not be poisoned");
+    let active = control.clone();
+    let consume = move |event| {
+        ensureDownloadActive(&active)?;
+        let mut state = sink.lock().map_err(|error| error.to_string())?;
+        match event {
+            UpdateHttpEvent::Head(head) => {
+                state.total = head
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .ok_or("Update response has no Content-Length")?
+                    .1
+                    .parse::<u64>()
+                    .map_err(|error| error.to_string())?;
+                if state.total == 0 {
+                    return Err("Update package Content-Length must be positive".into());
+                }
+            }
+            UpdateHttpEvent::Bytes(bytes) => {
+                let next = state
+                    .received
+                    .checked_add(bytes.len() as u64)
+                    .ok_or("Update byte count overflow")?;
+                if next > state.total {
+                    return Err("Update package exceeds Content-Length".into());
+                }
+                state
+                    .writer
+                    .as_mut()
+                    .expect("active update session")
+                    .writeChunk(&bytes)
+                    .map_err(|error| error.to_string())?;
+                state.hash.update(&bytes);
+                let prefixBytes = bytes.len().min(8 - state.prefix.len());
+                state.prefix.extend_from_slice(&bytes[..prefixBytes]);
                 let now = scheduler
                     .monotonicTimeMillis()
-                    .expect("validated Host monotonic clock must remain available");
-                let elapsed = now.saturating_sub(clock.0).max(1);
-                let speed = progress
-                    .downloadedBytes
-                    .saturating_sub(clock.1)
-                    .saturating_mul(1000)
-                    / elapsed;
-                *clock = (now, progress.downloadedBytes);
-                drop(clock);
-                progressEvents(FullUpdateProgressEvent::DownloadProgress {
-                    readBytes: progress.downloadedBytes,
-                    totalBytes: progress.totalBytes,
+                    .map_err(|error| error.to_string())?;
+                let speed = (next - state.received).saturating_mul(1000)
+                    / now.saturating_sub(lastTime).max(1);
+                lastTime = now;
+                state.received = next;
+                let event = FullUpdateProgressEvent::DownloadProgress {
+                    readBytes: state.received,
+                    totalBytes: state.total,
                     speedBytesPerSec: speed,
-                });
-            }),
-        )
+                };
+                drop(state);
+                onEvent(event);
+            }
+        }
+        Ok(())
+    };
+    let mut request = updateHttpRequest(url, "GET");
+    request.connectTimeoutSeconds = 8;
+    request.readTimeoutSeconds = 15;
+    request
+        .headers
+        .push(("Accept-Encoding".into(), "identity".into()));
+    let present = if optional {
+        crate::UpdateHttp::requestOptional(http, request, control.clone(), consume).await?
+    } else {
+        requestUpdateHttp(http, request, control.clone(), consume).await?;
+        true
+    };
+    ensureDownloadActive(&control)?;
+    if !present {
+        return Ok(false);
+    }
+    let mut state = state.lock().map_err(|error| error.to_string())?;
+    if state.received != state.total || state.total == 0 {
+        return Err("Update package is incomplete".into());
+    }
+    validateDownloadedUpdatePackage(&state.prefix, name)?;
+    if let Some(expectedHash) = expectedHash {
+        if format!("{:x}", state.hash.clone().finalize()) != expectedHash {
+            return Err("UPDATE_INTEGRITY: downloaded update SHA-256 mismatch".into());
+        }
+    }
+    state
+        .writer
+        .take()
+        .expect("active update session")
+        .commit()
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1138,6 +1337,15 @@ mod tests {
             name
         )
         .is_ok());
+        assert!(super::validateUpdatePackageSource(
+            &format!("https://github.com/AAswordman/Operit2-nightly/releases/download/v2.0.0/{name}.update.json"),
+            &format!("{name}.update.json")
+        ).is_ok());
+        assert!(super::validateUpdatePackageSource(
+            &format!("https://github.com/other/Operit2-nightly/releases/download/v2.0.0/{name}"),
+            name
+        )
+        .is_err());
         assert!(super::validateUpdatePackageSource("https://evil.example/install", name).is_err());
         assert!(super::validateUpdatePackageSource(
             "https://github.com/AAswordman/Operit2/releases/download/v2/a",
@@ -1150,63 +1358,18 @@ mod tests {
         )
         .is_err());
     }
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn shared_package_validation_rejects_html_and_accepts_native_headers() {
-        let path = std::env::temp_dir().join(format!("operit-header-test-{}", std::process::id()));
         for (name, header) in [
             ("app.pkg", &b"xar!"[..]),
             ("cli.tar.gz", &b"\x1f\x8bxx"[..]),
             ("app.apk", &b"PK\x03\x04"[..]),
+            ("app.msi", &b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"[..]),
         ] {
-            std::fs::write(&path, b"<html>error</html>").unwrap();
-            assert!(super::validateDownloadedUpdatePackage(&path, name).is_err());
-            std::fs::write(&path, header).unwrap();
-            super::validateDownloadedUpdatePackage(&path, name).unwrap();
+            assert!(super::validateDownloadedUpdatePackage(b"<html>error</html>", name).is_err());
+            assert!(super::validateDownloadedUpdatePackage(b"", name).is_err());
+            super::validateDownloadedUpdatePackage(header, name).unwrap();
         }
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn cancelled_attempt_preserves_other_tasks_and_cleans_its_directory() {
-        let root = std::env::temp_dir().join(format!("operit-cancel-test-{}", std::process::id()));
-        let other = root.join("other-task");
-        std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join("keep"), b"other update").unwrap();
-        let control = operit_host_api::HttpDownloadControl::new();
-        let cancel = control.clone();
-        let name = "operit2-app-linux-x86_64-2.0.0.tar.gz";
-        let result = GithubReleaseUtil::downloadAndPrepareFullUpdateControlledBlocking(
-            &format!("https://github.com/AAswordman/Operit2/releases/download/v2.0.0/{name}"),
-            name,
-            &root,
-            control,
-            move |_| cancel.cancel(),
-        );
-        assert_eq!(result.unwrap_err(), "UPDATE_CANCELLED");
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
-        assert_eq!(std::fs::read(other.join("keep")).unwrap(), b"other update");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn already_cancelled_download_creates_no_files() {
-        let root =
-            std::env::temp_dir().join(format!("operit-precancel-test-{}", std::process::id()));
-        let control = operit_host_api::HttpDownloadControl::new();
-        control.cancel();
-        let name = "operit2-app-linux-x86_64-2.0.0.tar.gz";
-        let result = GithubReleaseUtil::downloadAndPrepareFullUpdateControlledBlocking(
-            &format!("https://github.com/AAswordman/Operit2/releases/download/v2.0.0/{name}"),
-            name,
-            &root,
-            control,
-            |_| {},
-        );
-        assert_eq!(result.unwrap_err(), "UPDATE_CANCELLED");
-        assert!(!root.exists());
     }
 
     #[test]
@@ -1243,7 +1406,7 @@ mod tests {
                     .is_none()
             );
         }
-        assert!(FullUpdateTarget::cliForCurrentHost()
+        assert!(FullUpdateTarget::new("cli", "linux", "x86_64")
             .unwrap()
             .withMacosInstaller("sandbox")
             .is_err());
@@ -1266,30 +1429,85 @@ mod tests {
                 .identifiers
                 .is_empty(),
             assets: vec![GitHubReleaseAsset {
+                digest: None,
                 name: target.assetNameForVersion(version).unwrap(),
                 browser_download_url: "https://example.com/update".to_string(),
             }],
         }
     }
 
-    /// Finds a compatible older release beyond a full page of other architectures.
+    /// Keeps MSI-managed apps on MSI assets even when a newer ZIP release exists.
     #[test]
-    fn finds_older_target_package_on_next_page() {
+    fn windows_installation_identity_selects_the_exact_package_format() {
+        use operit_host_api::{ApplicationUpdatePackage, ApplicationUpdateTarget};
+        let msi = FullUpdateTarget::fromApplicationTarget(ApplicationUpdateTarget {
+            installTiming: operit_host_api::AppInstallTiming::Immediate,
+            arch: "x86_64".into(),
+            package: ApplicationUpdatePackage::WindowsMsi,
+        })
+        .unwrap();
+        let zip = FullUpdateTarget::fromApplicationTarget(ApplicationUpdateTarget {
+            installTiming: operit_host_api::AppInstallTiming::Immediate,
+            arch: "x86_64".into(),
+            package: ApplicationUpdatePackage::WindowsZip,
+        })
+        .unwrap();
+        let releases = vec![
+            release_for_target("2.0.0-preview.32", &zip),
+            release_for_target("2.0.0-preview.31", &msi),
+        ];
+        let selected = selectLatestReleaseInfo(releases.clone(), &msi, FullUpdateChannel::Preview)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.assetName,
+            "operit2-app-windows-x86_64-2.0.0-preview.31.msi"
+        );
+        assert_eq!(
+            selectLatestReleaseInfo(releases, &zip, FullUpdateChannel::Preview)
+                .unwrap()
+                .unwrap()
+                .version,
+            "2.0.0-preview.32"
+        );
+        assert!(selectLatestReleaseInfo(
+            vec![release_for_target("2.0.0-preview.32", &zip)],
+            &msi,
+            FullUpdateChannel::Preview
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            FullUpdateTarget::fromApplicationTarget(ApplicationUpdateTarget {
+                installTiming: operit_host_api::AppInstallTiming::Immediate,
+                arch: "aarch64".into(),
+                package: ApplicationUpdatePackage::WindowsMsi,
+            })
+            .is_err()
+        );
+    }
+
+    /// Finds a compatible older release beyond a full page of other architectures.
+    #[tokio::test]
+    async fn finds_older_target_package_on_next_page() {
         let target = FullUpdateTarget::new("app", "windows", "aarch64").unwrap();
         let other = FullUpdateTarget::new("app", "windows", "x86_64").unwrap();
         let mut requested_pages = Vec::new();
         let selected =
             selectLatestReleaseInfoFromPages(&target, FullUpdateChannel::Preview, |page| {
-                requested_pages.push(page);
-                match page {
-                    1 => Ok(vec![
-                        release_for_target("2.0.0-preview.30", &other);
-                        GITHUB_RELEASE_PAGE_SIZE
-                    ]),
-                    2 => Ok(vec![release_for_target("2.0.0-preview.20", &target)]),
-                    _ => panic!("unexpected release page {page}"),
-                }
+                std::future::ready({
+                    requested_pages.push(page);
+                    match page {
+                        1 => Ok(vec![
+                            release_for_target("2.0.0-preview.30", &other);
+                            GITHUB_RELEASE_PAGE_SIZE
+                        ]),
+                        2 => Ok(vec![release_for_target("2.0.0-preview.20", &target)]),
+                        _ => panic!("unexpected release page {page}"),
+                    }
+                })
             })
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(requested_pages, vec![1, 2]);
@@ -1307,25 +1525,30 @@ mod tests {
     }
 
     /// Stops after the first matching page even when that page is full.
-    #[test]
-    fn stops_loading_pages_when_target_package_is_found() {
+    #[tokio::test]
+    async fn stops_loading_pages_when_target_package_is_found() {
         let target = FullUpdateTarget::new("cli", "linux", "aarch64").unwrap();
         let selected =
             selectLatestReleaseInfoFromPages(&target, FullUpdateChannel::Preview, |page| {
-                assert_eq!(page, 1, "older pages must not be fetched after a match");
-                let mut releases =
-                    vec![release_for_target("2.0.0-preview.9", &target); GITHUB_RELEASE_PAGE_SIZE];
-                releases[1] = release_for_target("2.0.0-preview.16", &target);
-                Ok(releases)
+                std::future::ready({
+                    assert_eq!(page, 1, "older pages must not be fetched after a match");
+                    let mut releases = vec![
+                        release_for_target("2.0.0-preview.9", &target);
+                        GITHUB_RELEASE_PAGE_SIZE
+                    ];
+                    releases[1] = release_for_target("2.0.0-preview.16", &target);
+                    Ok(releases)
+                })
             })
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(selected.version, "2.0.0-preview.16");
     }
 
     /// Loads older pages only when the installed channel rejects the current page.
-    #[test]
-    fn loads_older_pages_only_for_compatible_channel() {
+    #[tokio::test]
+    async fn loads_older_pages_only_for_compatible_channel() {
         let target = FullUpdateTarget::new("cli", "linux", "aarch64").unwrap();
         for (channel, expected, expected_pages) in [
             (FullUpdateChannel::Preview, "2.1.0-preview.1", vec![1]),
@@ -1333,16 +1556,19 @@ mod tests {
         ] {
             let mut requested_pages = Vec::new();
             let selected = selectLatestReleaseInfoFromPages(&target, channel, |page| {
-                requested_pages.push(page);
-                match page {
-                    1 => Ok(vec![
-                        release_for_target("2.1.0-preview.1", &target);
-                        GITHUB_RELEASE_PAGE_SIZE
-                    ]),
-                    2 => Ok(vec![release_for_target("2.0.1", &target)]),
-                    _ => panic!("unexpected release page {page}"),
-                }
+                std::future::ready({
+                    requested_pages.push(page);
+                    match page {
+                        1 => Ok(vec![
+                            release_for_target("2.1.0-preview.1", &target);
+                            GITHUB_RELEASE_PAGE_SIZE
+                        ]),
+                        2 => Ok(vec![release_for_target("2.0.1", &target)]),
+                        _ => panic!("unexpected release page {page}"),
+                    }
+                })
             })
+            .await
             .unwrap()
             .unwrap();
             assert_eq!(selected.version, expected);
@@ -1351,47 +1577,48 @@ mod tests {
     }
 
     /// Exhausts a full final page before reporting that no compatible package exists.
-    #[test]
-    fn returns_no_package_after_exhausting_pages() {
+    #[tokio::test]
+    async fn returns_no_package_after_exhausting_pages() {
         let target = FullUpdateTarget::new("app", "windows", "aarch64").unwrap();
         let other = FullUpdateTarget::new("cli", "windows", "aarch64").unwrap();
         let mut requested_pages = Vec::new();
         let selected =
             selectLatestReleaseInfoFromPages(&target, FullUpdateChannel::Preview, |page| {
-                requested_pages.push(page);
-                match page {
-                    1 => Ok(vec![
-                        release_for_target("2.0.0", &other);
-                        GITHUB_RELEASE_PAGE_SIZE
-                    ]),
-                    2 => Ok(Vec::new()),
-                    _ => panic!("unexpected release page {page}"),
-                }
+                std::future::ready({
+                    requested_pages.push(page);
+                    match page {
+                        1 => Ok(vec![
+                            release_for_target("2.0.0", &other);
+                            GITHUB_RELEASE_PAGE_SIZE
+                        ]),
+                        2 => Ok(Vec::new()),
+                        _ => panic!("unexpected release page {page}"),
+                    }
+                })
             })
+            .await
             .unwrap();
         assert_eq!(requested_pages, vec![1, 2]);
         assert!(selected.is_none());
     }
 
     /// Reports a network error encountered while loading a required older page.
-    #[test]
-    fn propagates_later_page_errors() {
+    #[tokio::test]
+    async fn propagates_later_page_errors() {
         let target = FullUpdateTarget::new("cli", "windows", "x86_64").unwrap();
         let other = FullUpdateTarget::new("cli", "windows", "aarch64").unwrap();
-        let error =
-            selectLatestReleaseInfoFromPages(
-                &target,
-                FullUpdateChannel::Preview,
-                |page| match page {
-                    1 => Ok(vec![
-                        release_for_target("2.0.0", &other);
-                        GITHUB_RELEASE_PAGE_SIZE
-                    ]),
-                    2 => Err("HTTP 403".to_string()),
-                    _ => panic!("unexpected release page {page}"),
-                },
-            )
-            .unwrap_err();
+        let error = selectLatestReleaseInfoFromPages(&target, FullUpdateChannel::Preview, |page| {
+            std::future::ready(match page {
+                1 => Ok(vec![
+                    release_for_target("2.0.0", &other);
+                    GITHUB_RELEASE_PAGE_SIZE
+                ]),
+                2 => Err("HTTP 403".to_string()),
+                _ => panic!("unexpected release page {page}"),
+            })
+        })
+        .await
+        .unwrap_err();
         assert_eq!(error, "HTTP 403");
     }
 
@@ -1456,6 +1683,7 @@ mod tests {
             draft: false,
             prerelease: true,
             assets: vec![GitHubReleaseAsset {
+                digest: None,
                 name: "operit2-cli-windows-x86_64-2.0.0-preview.1.zip".to_string(),
                 browser_download_url:
                     "https://github.com/AAswordman/Operit2/releases/download/v2.0.0-preview.1/operit2-cli-windows-x86_64-2.0.0-preview.1.zip"
@@ -1526,6 +1754,7 @@ mod tests {
                         draft: false,
                         prerelease: version == "2.0.0-preview.16",
                         assets: vec![GitHubReleaseAsset {
+                            digest: None,
                             name,
                             browser_download_url: "https://example.com/update".to_string(),
                         }],
@@ -1556,6 +1785,7 @@ mod tests {
                 draft: false,
                 prerelease: version != "2.0.0",
                 assets: vec![GitHubReleaseAsset {
+                    digest: None,
                     name: target.assetNameForVersion(version).unwrap(),
                     browser_download_url: "https://example.com/update".to_string(),
                 }],

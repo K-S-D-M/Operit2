@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use operit_model::FunctionType::FunctionType;
-use operit_model::ModelConfigData::{ProviderProfile, ResolvedModelConfig};
+use operit_model::ModelConfigData::{ModelCapabilities, ProviderProfile, ResolvedModelConfig};
 use operit_plugin_sdk::toolpkg::ToolPkgHooks::{ToolPkgAiProviderRegistration, decodeToolPkgHookResult};
 use operit_providers::runtime_support::{
     ChatConfigurationDisplayResult, ChatConfigurationPurpose, ChatConfigurationRequest, ChatConfigurationResult,
@@ -250,7 +250,7 @@ impl ChatConfigurationApi {
             tool_handler: self.toolHandler.clone(),
         };
         let binding = &request.defaultModelBinding;
-        let model = support.resolvedModelConfig(support.dataDir()?, &binding.providerId, &binding.modelId)?;
+        let model = support.resolvedModelConfig(&binding.providerId, &binding.modelId)?;
         if request.defaultTtsConfigId.trim().is_empty() {
             return Err("Model conversation speech configuration is empty".into());
         }
@@ -470,7 +470,7 @@ impl ProviderRuntimeSupport for RuntimeProviderSupport {
                                 bindingKey
                             };
                             let response = super::LocalLlmService::generateRoutedLocalLlm(
-                                storage,
+                                context,
                                 key,
                                 modelBinding,
                                 request.to_string(),
@@ -490,18 +490,6 @@ impl ProviderRuntimeSupport for RuntimeProviderSupport {
                 .await
                 .map_err(|error| format!("Local inference task ended: {error}"))?
         })
-    }
-
-    /// Returns the root directory used by runtime data.
-    fn dataDir(&self) -> Result<PathBuf, String> {
-        let context = self.tool_handler.getContext();
-        let storage = context
-            .runtimeStorageHost
-            .as_ref()
-            .ok_or("Provider runtime has no storage host")?;
-        storage
-            .runtimeRootDir()
-            .ok_or_else(|| "Provider runtime storage host has no data root".to_string())
     }
 
     /// Records provider/model token usage.
@@ -586,10 +574,9 @@ impl ProviderRuntimeSupport for RuntimeProviderSupport {
     /// Returns the model binding for a function.
     fn modelBindingForFunction(
         &self,
-        rootDir: PathBuf,
         functionType: FunctionType,
     ) -> Result<ProviderFunctionModelBinding, String> {
-        let binding = FunctionalConfigManager::new(rootDir)
+        let binding = FunctionalConfigManager::default()
             .getModelBindingForFunction(functionType)
             .map_err(|error| error.to_string())?;
         Ok(ProviderFunctionModelBinding {
@@ -601,12 +588,22 @@ impl ProviderRuntimeSupport for RuntimeProviderSupport {
     /// Returns the resolved model config for a provider/model pair.
     fn resolvedModelConfig(
         &self,
-        rootDir: PathBuf,
         providerId: &str,
         modelId: &str,
     ) -> Result<ResolvedModelConfig, String> {
-        ModelConfigManager::new(rootDir)
+        ModelConfigManager::default()
             .getResolvedModelConfig(providerId, modelId)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Describes existing auxiliary models without making missing bindings fatal to ordinary chat.
+    fn modelCapabilitiesForFunction(
+        &self,
+        functionType: FunctionType,
+    ) -> Result<Option<ModelCapabilities>, String> {
+        let binding = self.modelBindingForFunction(functionType)?;
+        ModelConfigManager::default()
+            .configuredModelCapabilities(&binding.providerId, &binding.modelId)
             .map_err(|error| error.to_string())
     }
 
@@ -631,12 +628,22 @@ impl ProviderRuntimeSupport for RuntimeProviderSupport {
     /// Returns a provider profile by id.
     fn providerProfile(
         &self,
-        rootDir: PathBuf,
         providerId: &str,
     ) -> Result<ProviderProfile, String> {
-        ModelConfigManager::new(rootDir)
+        ModelConfigManager::default()
             .getProviderProfile(providerId)
             .map_err(|error| error.to_string())
+    }
+
+    /// Atomically reserves a credential through the configuration store.
+    fn reserveProviderApiKey(&self, providerId: &str) -> Result<String, String> {
+        ModelConfigManager::default().reserveProviderApiKey(providerId).map_err(|error| error.to_string())
+    }
+
+    /// Updates the shared provider-wide health decision from a typed transport outcome.
+    fn reportProviderApiKey(&self, providerId: &str, key: &str, startedAt: i64,
+        outcome: operit_providers::chat::llmprovider::ApiKeyProvider::ApiKeyOutcome) -> Result<(), String> {
+        ModelConfigManager::default().reportProviderApiKey(providerId, key, startedAt, outcome).map_err(|error| error.to_string())
     }
 
     /// Returns whether a ToolPkg AI provider is registered.

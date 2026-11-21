@@ -1,7 +1,7 @@
 use crate::BridgeExports::*;
 use crate::BridgeExports::{last_create_error, panic_payload_message, set_last_create_error};
 use crate::OperitFlutterBridge;
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{JClass, JObject, JObjectArray, JString};
 use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
 use std::ffi::CStr;
@@ -10,6 +10,34 @@ use std::sync::Arc;
 
 #[path = "AndroidJniTaskScheduler.rs"]
 mod task_scheduler;
+
+/// Reuses the terminal identity boundary and replaces the Root VM with a shell-owned VM.
+#[no_mangle]
+pub unsafe extern "system" fn Java_app_operit_uiserver_UiServerMain_restartAsShell(
+    mut env: JNIEnv,
+    _class: JClass,
+    arguments: JObjectArray,
+) {
+    let result = (|| -> Result<(), String> {
+        let count = env
+            .get_array_length(&arguments)
+            .map_err(|error| error.to_string())?;
+        let mut decoded = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let argument = JString::from(
+                env.get_object_array_element(&arguments, index)
+                    .map_err(|error| error.to_string())?,
+            );
+            decoded.push(String::from(
+                env.get_string(&argument).map_err(|error| error.to_string())?,
+            ));
+        }
+        operit_host_android_native::androidExecShellProcess(&decoded).map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        let _ = env.throw_new("java/lang/SecurityException", error.to_string());
+    }
+}
 
 /// Runs process primitives in the privileged service without creating a Core runtime.
 #[no_mangle]
@@ -74,6 +102,7 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_create(
     _class: JClass,
     runtime_root: JString,
     workspace_root: JString,
+    archive_runtime_root: JString,
     device_model: JString,
     host: JObject,
 ) -> jlong {
@@ -91,6 +120,17 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_create(
             return 0;
         }
     };
+    let archive_runtime_root = match env.get_string(&archive_runtime_root) {
+        Ok(value) => PathBuf::from(String::from(value)),
+        Err(error) => {
+            set_last_create_error(format!("private archive storage root is invalid: {error}"));
+            return 0;
+        }
+    };
+    if !archive_runtime_root.is_absolute() {
+        set_last_create_error("Private archive storage root must be absolute".to_string());
+        return 0;
+    }
     let device_model: String = match env.get_string(&device_model) {
         Ok(value) => value.into(),
         Err(error) => {
@@ -123,7 +163,7 @@ pub unsafe extern "system" fn Java_app_operit_OperitRuntimeNative_create(
         return 0;
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        OperitFlutterBridge::new_with_storage_roots(runtime_root, workspace_root, device_model)
+        OperitFlutterBridge::new_with_storage_roots(runtime_root, workspace_root, archive_runtime_root, device_model)
     })) {
         Ok(Ok(bridge)) => {
             let installed = env

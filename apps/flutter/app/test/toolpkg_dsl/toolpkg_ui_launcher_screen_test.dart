@@ -23,11 +23,139 @@ import 'package:operit2/core/proxy/generated/CoreProxyModels.g.dart'
 import 'package:operit2/ui/features/packages/screens/ToolPkgUiLauncherScreen.dart';
 import 'package:operit2/ui/features/chat/components/MessageContextMenu.dart';
 import 'package:operit2/ui/main/navigation/AppNavigationModels.dart';
+import 'package:operit2/ui/main/MainLayoutController.dart';
+import 'package:operit2/ui/main/TopBarController.dart';
+import 'package:operit2/ui/main/components/AppContent.dart';
+import 'package:operit2/ui/main/layout/DrawerMotionScope.dart';
+import 'package:operit2/ui/main/screens/OperitScreens.dart';
 
 /// Verifies plugin rendering and message-menu integration through the Core bridge.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUpAll(ClientLogger.initialize);
+
+  testWidgets('retained plugin pages keep sessions through drawer navigation', (
+    tester,
+  ) async {
+    final topBar = TopBarController();
+    final layout = MainLayoutController();
+    final motion = ValueNotifier<bool>(false);
+    final activation = ValueNotifier<int>(0);
+    final router = AppRouterState(RouteEntry(routeId: 'characters'));
+    addTearDown(topBar.dispose);
+    addTearDown(layout.dispose);
+    addTearDown(motion.dispose);
+    addTearDown(activation.dispose);
+    addTearDown(router.dispose);
+    final charactersBridge = _ToolPkgDslTestBridge();
+    final memoryBridge = _ToolPkgDslTestBridge();
+    final screens = <String, OperitScreen>{
+      'characters': _RetainedPluginScreen('main', charactersBridge),
+      'memory': _RetainedPluginScreen('memory', memoryBridge),
+      'settings': const _RetainedSettingsScreen(),
+    };
+
+    /// Uses the production page cache and drawer motion scope for each selection.
+    Future<void> pumpPage() async {
+      await tester.pumpWidget(
+        OperitTheme(
+          initialThemePreferenceSnapshot:
+              UserPreferencesManager.defaultThemePreferenceSnapshot,
+          initialThemeIsReady: false,
+          unconfiguredChildEnabled: true,
+          hostInteractionHostsEnabled: false,
+          child: MainLayoutScope(
+            controller: layout,
+            child: TopBarScope(
+              controller: topBar,
+              child: Scaffold(
+                body: DrawerMotionScope(
+                  isAnimating: motion,
+                  contentActivation: activation,
+                  child: AppContent(
+                    routerState: router,
+                    currentScreen: screens[router.currentEntry.routeId]!,
+                    currentRouteEntry: router.currentEntry,
+                    currentRouteTitle: router.currentEntry.routeId,
+                    useTabletLayout: false,
+                    isTabletSidebarExpanded: false,
+                    canGoBack: false,
+                    enableNavigationAnimation: true,
+                    isNavigatingBack: false,
+                    topBarController: topBar,
+                    appBarEntries: const [],
+                    onGoBack: () {},
+                    onNavigationButtonPressed: () {},
+                    onAppBarEntrySelected: (_) {},
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    /// Selects a sidebar destination with a fresh router entry as the shell does.
+    Future<void> select(String route) async {
+      router.resetTo(
+        RouteEntry(routeId: route, source: RouteEntrySource.drawer),
+      );
+      activation.value++;
+      await pumpPage();
+    }
+
+    await pumpPage();
+    final charactersState = tester.state(find.byType(ToolPkgUiLauncherScreen));
+    await tester.tap(find.text('Increment'));
+    await tester.pumpAndSettle();
+    expect(find.text('Counter: 1'), findsOneWidget);
+    await select('memory');
+    final memoryState = tester.state(find.byType(ToolPkgUiLauncherScreen));
+
+    for (var cycle = 0; cycle < 3; cycle++) {
+      await select('settings');
+      await select('characters');
+      expect(
+        tester.state(find.byType(ToolPkgUiLauncherScreen)),
+        same(charactersState),
+      );
+      expect(find.text('Counter: 1'), findsOneWidget);
+      motion.value = true;
+      await tester.pump();
+      activation.value++;
+      motion.value = false;
+      await tester.pumpAndSettle();
+      await select('characters');
+      expect(
+        tester.state(find.byType(ToolPkgUiLauncherScreen)),
+        same(charactersState),
+      );
+      await select('memory');
+      expect(
+        tester.state(find.byType(ToolPkgUiLauncherScreen)),
+        same(memoryState),
+      );
+    }
+    for (final bridge in [charactersBridge, memoryBridge]) {
+      for (final method in ['acquireToolPkgExecutionEngine', 'render']) {
+        expect(
+          bridge.calls.where((call) => call.methodName == method),
+          hasLength(1),
+        );
+      }
+      expect(
+        bridge.calls.where(
+          (call) => call.methodName == 'releaseToolPkgExecutionEngine',
+        ),
+        isEmpty,
+      );
+    }
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+  });
 
   testWidgets('DSL resource requests start before the mounting frame ends', (
     tester,
@@ -1144,6 +1272,74 @@ void main() {
       'toolpkg:com.operit.sidebar_model_sites:ui:model_sites_viewer',
     ]);
   });
+
+  for (final bot in ['qqbot_bundle', 'wechat_bot']) {
+    testWidgets('package launcher reveals $bot settings immediately', (
+      tester,
+    ) async {
+      final destination = ValueNotifier<String>('扩展详情');
+      addTearDown(destination.dispose);
+      final route = 'toolpkg:com.operit.$bot:ui:settings';
+      AppRouterGateway.install(
+        handler: (id, _, _) => destination.value = id,
+        reset: (_, _, _) {},
+      );
+      addTearDown(AppRouterGateway.clear);
+      var selected = false;
+      final bridge = _ToolPkgDslTestBridge(
+        onAction: (_) => selected = true,
+        renderResult: (_) => jsonEncode({
+          'success': true,
+          'tree': _node(
+            'Button',
+            props: {
+              'text': '高级设置',
+              'onClick': {'__actionId': 'settings'},
+            },
+          ),
+          'navigationCommands': [
+            if (selected) {'route': route},
+          ],
+        }),
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Builder(
+            builder: (context) {
+              return Scaffold(
+                body: Column(
+                  children: [
+                    ValueListenableBuilder(
+                      valueListenable: destination,
+                      builder: (_, value, _) => Text(value),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => ToolPkgUiLauncherScreen(
+                            clients: GeneratedCoreProxyClients(bridge),
+                            plugin: _pluginRuntime(),
+                            dismissOnExternalNavigation: true,
+                          ),
+                        ),
+                      ),
+                      child: const Text('打开插件'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      );
+      await tester.tap(find.text('打开插件'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('高级设置'));
+      await tester.pumpAndSettle();
+      expect(find.text(route), findsOneWidget);
+      expect(find.byType(ToolPkgUiLauncherScreen), findsNothing);
+    });
+  }
 
   testWidgets(
     'retired renderer callbacks cannot enter a reloading or replacement session',
@@ -2557,9 +2753,47 @@ Widget _screen(
   );
 }
 
+class _RetainedPluginScreen extends ToolPkgComposeDslScreenRoute {
+  /// Exercises the production plugin route identity with a protocol-backed session.
+  const _RetainedPluginScreen(String module, this.bridge)
+    : super(
+        containerPackageName: 'demo_toolpkg',
+        uiModuleId: module,
+        keepAlive: true,
+      );
+
+  final _ToolPkgDslTestBridge bridge;
+
+  /// Mounts the real launcher with an isolated bridge for each retained route.
+  @override
+  Widget build(BuildContext context) => ToolPkgUiLauncherScreen(
+    clients: GeneratedCoreProxyClients(bridge),
+    plugin: _pluginRuntime(),
+    initialRouteId: 'main',
+    showLauncherChrome: false,
+  );
+}
+
+class _RetainedSettingsScreen extends OperitScreen {
+  /// Supplies a cached host destination while plugin pages are inactive.
+  const _RetainedSettingsScreen()
+    : super(routeTypeName: 'Settings', keepAlive: true);
+
+  /// Shares one settings page across sidebar selections.
+  @override
+  String stableScreenKey() => 'Settings';
+
+  /// Builds a static host page without plugin lifecycle work.
+  @override
+  Widget build(BuildContext context) => const Text('Settings fixture');
+}
+
 /// Builds the route fixture with all fields required by the current runtime model.
 core_proxy.ToolPkgContainerRuntime _pluginRuntime() {
   return const core_proxy.ToolPkgContainerRuntime(
+    optionalRequires: [],
+    messageStreamTransforms: [],
+    messageTransformHooks: [],
     chatLifecycleHooks: [],
     packageName: 'demo_toolpkg',
     displayName: core_proxy.LocalizedText(
@@ -2646,6 +2880,9 @@ core_proxy.ToolPkgContainerRuntime _pluginRuntime() {
 /// Builds the module-only fixture using the same current runtime schema.
 core_proxy.ToolPkgContainerRuntime _moduleOnlyPluginRuntime() {
   return const core_proxy.ToolPkgContainerRuntime(
+    optionalRequires: [],
+    messageStreamTransforms: [],
+    messageTransformHooks: [],
     chatLifecycleHooks: [],
     packageName: 'module_only_toolpkg',
     displayName: core_proxy.LocalizedText(
@@ -2791,6 +3028,8 @@ class _ToolPkgDslTestBridge extends OperitRuntimeBridge {
   Future<Object?> call(CoreCallRequest request) async {
     calls.add(request);
     switch (request.methodName) {
+      case 'getToolPkgNavigationEntries':
+        return <Object?>[];
       case 'getToolPkgChatMessageMenuItems':
         return [
           const core_proxy.ToolPkgChatMessageMenuItem(

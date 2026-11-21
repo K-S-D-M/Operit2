@@ -9,6 +9,143 @@ class AppLocalizationsEn extends AppLocalizations {
   AppLocalizationsEn([String locale = 'en']) : super(locale);
 
   @override
+  String get terminalProfileSelect => 'Choose terminal profile';
+
+  @override
+  String get terminalProfilesUnavailable =>
+      'No terminals are available on this device.';
+
+  @override
+  String get terminalImplementationNative => 'Native terminal';
+
+  @override
+  String get terminalImplementationProot => 'PRoot Linux terminal';
+
+  @override
+  String get terminalImplementationAndroidSystem => 'Android system terminal';
+
+  @override
+  String get terminalImplementationQemu => 'QEMU Linux emulated terminal';
+
+  @override
+  String get terminalImplementationArm64 => 'Linux ARM64 emulated terminal';
+
+  @override
+  String get terminalImplementationSystem => 'System terminal';
+
+  @override
+  String get terminalImplementationBrowser => 'Browser Linux VM';
+
+  @override
+  String get terminalInterpreterShell => 'Shell';
+
+  @override
+  String terminalBuiltinMacNative(String interpreter) {
+    return 'macOS native $interpreter terminal';
+  }
+
+  @override
+  String terminalBuiltinMacSandbox(String interpreter) {
+    return 'macOS sandbox $interpreter terminal';
+  }
+
+  @override
+  String get terminalBuiltinAndroidLinux => 'Android PRoot Linux Bash terminal';
+
+  @override
+  String get terminalBuiltinAndroidSystem => 'Android system Shell terminal';
+
+  @override
+  String get terminalBuiltinLinux => 'Linux native Bash terminal';
+
+  @override
+  String get terminalBuiltinPosix => 'POSIX native Bash terminal';
+
+  @override
+  String get terminalBuiltinPrivileged => 'System privileged sh terminal';
+
+  @override
+  String get terminalBuiltinPowerShellDownload => 'PowerShell 7 terminal';
+
+  @override
+  String get terminalBuiltinPowerShell =>
+      'Windows bundled PowerShell 7 terminal';
+
+  @override
+  String get terminalBuiltinWindowsBash => 'Windows bundled Bash terminal';
+
+  @override
+  String get terminalBuiltinArm64 => 'Linux ARM64 emulated terminal';
+
+  @override
+  String get terminalBuiltinIosSystem => 'iOS system sh terminal';
+
+  @override
+  String get terminalBuiltinOhosLinux =>
+      'OpenHarmony QEMU Linux emulated terminal';
+
+  @override
+  String get terminalBuiltinOhosSystem => 'OpenHarmony system sh terminal';
+
+  @override
+  String get terminalBuiltinBrowser => 'Browser Linux VM terminal';
+
+  @override
+  String get terminalProfilesTitle => 'Terminal profiles';
+
+  @override
+  String get terminalProfilesDescription =>
+      'Add terminal profiles for this device and choose a default. New workspace and AI terminal sessions share this setting; existing sessions keep their original environment.';
+
+  @override
+  String get terminalProfileAdd => 'Add terminal profile';
+
+  @override
+  String get terminalProfileEdit => 'Edit terminal profile';
+
+  @override
+  String get terminalProfileDelete => 'Delete terminal profile';
+
+  @override
+  String get terminalProfileDeleteDescription =>
+      'This profile will no longer be available for new terminals. Running sessions stay open. Select another default before deleting the default profile.';
+
+  @override
+  String get terminalProfileName => 'Profile name';
+
+  @override
+  String get terminalProfileNameRequired => 'Enter a profile name';
+
+  @override
+  String get terminalProfileImplementation =>
+      'Terminal implementation and interpreter';
+
+  @override
+  String get terminalProfileRootfs => 'Root filesystem directory';
+
+  @override
+  String get terminalProfileRootfsHelp =>
+      'Enter an accessible absolute path to an extracted Linux root filesystem matching this device\'s architecture, such as Ubuntu. Android requires /bin/bash; OpenHarmony requires /bin/sh. Leave blank to use the built-in environment.';
+
+  @override
+  String get terminalProfileExecutable => 'Interpreter executable path';
+
+  @override
+  String get terminalProfileArguments => 'Launcher arguments (JSON array)';
+
+  @override
+  String get terminalProfileArgumentsHelp =>
+      'For example [\"--login\"]. Arguments precede the managed interactive-shell arguments. Enter an executable path when specifying launch options. PowerShell 5 and 7 can be added as separate profiles.';
+
+  @override
+  String get terminalProfileArgumentsError =>
+      'Enter a JSON array of strings, for example [\"--login\"]';
+
+  @override
+  String get terminalProfileNoOptions =>
+      'This terminal is managed by the platform and can be selected as the default. The host does not expose additional launch options.';
+
+  @override
   String get chatPromoteToRoot => 'Promote to main conversation';
 
   @override
@@ -245,6 +382,19 @@ class AppLocalizationsEn extends AppLocalizations {
   String get workspaceCloseOtherTabs => 'Close Others';
 
   @override
+  String get workspaceDockDropTarget => 'Drop into workspace';
+
+  @override
+  String get workspaceOpenWith => 'Open with';
+
+  @override
+  String get workspaceBuiltInPreview => 'Built-in preview';
+
+  @override
+  String get workspacePluginUnsavedChanges =>
+      'Save in the editor first, or discard the unsaved changes.';
+
+  @override
   String get workspaceCloseTabsToRight => 'Close to the Right';
 
   @override
@@ -371,6 +521,11 @@ class AppLocalizationsEn extends AppLocalizations {
       'Could not load messages. Please try again.';
 
   @override
+  String messageTransformFailed(String error) {
+    return 'Failed to process message display: $error';
+  }
+
+  @override
   String get messageLocatorFavoriteFailed =>
       'Could not update favorite. Please try again.';
 
@@ -437,6 +592,9 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get hiddenUserMessage => 'Hidden user message';
+
+  @override
+  String get autoTriggeredUserMessage => 'AUTO';
 
   @override
   String get workspaceSetupTitle => 'Set up workspace';
@@ -773,6 +931,22 @@ class AppLocalizationsEn extends AppLocalizations {
   String get downloads => 'Downloads';
 
   @override
+  String get browserDownloadsAll => 'All';
+
+  @override
+  String get browserDownloadStorageHint =>
+      'Files are kept in the browser\'s download folder on the browser device. Open copies the file into this workspace first. You can also save it to the workspace directly.';
+
+  @override
+  String get browserDownloadWorkspaceTarget => 'Save to this workspace:';
+
+  @override
+  String get browserDownloadSaveToWorkspace => 'Save to workspace';
+
+  @override
+  String get browserDownloadInterrupted => 'Interrupted · download again';
+
+  @override
   String get scripts => 'Scripts';
 
   @override
@@ -798,6 +972,13 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get openFile => 'Open file';
+
+  @override
+  String get workspaceFileOpening => 'Opening file…';
+
+  @override
+  String get workspaceFileOpenTimedOut =>
+      'Opening the file timed out. Please try again.';
 
   @override
   String get openLocation => 'Open location';
@@ -837,6 +1018,10 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get openExternalApplication => 'Open external application';
+
+  @override
+  String get browserExternalNavigationFailed =>
+      'Unable to open the link. No compatible application is installed, the link is invalid, or the system rejected the request.';
 
   @override
   String get open => 'Open';
@@ -1069,11 +1254,17 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsCategoryDataTitle => 'Data & Backup';
 
   @override
-  String get settingsCategoryDataSubtitle => 'Backup, restore, stats';
+  String get settingsCategoryDataSubtitle => 'Backup, restore, storage';
 
   @override
   String get settingsCategoryDataDescription =>
-      'Back up chats, plugin data, and model settings, restore backup content, and view data statistics.';
+      'Back up and restore chats, plugin data, and model settings, and manage storage.';
+
+  @override
+  String get settingsUsageReportTitle => 'Token Usage Report';
+
+  @override
+  String get settingsUsageReportSubtitle => 'Model usage, cache, and cost';
 
   @override
   String get settingsCategoryAccessLinksTitle => 'Device Space';
@@ -1100,6 +1291,13 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsGlobalBehaviorChatInputSection => 'Chat input';
+
+  @override
+  String get settingsGlobalBehaviorEnterSendsMessage => 'Press Enter to send';
+
+  @override
+  String get settingsGlobalBehaviorEnterSendsMessageDescription =>
+      'When off, Enter inserts a newline. Ctrl+Enter and Enter in the expanded editor always insert a newline.';
 
   @override
   String get settingsGlobalBehaviorLongPastedTextAsAttachment =>
@@ -1361,6 +1559,12 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsModelApiKey => 'API key';
 
   @override
+  String get settingsModelShowApiKey => 'Show API key';
+
+  @override
+  String get settingsModelHideApiKey => 'Hide API key';
+
+  @override
   String get settingsModelCodexLogin => 'ChatGPT login';
 
   @override
@@ -1407,7 +1611,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyPoolDescription =>
-      'Prepare multiple keys for one model profile so runtime can rotate between them.';
+      'Keep using a healthy key. Switch on authentication, quota, rate limit, or temporary failures; cooling keys are skipped.';
 
   @override
   String settingsModelApiKeyPoolCount(int count) {
@@ -1416,7 +1620,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyPoolEmpty =>
-      'No keys yet. Add keys and this profile will use the key pool.';
+      'No keys yet. Add a key before enabling this pool.';
 
   @override
   String get settingsModelAddApiKey => 'Add key';
@@ -1429,6 +1633,36 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsModelApiKeyEnabled => 'Enable this key';
+
+  @override
+  String get settingsModelPoolAddSingle => 'Add current single key';
+
+  @override
+  String get settingsModelPoolPaste =>
+      'Paste one key per line to add several at once.';
+
+  @override
+  String get settingsModelPoolNoEligible =>
+      'Enable at least one nonempty key that is not marked unavailable.';
+
+  @override
+  String get settingsModelPoolUntested => 'Untested';
+
+  @override
+  String get settingsModelPoolAvailable => 'Available';
+
+  @override
+  String get settingsModelPoolUnavailable => 'Unavailable';
+
+  @override
+  String get settingsModelPoolClearMarks => 'Reset key health';
+
+  @override
+  String get settingsModelPoolTest => 'Test untested keys';
+
+  @override
+  String get settingsModelPoolNeedsModel =>
+      'Save the provider and add a model before testing keys.';
 
   @override
   String get settingsModelProviderId => 'Provider ID';
@@ -1553,7 +1787,57 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
-  String get localModelsAddModel => 'Add model';
+  String get localModelsAddModel => 'Browse online';
+
+  @override
+  String get localModelsImportFromDevice => 'Import from device';
+
+  @override
+  String get localModelsImportGgufHint =>
+      'Choose one complete GGUF chat model for llama.cpp.';
+
+  @override
+  String get localModelsImportMnnHint =>
+      'Select the extracted MNN model files together, including config.json and the weights.';
+
+  @override
+  String get localModelsImportInvalidGguf => 'Select a single .gguf file.';
+
+  @override
+  String get localModelsImportMissingConfig =>
+      'The selected files are missing config.json.';
+
+  @override
+  String get localModelsImportFileSizeRequired =>
+      'Each selected file must be non-empty and report its size.';
+
+  @override
+  String get localModelsImportChangeFiles => 'Choose again';
+
+  @override
+  String localModelsImportFileCount(int count) {
+    return '$count files selected';
+  }
+
+  @override
+  String get localModelsImportName => 'Model name';
+
+  @override
+  String get localModelsImportCopyNotice =>
+      'The files are copied into app storage and stay on this device.';
+
+  @override
+  String get localModelsImportCopying => 'Copying model files…';
+
+  @override
+  String get localModelsImportFinishing => 'Checking and registering model…';
+
+  @override
+  String get localModelsImportComplete =>
+      'Model imported. Open Run and configure to try it.';
+
+  @override
+  String get localModelsImportedFile => 'Device import';
 
   @override
   String get localModelsFilterDownloads => 'Downloads';
@@ -1834,11 +2118,11 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
-  String get settingsModelCatalogNotDownloaded =>
-      'Model details have not been downloaded yet';
+  String get settingsModelCatalogBundled =>
+      'Using bundled model details; online updates replace them automatically';
 
   @override
-  String get settingsModelCatalogRetry => 'Retry';
+  String get settingsModelCatalogRetry => 'Update';
 
   @override
   String get settingsModelCustomModel => 'Custom model';
@@ -1921,12 +2205,6 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsModelSummaryThreshold => 'Summarize at';
-
-  @override
-  String get settingsModelSummaryByMessageCount => 'Summarize by message count';
-
-  @override
-  String get settingsModelSummaryMessageCount => 'Summary message threshold';
 
   @override
   String get settingsModelCustomHeaders => 'Custom headers';
@@ -2119,6 +2397,15 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
+  String settingsModelTestSummaryWithRestricted(
+    int passed,
+    int failed,
+    int restricted,
+  ) {
+    return '$passed passed, $failed failed, $restricted restricted';
+  }
+
+  @override
   String settingsModelTestAllPassed(int count) {
     return 'All $count passed';
   }
@@ -2176,6 +2463,17 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsModelConnectionTestFailed => 'Some checks failed';
+
+  @override
+  String get settingsModelConnectionTestRestricted => 'Test restricted';
+
+  @override
+  String get settingsModelTestCreditRestricted =>
+      'Credit or output budget limit';
+
+  @override
+  String get settingsModelTestRateRestricted =>
+      'Upstream rate limit or cooldown';
 
   @override
   String get settingsModelCapabilitiesApplied =>
@@ -3172,11 +3470,28 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsAppearanceBubbleImageAdjustAi => 'Adjust AI bubble image';
 
   @override
-  String get settingsAppearanceBubbleImagePreview => 'Preview';
+  String get settingsAppearanceBubbleImagePreview => 'Live preview';
 
   @override
   String get settingsAppearanceBubbleImagePreviewText =>
-      'Bubble preview with 9-slice guides';
+      'This is a bubble preview message.\nCheck the corners, edges, and center at their rendered size.';
+
+  @override
+  String get settingsAppearanceBubbleImageSource => 'Original';
+
+  @override
+  String get settingsAppearanceBubbleImageSourceHint =>
+      'Original · White: crop boundary. Blue: nine-slice grid. Pinch to zoom and drag to inspect.';
+
+  @override
+  String get settingsAppearanceBubbleImageFitSource => 'Fit original image';
+
+  @override
+  String get settingsAppearanceBubbleImageGrid => '9-slice';
+
+  @override
+  String get settingsAppearanceBubbleImageGridHint =>
+      'Two horizontal and two vertical cuts form nine regions. Corners stay fixed; edges tile along one axis and the center tiles along both. Stretch mode stretches those regions instead. Boundaries are relative to the cropped image.';
 
   @override
   String settingsAppearanceBubbleImageImportFailed(String error) {
@@ -3407,29 +3722,17 @@ class AppLocalizationsEn extends AppLocalizations {
   }
 
   @override
-  String get settingsDataTokenSection => 'Usage statistics';
-
-  @override
   String get settingsDataInputTokens => 'Input';
 
   @override
   String get settingsDataOutputTokens => 'Output';
 
   @override
-  String get settingsDataOpenDetailedStats => 'View detailed statistics';
-
-  @override
-  String get settingsDataOpenDetailedStatsDescription =>
-      'View the usage heatmap and model usage timeline with minute-level zoom.';
-
-  @override
-  String get settingsDataRefreshTokenStats => 'Refresh statistics';
-
-  @override
   String get settingsDataResetTokenStats => 'Reset statistics';
 
   @override
-  String get settingsDataDetailedStatsTitle => 'Detailed statistics';
+  String get settingsUsageReportResetConfirmation =>
+      'This permanently deletes all saved model usage records. Your conversations are kept.';
 
   @override
   String get settingsDataDetailedStatsDescription =>
@@ -3682,14 +3985,89 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsDataSnapshotBackupTitle => 'Full snapshot';
 
   @override
-  String get settingsDataExportRawSnapshot => 'Export snapshot';
+  String get settingsDataExportRawSnapshot => 'Export full snapshot';
 
   @override
-  String get settingsDataImportRawSnapshot => 'Restore snapshot';
+  String get settingsDataImportRawSnapshot => 'Restore a full snapshot';
 
   @override
   String get settingsDataExportRawSnapshotDescription =>
-      'Pack chats, plugin data, model settings, and local files into one backup file. Restoring replaces current data with the backup.';
+      'Package chats, plugin data, model settings, and local files as an .opsnapshot file.';
+
+  @override
+  String get settingsDataDatabaseBackup => 'Database backup';
+
+  @override
+  String get settingsDataDatabaseBackupDescription =>
+      'Save a copy of the database daily and keep the 10 most recent automatic backups. Attachments and workspace files are stored separately.';
+
+  @override
+  String get settingsDataBackupScheduled => 'Daily backup is on';
+
+  @override
+  String get settingsDataBackupUnavailable =>
+      'Choose an accessible folder to turn on daily backups';
+
+  @override
+  String get settingsDataBackupNow => 'Back up now';
+
+  @override
+  String get settingsDataBackupSaved => 'Database backup saved.';
+
+  @override
+  String get settingsDataRecoverySection => 'Restore data';
+
+  @override
+  String get settingsDataRestoreDatabaseDescription =>
+      'Choose a dated database backup. The restored data becomes the source of truth for sync with other devices.';
+
+  @override
+  String get settingsDataRestoreArchiveDescription =>
+      'Replace current runtime data with an Operit2 full snapshot and restart the app.';
+
+  @override
+  String get settingsDataImportSection => 'Import data';
+
+  @override
+  String get settingsDataImportOperit1Description =>
+      'Preview an Operit1 snapshot before migrating chats, model settings, and files.';
+
+  @override
+  String get settingsDataImportChatJson => 'Import chat JSON';
+
+  @override
+  String get settingsDataImportChatJsonDescription =>
+      'Add chats and update existing chats with matching IDs.';
+
+  @override
+  String get settingsDataImportModelJson => 'Import model settings JSON';
+
+  @override
+  String get settingsDataImportModelJsonDescription =>
+      'Add model provider settings and update existing providers with matching IDs.';
+
+  @override
+  String get settingsDataImportAction => 'Import';
+
+  @override
+  String get settingsDataReadingSnapshot => 'Reading snapshot';
+
+  @override
+  String get settingsDataPreparingPreview => 'Preparing preview';
+
+  @override
+  String settingsDataOperit1ImportResult(int chatCount, int messageCount) {
+    return 'Imported $chatCount chats and $messageCount messages.';
+  }
+
+  @override
+  String get settingsDataExportSection => 'Export files';
+
+  @override
+  String get settingsDataExportChatJson => 'Export chat JSON';
+
+  @override
+  String get settingsDataExportModelJson => 'Export model settings JSON';
 
   @override
   String settingsDataSnapshotBytes(int bytes) {
@@ -4174,6 +4552,33 @@ class AppLocalizationsEn extends AppLocalizations {
   String get settingsPeerPortModeAutomatic => 'Automatic port';
 
   @override
+  String get settingsPeerNetworkDiscoveryHelp =>
+      'For discovery across routed networks, configure a shared directory and group key. To host the directory, leave the address empty and set a group key.';
+
+  @override
+  String get settingsPeerDiscoveryDirectory => 'Discovery directory (optional)';
+
+  @override
+  String get settingsPeerDiscoveryGroup => 'Discovery group key';
+
+  @override
+  String get settingsPeerDiscoveryGenerateKey => 'Generate new group key';
+
+  @override
+  String get settingsPeerDiscoveryCopyKey => 'Copy group key';
+
+  @override
+  String get settingsPeerDiscoveryPort => 'Directory listener port';
+
+  @override
+  String get settingsPeerDiscoveryPortHelp =>
+      'Only used on the directory host. Other devices use the port in the directory URL.';
+
+  @override
+  String get settingsPeerNetworkDiscoveryInvalid =>
+      'Check the discovery settings: use an HTTP(S) origin without a path, a shared key of 16–128 bytes, and a nonzero port when hosting the directory.';
+
+  @override
   String get settingsPeerAdvanced => 'Advanced options';
 
   @override
@@ -4523,6 +4928,38 @@ class AppLocalizationsEn extends AppLocalizations {
       'Your saved appearance has not been replaced. Retry after repairing its resources, or reset appearance explicitly. Reset keeps your avatar and saved configurations and selects custom appearance.';
 
   @override
+  String settingsAppearanceAssetBackgroundFailed(String reference) {
+    return 'The background image could not be loaded. Using the default background ($reference).';
+  }
+
+  @override
+  String settingsAppearanceAssetVideoFailed(String reference) {
+    return 'The background video could not be played. Using the default background ($reference).';
+  }
+
+  @override
+  String settingsAppearanceAssetBubbleFailed(String reference) {
+    return 'The bubble image could not be loaded. Using the default bubble color ($reference).';
+  }
+
+  @override
+  String settingsAppearanceAssetPreviousRetained(String reference) {
+    return 'This theme resource could not be loaded. Keeping the previous image or media ($reference); your other theme settings still apply.';
+  }
+
+  @override
+  String get settingsAppearanceAssetRetry => 'Retry';
+
+  @override
+  String get settingsAppearanceAssetReimportHint =>
+      'If retrying does not help, choose and import a readable image or playable video again.';
+
+  @override
+  String settingsAppearanceAssetImportFailed(String reason) {
+    return 'The background resource was not applied: $reason. Please choose a readable image or playable video.';
+  }
+
+  @override
   String get settingsAppearanceRetry => 'Retry';
 
   @override
@@ -4678,8 +5115,7 @@ class AppLocalizationsEn extends AppLocalizations {
       'Sync interrupted. Retrying automatically.';
 
   @override
-  String get deviceSpaceSyncPending =>
-      'Some data is still pending. Retrying automatically.';
+  String get deviceSpaceSyncPending => 'Some data is still pending.';
 
   @override
   String deviceSpaceSyncCurrentFile(String done, String total) {
@@ -4763,6 +5199,10 @@ class AppLocalizationsEn extends AppLocalizations {
   @override
   String get peerQrWrongDevice =>
       'This code belongs to a different device. Scan the code for the selected device.';
+
+  @override
+  String get peerPairTimeoutHint =>
+      'Connection timed out: could not reach the other device. A common cause is the other device’s firewall blocking incoming connections. Try initiating the connection from the other device, or allow Operit through the other device’s firewall (especially on public networks).';
 
   @override
   String get peerQrImageInvalid =>
@@ -4979,4 +5419,187 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get settingsAppearanceThemeNew => 'New theme';
+
+  @override
+  String get settingsAppearanceDeviceFonts => 'Device fonts';
+
+  @override
+  String get settingsAppearanceChooseDeviceFont => 'Choose device font';
+
+  @override
+  String get settingsAppearanceNoDeviceFonts => 'No matching device fonts';
+
+  @override
+  String get settingsAppearanceDeviceFontPreview =>
+      'The quick brown fox · 0123456789\n字体预览：你好，世界';
+
+  @override
+  String get workspaceFileRename => 'Rename';
+
+  @override
+  String get workspaceFileCopy => 'Copy';
+
+  @override
+  String get workspaceFileCut => 'Cut';
+
+  @override
+  String get workspaceFilePaste => 'Paste';
+
+  @override
+  String get workspaceFileName => 'Name';
+
+  @override
+  String get workspaceFileInvalidName =>
+      'Enter a valid name without path separators.';
+
+  @override
+  String get workspaceDeleteFolderTitle => 'Delete folder?';
+
+  @override
+  String workspaceDeleteFolderMessage(String name) {
+    return 'Delete “$name” and all its contents? This cannot be undone.';
+  }
+
+  @override
+  String workspaceFileOperationFailed(String error) {
+    return 'File operation failed: $error';
+  }
+
+  @override
+  String workspaceFileCopyName(String name, int index) {
+    return '$name (copy $index)';
+  }
+
+  @override
+  String get workspaceFileSaving =>
+      'This file is being saved. Please try again when saving finishes.';
+
+  @override
+  String get chatBackupChooseTitle => 'Choose your backup directory';
+
+  @override
+  String get chatBackupTitle => 'Daily chat backup';
+
+  @override
+  String get chatBackupDescription =>
+      'Copy the complete SQLite database file daily while the app is running and keep the latest 10 automatic backups. Includes all data stored in this database. External attachments, workspaces and separate configuration files are not copied.';
+
+  @override
+  String get chatRestoreTitle => 'Restore from a database backup';
+
+  @override
+  String get chatRestoreDescription =>
+      'Open the folder containing your backups and choose the date you want to restore from.';
+
+  @override
+  String get chatRestoreChooseFolder => 'Choose backup source';
+
+  @override
+  String get chatRestoreRefresh => 'Refresh list';
+
+  @override
+  String get chatRestoreSelected => 'Restore selected backup';
+
+  @override
+  String get chatRestoreAction => 'Restore';
+
+  @override
+  String get chatRestoreCancel => 'Cancel';
+
+  @override
+  String get chatRestoreEmpty => 'This folder contains no database backups.';
+
+  @override
+  String get chatRestoreConfirmTitle => 'Restore this database backup?';
+
+  @override
+  String chatRestoreConfirmDescription(String name) {
+    return 'Replace the current database file with $name. This replaces all data stored in this database. Stop running conversations first. Restoring establishes a new synchronization baseline that replaces older data on other devices.';
+  }
+
+  @override
+  String get chatRestoreSuccess =>
+      'Database restored. The next sync will use this copy as the source of truth.';
+
+  @override
+  String get chatRestoreOnboardingTitle => 'Restore from a previous backup';
+
+  @override
+  String get chatRestoreOnboardingDescription =>
+      'Recover chats saved in an external folder before reinstalling or uninstalling';
+
+  @override
+  String get chatBackupExternalDescription =>
+      'Choose a folder outside the app so backups remain after uninstall. On iPhone and iPad, choose iCloud Drive or another external file provider.';
+
+  @override
+  String get chatBackupChoose => 'Choose backup directory';
+
+  @override
+  String get chatBackupLater => 'Set up later';
+
+  @override
+  String get chatBackupChange => 'Change backup directory';
+
+  @override
+  String get chatBackupMissing =>
+      'The backup directory is not configured, no longer exists or cannot be accessed. Select a directory to enable daily chat backups.';
+
+  @override
+  String get chatBackupDirectoryUnavailable =>
+      'The selected folder cannot be used. Create a new directory inside an accessible folder, such as Documents or Downloads, and select that directory.';
+
+  @override
+  String get chatBackupReady =>
+      'The backup directory is ready. Daily backups are checked at startup, on resume and while the app is running.';
+
+  @override
+  String get chatBackupNow => 'Back up chats now';
+
+  @override
+  String get chatBackupNever => 'No successful backup yet';
+
+  @override
+  String chatBackupLastSuccess(String time) {
+    return 'Last successful backup: $time';
+  }
+
+  @override
+  String get terminalDistributionsTitle => 'Download Linux distributions';
+
+  @override
+  String get terminalDistributionsDescription =>
+      'Only Alpine is bundled. Download an ARM64 root filesystem to add a separate instance, then choose it as the default. You can install the same distribution multiple times.';
+
+  @override
+  String get terminalDistributionDownload => 'Download and install';
+
+  @override
+  String get terminalInstallQueued => 'Waiting to install';
+
+  @override
+  String get terminalInstallDownloading => 'Downloading root filesystem';
+
+  @override
+  String get terminalInstallVerifying => 'Verifying SHA-256';
+
+  @override
+  String get terminalInstallExtracting => 'Installing root filesystem';
+
+  @override
+  String get terminalInstallCompleted =>
+      'Installed · available in terminal profiles';
+
+  @override
+  String get terminalInstallCancelled => 'Installation cancelled';
+
+  @override
+  String get terminalInstallFailed => 'Installation failed';
+
+  @override
+  String get terminalProfileWslDistribution => 'WSL distribution (optional)';
+
+  @override
+  String get terminalProfileWslHelp =>
+      'For WSL, select Bash, enter the absolute path to wsl.exe and a distribution name from wsl --list --quiet, such as Ubuntu-24.04. Leave this field blank for a native Bash executable.';
 }

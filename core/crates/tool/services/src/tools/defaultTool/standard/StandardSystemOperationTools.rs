@@ -14,8 +14,12 @@ use operit_tools::tools::ToolResultDataClasses::{
     ToolResultData,
 };
 use operit_tools::ConversationMarkupManager::ToolResult;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
+use operit_vfs::VfsPath;
+use operit_tools::files::FileToolRouting::{FileToolRouting, PreparedFileToolCall};
 use operit_tools::ToolExecutionManager::{
-    AITool, ToolAccessSpec, ToolBoundary, ToolEffect, ToolExecutor, ToolValidationResult,
+    AITool, AsyncToolExecutor, ToolAccessSpec, ToolBoundary, ToolEffect, ToolExecutor,
+    ToolInvocationContext, ToolInvocationFuture, ToolValidationResult,
 };
 
 #[derive(Clone)]
@@ -24,6 +28,8 @@ pub struct StandardSystemOperationTools {
     pub systemOperationHost: Option<Arc<dyn SystemOperationHost>>,
     pub toastHost: Option<Arc<dyn ToastHost>>,
     pub clipboardHost: Option<Arc<dyn ClipboardHost>>,
+    vfs: VisualFileSystem,
+    fileRouting: FileToolRouting,
 }
 
 #[derive(Clone, Copy)]
@@ -34,7 +40,6 @@ pub enum SystemOperationToolOperation {
     SendNotification,
     ModifySystemSetting,
     GetSystemSetting,
-    InstallApp,
     UninstallApp,
     ListInstalledApps,
     StartApp,
@@ -53,17 +58,26 @@ pub struct SystemOperationToolExecutor {
     pub operation: SystemOperationToolOperation,
 }
 
+/// Executes package installation with the common asynchronous file routing contract.
+pub struct InstallAppToolExecutor {
+    pub tools: StandardSystemOperationTools,
+}
+
 impl StandardSystemOperationTools {
-    /// Creates a system-operation tool set from an optional host bridge.
-    pub fn new(
+    /// Binds system operations to their host capabilities and shared VFS routing.
+    pub(crate) fn new(
         systemOperationHost: Option<Arc<dyn SystemOperationHost>>,
         toastHost: Option<Arc<dyn ToastHost>>,
         clipboardHost: Option<Arc<dyn ClipboardHost>>,
+        vfs: VisualFileSystem,
+        fileRouting: FileToolRouting,
     ) -> Self {
         Self {
             systemOperationHost,
             toastHost,
             clipboardHost,
+            vfs,
+            fileRouting,
         }
     }
 
@@ -183,20 +197,36 @@ impl StandardSystemOperationTools {
     }
 
     #[allow(non_snake_case)]
-    /// Requests host installation of an application package.
-    pub fn installApp(&self, tool: &AITool) -> ToolResult {
-        let apkPath = parameterValue(tool, "path");
-        if apkPath.is_empty() {
+    /// Resolves a package's file directory and device before invoking the selected host.
+    pub async fn installApp(&self, tool: &AITool) -> ToolResult {
+        let packagePath = parameterValue(tool, "path");
+        if packagePath.is_empty() {
             return toolError(tool, "Must provide installer file path".to_string());
         }
-        match self.host().and_then(|host| host.installApp(&apkPath)) {
+        let tool = &match self.fileRouting.prepare(tool, &["path"]) {
+            Ok(PreparedFileToolCall::Local(call)) => call,
+            Ok(PreparedFileToolCall::Remote {
+                call, nodeId, typedPath, nodePrefix,
+            }) => {
+                return self.fileRouting
+                    .dispatchRemote(call, nodeId, &typedPath, &nodePrefix)
+                    .await;
+            }
+            Err(error) => return toolError(tool, error),
+        };
+        let result = (|| {
+            let source = self.vfs.file(&parameterValue(tool, "path"))?;
+            self.host().and_then(|host| host.installApp(&source, operit_host_api::AppInstallTiming::Immediate))
+                .map_err(|error| error.message)
+        })();
+        match result {
             Ok(data) => toolSuccessData(
                 tool,
                 ToolResultData::AppOperationData(appOperationData(data)),
             ),
             Err(error) => toolError(
                 tool,
-                format!("Error requesting app installation: {}", error.message),
+                format!("Error requesting app installation: {}", error),
             ),
         }
     }
@@ -373,7 +403,15 @@ impl StandardSystemOperationTools {
     #[allow(non_snake_case)]
     /// Captures a screenshot through the host bridge.
     pub fn captureScreenshot(&self, tool: &AITool) -> ToolResult {
-        match self.host().and_then(|host| host.captureScreenshot()) {
+        let capture: operit_host_api::HostResult<String> = (|| {
+            let parent = "/operitapp/data/temp/clean_on_exit/screenshots";
+            self.vfs.makeDirectory(parent, true).map_err(operit_host_api::HostError::new)?;
+            let path = format!("{parent}/{}.png", uuid::Uuid::new_v4());
+            let target = self.vfs.file(&path).map_err(operit_host_api::HostError::new)?;
+            self.host()?.captureScreenshotTo(&target)?;
+            Ok(path)
+        })();
+        match capture {
             Ok(path) => toolSuccess(tool, path),
             Err(error) => toolError(
                 tool,
@@ -405,6 +443,66 @@ impl StandardSystemOperationTools {
     }
 }
 
+impl AsyncToolExecutor for InstallAppToolExecutor {
+    /// Requires an installer path before scheduling or dispatching installation.
+    fn validateParameters(&self, tool: &AITool) -> ToolValidationResult {
+        let valid = !parameterValue(tool, "path").trim().is_empty();
+        ToolValidationResult {
+            valid,
+            errorMessage: if valid {
+                String::new()
+            } else {
+                "path is required.".into()
+            },
+        }
+    }
+
+    /// Retains host-installation approval independently of the package's file location.
+    fn accessSpec(&self, _tool: &AITool) -> Result<ToolAccessSpec, String> {
+        Ok(ToolAccessSpec {
+            effect: ToolEffect::WRITE,
+            boundary: ToolBoundary::None,
+        })
+    }
+
+    /// Preserves the caller's directory while native package APIs use Host blocking capacity.
+    fn invokeAndStreamAsync<'a>(
+        &'a self,
+        tool: &'a AITool,
+        context: &'a ToolInvocationContext,
+    ) -> ToolInvocationFuture<'a> {
+        let tools = self.tools.clone();
+        let request = tool.clone();
+        let context = context.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let scheduled = operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost()
+            .scheduleHostRuntimeBlockingAsyncTask(
+                "install-app-tool-invocation",
+                Box::new(move || {
+                    Box::pin(async move {
+                        let result = context.scope(tools.installApp(&request)).await;
+                        let _ = sender.send(vec![result]);
+                    })
+                }),
+            );
+        Box::pin(async move {
+            match scheduled {
+                Err(error) => vec![toolError(
+                    tool,
+                    format!("Install tool scheduling failed: {error}"),
+                )],
+                Ok(()) => match receiver.await {
+                    Ok(results) => results,
+                    Err(error) => vec![toolError(
+                        tool,
+                        format!("Install tool execution ended: {error}"),
+                    )],
+                },
+            }
+        })
+    }
+}
+
 impl ToolExecutor for SystemOperationToolExecutor {
     fn validateParameters(&self, tool: &AITool) -> ToolValidationResult {
         validateSystemOperationTool(self.operation, tool)
@@ -422,7 +520,6 @@ impl ToolExecutor for SystemOperationToolExecutor {
             | SystemOperationToolOperation::SetClipboardText
             | SystemOperationToolOperation::SendNotification
             | SystemOperationToolOperation::ModifySystemSetting
-            | SystemOperationToolOperation::InstallApp
             | SystemOperationToolOperation::UninstallApp
             | SystemOperationToolOperation::StartApp
             | SystemOperationToolOperation::StopApp
@@ -434,7 +531,8 @@ impl ToolExecutor for SystemOperationToolExecutor {
         })
     }
 
-    fn invokeAndStream(&mut self, tool: &AITool) -> Vec<ToolResult> {
+    /// Executes an independent request through the owning resource services.
+    fn invokeAndStream(&self, tool: &AITool) -> Vec<ToolResult> {
         let result = match self.operation {
             SystemOperationToolOperation::Toast => self.tools.toast(tool),
             SystemOperationToolOperation::SetClipboardText => self.tools.setClipboardText(tool),
@@ -443,7 +541,6 @@ impl ToolExecutor for SystemOperationToolExecutor {
                 self.tools.modifySystemSetting(tool)
             }
             SystemOperationToolOperation::GetSystemSetting => self.tools.getSystemSetting(tool),
-            SystemOperationToolOperation::InstallApp => self.tools.installApp(tool),
             SystemOperationToolOperation::UninstallApp => self.tools.uninstallApp(tool),
             SystemOperationToolOperation::ListInstalledApps => self.tools.listInstalledApps(tool),
             SystemOperationToolOperation::StartApp => self.tools.startApp(tool),
@@ -493,11 +590,6 @@ fn validateSystemOperationTool(
         SystemOperationToolOperation::GetSystemSetting => {
             if parameterValue(tool, "setting").is_empty() {
                 return invalid("setting is required.");
-            }
-        }
-        SystemOperationToolOperation::InstallApp => {
-            if parameterValue(tool, "path").is_empty() {
-                return invalid("path is required.");
             }
         }
         SystemOperationToolOperation::UninstallApp
@@ -857,8 +949,12 @@ fn deviceInfoDataToString(data: &DeviceInfoResultData) -> String {
     text.push_str(&format!("Available Memory: {}\n", data.availableMemory));
     text.push_str(&format!("Total Storage: {}\n", data.totalStorage));
     text.push_str(&format!("Available Storage: {}\n", data.availableStorage));
-    text.push_str(&format!("Battery Level: {}%\n", data.batteryLevel));
-    text.push_str(&format!("Battery Charging: {}\n", data.batteryCharging));
+    if (0..=100).contains(&data.batteryLevel) {
+        text.push_str(&format!("Battery Level: {}%\n", data.batteryLevel));
+        text.push_str(&format!("Battery Charging: {}\n", data.batteryCharging));
+    } else {
+        text.push_str("Battery: unavailable\n");
+    }
     text.push_str(&format!("CPU Info: {}\n", data.cpuInfo));
     text.push_str(&format!("Network Type: {}\n", data.networkType));
     if !data.additionalInfo.is_empty() {
@@ -869,3 +965,7 @@ fn deviceInfoDataToString(data: &DeviceInfoResultData) -> String {
     }
     text
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "StandardSystemOperationToolsTests.rs"]
+mod tests;

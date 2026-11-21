@@ -1,14 +1,17 @@
 // ignore_for_file: file_names
 
-import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
+import 'package:mime/mime.dart';
 
+import '../../../../core/bridge/PlatformCoreProxy.dart';
+import '../../../../core/bridge/ProxyCoreRuntimeBridge.dart';
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
-import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
+import '../../../../core/runtime/RuntimeFileBytes.dart';
 
 /// Shares immutable data-URI bytes so Flutter can reuse the same decoded image.
 /// The LRU bounds both entry count and retained source/byte memory. Mutable VFS
@@ -57,11 +60,13 @@ class ComposeDslVfsImage extends ImageProvider<ComposeDslVfsImage> {
     required this.path,
     required this.owner,
     required this.readBytes,
+    this.clients = imageSourceClients,
   });
 
   final String path;
   final Object owner;
   final Future<Uint8List> Function(String path) readBytes;
+  final GeneratedCoreProxyClients clients;
 
   @override
   Future<ComposeDslVfsImage> obtainKey(ImageConfiguration configuration) =>
@@ -81,7 +86,8 @@ class ComposeDslVfsImage extends ImageProvider<ComposeDslVfsImage> {
     try {
       final bytes = await readBytes(path);
       if (bytes.isEmpty) throw StateError('DSL VFS image is empty: $path');
-      return await decode(await ui.ImmutableBuffer.fromUint8List(bytes));
+      final displayBytes = await readImageDisplayBytes(bytes, clients: clients);
+      return await decode(await ui.ImmutableBuffer.fromUint8List(displayBytes));
     } catch (_) {
       PaintingBinding.instance.imageCache.evict(this);
       rethrow;
@@ -96,40 +102,45 @@ class ComposeDslVfsImage extends ImageProvider<ComposeDslVfsImage> {
   int get hashCode => Object.hash(path, owner);
 }
 
+const imageSourceClients = GeneratedCoreProxyClients(
+  ProxyCoreRuntimeBridge(coreProxy: platformCoreProxy),
+);
+
+/// Reads HEIF through the existing runtime image service using library MIME detection.
+Future<Uint8List> readImageDisplayBytes(
+  Uint8List bytes, {
+  GeneratedCoreProxyClients clients = imageSourceClients,
+}) async {
+  final mimeType = lookupMimeType('', headerBytes: bytes);
+  if (!const {
+    'image/heic',
+    'image/heif',
+    'image/heic-sequence',
+    'image/heif-sequence',
+  }.contains(mimeType)) {
+    return bytes;
+  }
+  final result = await clients.servicesRuntimeHostInteractionService
+      .imageBytes(url: Uri.dataFromBytes(bytes, mimeType: mimeType!).toString())
+      .first;
+  if (result.error != null) throw StateError(result.error!);
+  return result.bytes;
+}
+
 /// Reads virtual files through the actual Core file service, never dart:io.
 Future<Uint8List> readComposeDslVfsBytes(
   GeneratedCoreProxyClients clients,
   String path,
-) async {
-  final result = await clients.application.aiToolHandler().executeTool(
-    tool: core_proxy.CoreOperitToolsToolExecutionManagerAiTool(
-      name: 'read_file_binary',
-      parameters: [
-        core_proxy.CoreOperitToolsToolExecutionManagerToolParameter(
-          name: 'path',
-          value: path,
-        ),
-      ],
-    ),
-  );
-  if (!result.success) {
-    throw StateError('DSL VFS image $path: ${result.error}');
-  }
-  final data = result.result.value;
-  if (data is! core_proxy.BinaryFileContentData) {
-    throw StateError('DSL VFS image did not return binary file content');
-  }
-  return base64Decode(data.contentBase64);
-}
+) => readRuntimeFileBytes(clients, path);
 
 /// Gives known VFS roots precedence even when wrapped in a file URI.
 String? composeDslVfsImagePath(String source) {
-  final qualified = RegExp(
-    r'^[^/\\:]+:(/(?:app|operitapp|mnt|virtual)(?:/|$).*)$',
-  ).firstMatch(source);
-  if (qualified != null) return source;
   final uri = Uri.tryParse(source);
   final explicitVfs = uri?.scheme == 'vfs' || uri?.scheme == 'operit-vfs';
+  final qualified = RegExp(
+    r'^[^/\\:]{2,}:(//?(?:app|operitapp|mnt|virtual)(?:/|$).*)$',
+  ).firstMatch(source);
+  if (!explicitVfs && qualified != null) return source;
   final String path;
   if (explicitVfs) {
     final host = uri!.host;

@@ -196,7 +196,7 @@ fn assembleRuntimeBootstrapScript() -> String {
             .expect("Execution prelude source must serialize");
     let cleanOnExitDirJson = serde_json::to_string(&cleanOnExitVfsPath())
         .expect("clean-on-exit VFS path must serialize");
-    format!(
+    let source = format!(
         r#"
         {}
         var globalThis = this;
@@ -456,6 +456,11 @@ fn assembleRuntimeBootstrapScript() -> String {
             return [String(kind || ''), String(identity || ''), String(source || '').length, __operitHashText(source)].join(':');
         }}
 
+        /** Compiles every executable module and serialized callback through the same engine boundary. */
+        function __operitCompileJavaScript(source) {{
+            return __operitNativeCompileModuleFactory(__operitNativePrepareJavaScript(source));
+        }}
+
         function __operitGetFactory(kind, identity, source, composeCompilation) {{
             var key = __operitBuildFactoryKey(kind, identity, source) + ":compose=" + composeCompilation;
             var cache = __operitGetFactoryCache();
@@ -464,10 +469,9 @@ fn assembleRuntimeBootstrapScript() -> String {
             }}
             var preparedSource = source;
             if (composeCompilation) {{
-                var artifact = OperitComposeArtifact.read(source);
-                preparedSource = artifact === null ? __operitNativePrepareComposeModule(source, identity) : artifact;
+                preparedSource = __operitNativePrepareComposeModule(source, identity);
             }}
-            var factory = __operitNativeCompileModuleFactory(
+            var factory = __operitCompileJavaScript(
                 __operitRuntimePrelude + '\n' + (composeCompilation ? preparedSource + (kind === 'main' ? '\n' + __operitComposeRuntimeSource : '') : source)
             );
             cache[key] = factory;
@@ -518,6 +522,8 @@ fn assembleRuntimeBootstrapScript() -> String {
                 return;
             }}
             var callState = registerCallSession(callId, params, toolPkgContext);
+            params = callState.arguments;
+            delete callState.arguments;
             callState.previousCallId = previousCallId;
             callState.previousCallRuntime = previousCallRuntime;
             globalThis.__operitCurrentCallId = callId;
@@ -581,9 +587,10 @@ fn assembleRuntimeBootstrapScript() -> String {
                 __operitNativeLogJsExecutionTrace(
                     callId,
                     'function=' + callState.lastExecFunction +
-                        ' package=' + __operitText(params && (params.__operit_ui_package_name || params.toolPkgId || params.__operit_package_name)) +
-                        ' screen=' + __operitText(params && params.__operit_script_screen) +
-                        ' context=' + __operitText(params && params.__operit_execution_context_key)
+                        ' package=' + __operitText(readCallValue('__operit_ui_package_name', '') || readCallValue('toolPkgId', '') || readCallValue('__operit_package_name', '')) +
+                        ' screen=' + __operitText(readCallValue('__operit_script_screen', '')) +
+                        ' context=' + __operitText(toolPkgContext && toolPkgContext.contextKey) +
+                        ' session=' + __operitText(params && params.__operit_compose_session_id)
                 );
             }}
             function markRequire(request, fromPath, resolvedPath) {{
@@ -913,7 +920,7 @@ fn assembleRuntimeBootstrapScript() -> String {
                 var inlineFunctionSource = readCallValue('__operit_inline_function_source', '');
                 if (inlineFunctionName && inlineFunctionSource) {{
                     markStage('evaluate_inline_hook_function');
-                    var inlineFunction = eval('(' + inlineFunctionSource + ')');
+                    var inlineFunction = __operitCompileJavaScript(__operitRuntimePrelude + '\nreturn (' + inlineFunctionSource + ');')(module, exports, require, callRuntime);
                     if (typeof inlineFunction !== 'function') {{
                         throw new Error('inline hook source did not evaluate to function');
                     }}
@@ -986,5 +993,8 @@ fn assembleRuntimeBootstrapScript() -> String {
         buildLazyLibraryBootstrapScript(),
         format!("{}\n{}\n__operitInstallV1Runtime(globalThis);", include_str!("../../../sdk/src/js_sdk/toolpkg_route_runtime.js"),
             JsExecutionScriptBuilder::buildExecutionRuntimeBridgeScript())
-    )
+    );
+    let compiled = crate::javascript::JsAsyncCompiler::compile(&source)
+        .expect("Trusted JavaScript runtime must compile");
+    format!("{}\n{compiled}", include_str!("JsAsyncHelpers.script.js"))
 }

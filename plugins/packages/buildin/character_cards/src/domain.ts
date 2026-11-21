@@ -1,4 +1,4 @@
-import { characterModelBindingMode } from "./model-binding";
+import { characterModelBinding } from "./model-binding";
 import { parseChatSelection } from "./chat-bindings";
 import type { CharacterRepository } from "./canonical";
 import { configurationReadScope } from "./configuration-reads";
@@ -7,7 +7,7 @@ import { decodeChatMarker, encodeExecutionData, markerObject } from "./chat-mark
 import { resolveChatDisplay } from "./group-execution/display";
 import { modelParticipant } from "./model-participant";
 import { withGroupParticipantPrompt } from "./group-execution/prompts";
-import type { MemoryQueryRequest, JsonValue, ChatConfigurationExecutionResult, ChatConfigurationRequest, ChatConfigurationResult, ChatParticipantProfile, CharacterRecord, DomainInput, DomainOperation, DomainOutput } from "./api";
+import type { MemoryQueryRequest, JsonValue, ChatConfigurationExecutionResult, ChatConfigurationRequest, ChatConfigurationResult, ChatParticipantProfile, CharacterRecord, GroupRecord, DomainInput, DomainOperation, DomainOutput } from "./api";
 export type { DomainInput, DomainOperation, DomainOutput, DomainOperations } from "./api";
 
 type Validator = (value: unknown, path: string) => void;
@@ -126,7 +126,7 @@ const characterFields: Fields = {
   sharedMemoryId: optional(nullable(text)), sharedMemoryMounts: optional(array(mount)), toolAccessConfig: optional(toolAccess),
   createdAt: optional(integer), updatedAt: optional(integer),
 };
-const groupFields: Fields = { name: optional(nonblank), description: optional(text), themeConfigId: optional(nullable(text)), members: optional(array(member)), createdAt: optional(integer), updatedAt: optional(integer) };
+const groupFields: Fields = { name: optional(nonblank), description: optional(text), avatarUri: optional(nullable(text)), themeConfigId: optional(nullable(text)), members: optional(array(member)), createdAt: optional(integer), updatedAt: optional(integer) };
 const tagFields: Fields = { name: optional(nonblank), description: optional(text), promptContent: optional(text), tagType: optional(enumeration("TONE", "CHARACTER", "FUNCTION", "CUSTOM")), createdAt: optional(integer), updatedAt: optional(integer) };
 const memoryFields: Fields = {
   uuid: optional(text), title: optional(nonblank), content: optional(text), contentType: optional(text), source: optional(text),
@@ -138,6 +138,7 @@ const settings = shape({
   autoSaveIntervalMinutes: required(nonnegative), nextAutoSaveRunAtMs: required(integer), memoryExtractionCustomRules: required(text),
   profileAutoUpdateEnabled: required(boolean), profileAutoUpdateLocked: required(boolean), cloudEmbeddingEnabled: required(boolean),
   cloudEmbeddingEndpoint: required(text), cloudEmbeddingApiKey: required(text), cloudEmbeddingModel: required(text),
+  cloudEmbeddingBatchSize: required(integer), rebuildWindowMessageCount: required(integer),
 });
 const searchConfig = shape({ scoreMode: required(enumeration("BALANCED", "KEYWORD_FIRST", "SEMANTIC_FIRST")), keywordWeight: required(nonnegative), tagWeight: required(nonnegative), vectorWeight: required(nonnegative), edgeWeight: required(nonnegative) });
 const empty = shape({});
@@ -281,6 +282,8 @@ export function jsonValue(value: unknown, path = "result"): JsonValue {
 export interface ChatConfigurationService extends Pick<CharacterRepository,
   "getCharacter" | "getGroup" | "getTag" | "getStore" | "listModels" | "listTtsConfigs" | "readGlobalMemoryPreferences"
 > {
+  /** Resolves group portrait bytes through the main runtime's existing image services. */
+  groupAvatar(group: GroupRecord, cards: readonly CharacterRecord[]): Promise<string | null>;
   /** Calls a typed business operation without invoking another command. */
   dispatchDomain<K extends DomainOperation>(operation: K, input: DomainInput<K>): Promise<DomainOutput<K>>;
 }
@@ -323,24 +326,7 @@ async function chatParticipant(
 ): Promise<ChatParticipantProfile> {
   nonblank(card.name, "profile.name");
   const models = await service.listModels();
-  let modelBinding: ChatConfigurationRequest["defaultModelBinding"];
-  switch (characterModelBindingMode(card.chatModelBindingMode)) {
-    case "FOLLOW_GLOBAL": modelBinding = { ...request.defaultModelBinding }; break;
-    case "FIXED_MODEL": {
-      nonblank(card.chatModelId, "profile.fixedModelId");
-      nonblank(card.chatProviderId, "Fixed model provider must be explicitly selected");
-      const candidates = models.filter(
-        /** Resolves the exact provider-scoped model selected by the user. */
-        model => model.providerId === card.chatProviderId && model.modelId === card.chatModelId,
-      );
-      if (candidates.length !== 1) throw new Error(
-        candidates.length === 0 ? "Fixed model unavailable: " + card.chatModelId : "Fixed model ambiguous: " + card.chatModelId,
-      );
-      modelBinding = { providerId: candidates[0].providerId, modelId: candidates[0].modelId };
-      break;
-    }
-    default: throw new Error("角色卡“" + card.name + "”的模型绑定模式无效，请在角色卡设置中重新绑定模型：" + card.chatModelBindingMode);
-  }
+  const modelBinding = characterModelBinding(card, request.defaultModelBinding);
   const resolvedModels = models.filter(
     /** Requires the actual configured provider/model pair. */
     model => model.providerId === modelBinding.providerId && model.modelId === modelBinding.modelId,

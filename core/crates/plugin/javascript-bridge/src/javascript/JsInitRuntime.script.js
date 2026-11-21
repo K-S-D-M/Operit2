@@ -116,6 +116,21 @@
         return mostRecentLiveCallId(excludeCallId);
     }
 
+    // These exact fields belong to the call runtime, never to a tool's business input.
+    var runtimeParameterNames = new Set([
+        '__operit_environment_owner', '__operit_package_lang', '__operit_package_state',
+        '__operit_package_caller_name', '__operit_package_chat_id',
+        '__operit_package_caller_participant_id', '__operit_package_caller_owner',
+        '__operit_package_name', '__operit_package_api_version',
+        '__operit_toolpkg_runtime_kind', '__operit_toolpkg_api_version',
+        '__operit_execution_context_key', '__operit_toolpkg_subpackage_id',
+        '__operit_ui_package_name', '__operit_script_screen',
+        '__operit_inline_function_name', '__operit_inline_function_source',
+        '__operit_registration_mode', '__operit_registration_config_scope',
+        '__operit_registration_environment_names', '__operit_plugin_id', '__operit_ipc_trace_id'
+    ]);
+
+    /** Detaches temporary host fields before any package module or business handler executes. */
     function registerCallSession(callId, params, toolPkgContext) {
         var resolvedCallId = normalizeCallId(callId);
         if (!resolvedCallId) {
@@ -126,7 +141,17 @@
         var callState = state && typeof state === 'object' ? state : {};
         callState.callId = resolvedCallId;
         callState.activatedAt = nextCallActivation();
-        callState.params = params && typeof params === 'object' ? params : {};
+        var input = params && typeof params === 'object' ? params : {};
+        callState.params = {};
+        callState.arguments = {};
+        Object.keys(input).forEach(/** Separates exact runtime names while preserving declared hook identity fields. */ function(key) {
+            var packageIdentity = key === 'toolPkgId' || key === 'containerPackageName';
+            var runtimeParameter = runtimeParameterNames.has(key);
+            if (runtimeParameter || packageIdentity) callState.params[key] = input[key];
+            if (!runtimeParameter && !(packageIdentity && input.__operit_toolpkg_runtime_kind === 'sandbox')) {
+                Object.defineProperty(callState.arguments, key, { value: input[key], enumerable: true, configurable: true, writable: true });
+            }
+        });
         callState.toolPkgContext = toolPkgContext ? Object.freeze(toolPkgContext) : null;
         callState.completed = false;
         callState.resultCompleted = false;
@@ -341,7 +366,7 @@
         callState.timerIds = {};
     }
 
-    /** Releases owned subscriptions and timers before removing the call registry entry. */
+    /** Releases subscriptions under their exact owner and restores any surviving caller. */
     function cleanupCallSession(callId) {
         var resolvedCallId = normalizeCallId(callId);
         if (!resolvedCallId) {
@@ -349,12 +374,24 @@
         }
         var registry = ensureCallRegistry();
         var callState = registry[resolvedCallId];
-        if (callState) {
+        if (!callState) return;
+        var previousCallId = normalizeCallId(root.__operitCurrentCallId);
+        var restoreCallId = previousCallId === resolvedCallId ? callState.previousCallId : previousCallId;
+        root.__operitCurrentCallId = resolvedCallId;
+        root.__operit_call_runtime_ref = callState.callRuntime;
+        try {
             callState.cleanupCallbacks.forEach(/** Releases subscriptions owned by this exact call. */ function(cleanup) { cleanup(); });
             callState.cleanupCallbacks.clear();
+        } finally {
+            try {
+                clearCallTimers(callState);
+            } finally {
+                delete registry[resolvedCallId];
+                if (normalizeCallId(root.__operitCurrentCallId) === resolvedCallId) {
+                    restoreCallContext(restoreLiveCallId(restoreCallId, resolvedCallId));
+                }
+            }
         }
-        clearCallTimers(callState);
-        delete registry[resolvedCallId];
     }
 
     /** Cancels one call and restores identity and runtime from the same surviving session. */
@@ -368,9 +405,6 @@
             return;
         }
         callState.completed = true;
-        if (root.__operitCurrentCallId === resolvedCallId) {
-            restoreCallContext(restoreLiveCallId(callState.previousCallId, resolvedCallId));
-        }
         cleanupCallSession(resolvedCallId);
     }
 

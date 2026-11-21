@@ -1,4 +1,45 @@
 {
+  "terminalProfileSelect": "选择终端配置",
+  "terminalProfilesUnavailable": "当前设备没有可用的终端。",
+  "terminalImplementationNative": "本机终端",
+  "terminalImplementationProot": "PRoot Linux 终端",
+  "terminalImplementationAndroidSystem": "Android 系统终端",
+  "terminalImplementationQemu": "QEMU Linux 模拟终端",
+  "terminalImplementationArm64": "Linux ARM64 模拟终端",
+  "terminalImplementationSystem": "系统终端",
+  "terminalImplementationBrowser": "浏览器 Linux 虚拟机",
+  "terminalInterpreterShell": "Shell 命令行",
+  "terminalBuiltinMacNative": "macOS 本机 {interpreter} 终端",
+  "terminalBuiltinMacSandbox": "macOS 沙箱 {interpreter} 终端",
+  "terminalBuiltinAndroidLinux": "Android PRoot Linux Bash 终端",
+  "terminalBuiltinAndroidSystem": "Android 系统 Shell 终端",
+  "terminalBuiltinLinux": "Linux 本机 Bash 终端",
+  "terminalBuiltinPosix": "POSIX 本机 Bash 终端",
+  "terminalBuiltinPrivileged": "系统特权 sh 终端",
+  "terminalBuiltinPowerShellDownload": "PowerShell 7 终端",
+  "terminalBuiltinPowerShell": "Windows 内置 PowerShell 7 终端",
+  "terminalBuiltinWindowsBash": "Windows 内置 Bash 终端",
+  "terminalBuiltinArm64": "Linux ARM64 模拟终端",
+  "terminalBuiltinIosSystem": "iOS 系统 sh 终端",
+  "terminalBuiltinOhosLinux": "OpenHarmony QEMU Linux 模拟终端",
+  "terminalBuiltinOhosSystem": "OpenHarmony 系统 sh 终端",
+  "terminalBuiltinBrowser": "浏览器 Linux 虚拟机终端",
+  "terminalProfilesTitle": "终端配置",
+  "terminalProfilesDescription": "为当前设备添加终端配置并选择默认项。工作区和 AI 新建的终端会话共用此设置；已有会话继续使用原来的环境。",
+  "terminalProfileAdd": "添加终端配置",
+  "terminalProfileEdit": "编辑终端配置",
+  "terminalProfileDelete": "删除终端配置",
+  "terminalProfileDeleteDescription": "删除后不能再用此配置新建终端。已经运行的会话会继续保留。默认配置需要先切换到其他配置才能删除。",
+  "terminalProfileName": "配置名称",
+  "terminalProfileNameRequired": "请输入配置名称",
+  "terminalProfileImplementation": "终端实现与解释器",
+  "terminalProfileRootfs": "根文件系统目录",
+  "terminalProfileRootfsHelp": "填写当前设备可访问的、已解压的同架构 Linux 根文件系统绝对路径，例如 Ubuntu。Android 需要包含 /bin/bash，OpenHarmony 需要包含 /bin/sh。留空使用内置环境。",
+  "terminalProfileExecutable": "解释器可执行文件路径",
+  "terminalProfileArguments": "启动器参数（JSON 数组）",
+  "terminalProfileArgumentsHelp": "例如 [\"--login\"]。启动参数放在应用管理的交互参数之前；设置启动参数时需要填写程序路径。PowerShell 5 和 7 可以分别添加为独立配置。",
+  "terminalProfileArgumentsError": "请输入字符串组成的 JSON 数组，例如 [\"--login\"]",
+  "terminalProfileNoOptions": "此终端由当前平台管理，可选择为默认终端；宿主未开放额外启动参数。",
   "@@locale": "zh",
   "chatPromoteToRoot": "提升为主对话",
   "workspaceUnsavedChangesTitle": "有未保存的修改",
@@ -110,6 +151,10 @@
   },
   "close": "关闭",
   "workspaceCloseOtherTabs": "关闭其他",
+  "workspaceOpenWith": "打开方式",
+  "workspaceDockDropTarget": "拖到工作区",
+  "workspaceBuiltInPreview": "内置预览",
+  "workspacePluginUnsavedChanges": "请先在编辑器中保存，或放弃未保存的修改。",
   "workspaceCloseTabsToRight": "关闭右侧",
   "workspaceCloseAllTabs": "关闭全部",
   "commonExpand": "展开",
@@ -173,6 +218,14 @@
   "messageLocatorFavorites": "收藏",
   "messageLocatorNoFavorites": "还没有收藏的消息",
   "messageLocatorLoadFailed": "暂时无法加载消息，请重试",
+  "messageTransformFailed": "消息显示处理失败：{error}",
+  "@messageTransformFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "messageLocatorFavoriteFailed": "收藏更新失败，请重试",
   "messageLocatorAddFavorite": "收藏消息",
   "messageLocatorRemoveFavorite": "取消收藏",
@@ -214,6 +267,7 @@
   },
   "messageSenderOther": "其他",
   "hiddenUserMessage": "隐藏的用户消息",
+  "autoTriggeredUserMessage": "自动触发",
   "workspaceSetupTitle": "设置工作区",
   "workspaceSetupSubtitle": "为您的AI项目提供一个专属的文件环境",
   "workspaceCreateTitle": "创建工作区",
@@ -389,6 +443,11 @@
   "history": "历史记录",
   "bookmarks": "收藏夹",
   "downloads": "下载",
+  "browserDownloadsAll": "全部",
+  "browserDownloadStorageHint": "文件保存在浏览器所在设备的下载目录中。打开文件时会先复制到当前工作区，也可以直接保存到工作区。",
+  "browserDownloadWorkspaceTarget": "保存到当前工作区：",
+  "browserDownloadSaveToWorkspace": "保存到工作区",
+  "browserDownloadInterrupted": "下载已中断，请重新下载",
   "scripts": "脚本",
   "zoom": "缩放",
   "zoomIn": "放大",
@@ -398,6 +457,8 @@
   "searchHistory": "搜索历史",
   "noDownloadTasks": "还没有下载任务",
   "openFile": "打开文件",
+  "workspaceFileOpening": "正在打开文件…",
+  "workspaceFileOpenTimedOut": "打开文件超时，请重试。",
   "openLocation": "打开位置",
   "retry": "重试",
   "removeRecord": "移除记录",
@@ -411,6 +472,7 @@
   "home": "主页",
   "newTab": "新建标签页",
   "openExternalApplication": "打开外部应用",
+  "browserExternalNavigationFailed": "无法打开此链接。可能未安装对应应用、链接无效，或系统拒绝了打开请求。",
   "open": "打开",
   "ok": "确定",
   "webPage": "网页",
@@ -489,8 +551,10 @@
   "settingsCategoryAppearanceSubtitle": "主题、气泡与交互",
   "settingsCategoryAppearanceDescription": "调整全局主题、背景壁纸、聊天气泡样式与信息流交互。",
   "settingsCategoryDataTitle": "数据与备份",
-  "settingsCategoryDataSubtitle": "备份、恢复、统计",
-  "settingsCategoryDataDescription": "备份聊天、插件数据和模型配置，恢复备份内容，并查看数据统计。",
+  "settingsCategoryDataSubtitle": "备份、恢复、存储",
+  "settingsCategoryDataDescription": "备份和恢复聊天、插件数据及模型配置，并管理存储位置。",
+  "settingsUsageReportTitle": "Token 用量报告",
+  "settingsUsageReportSubtitle": "模型用量、缓存与费用",
   "settingsCategoryAccessLinksTitle": "设备空间",
   "settingsCategoryAccessLinksSubtitle": "连接、同步、协同",
   "settingsCategoryAccessLinksDescription": "管理当前设备空间，连接设备并同步数据和路由。",
@@ -499,6 +563,8 @@
   "settingsCategoryGroupExperience": "显示与交互",
   "settingsCategoryGroupSystem": "数据与系统",
   "settingsGlobalBehaviorChatInputSection": "聊天输入",
+  "settingsGlobalBehaviorEnterSendsMessage": "回车键发送消息",
+  "settingsGlobalBehaviorEnterSendsMessageDescription": "关闭后，回车键换行。Ctrl+Enter 和展开输入框中的回车键始终换行。",
   "settingsGlobalBehaviorLongPastedTextAsAttachment": "将超长粘贴文本转为文件",
   "settingsGlobalBehaviorLongPastedTextThreshold": "转换阈值",
   "settingsGlobalBehaviorLongPastedTextThresholdValue": "{count} 个字符",
@@ -644,6 +710,8 @@
   "settingsModelApiEndpoint": "API 地址",
   "settingsModelModelNames": "模型名称",
   "settingsModelApiKey": "API Key",
+  "settingsModelShowApiKey": "显示 API Key",
+  "settingsModelHideApiKey": "隐藏 API Key",
   "settingsModelCodexLogin": "ChatGPT 登录",
   "settingsModelCodexLoginTitle": "登录 ChatGPT Codex",
   "settingsModelCodexLoginDescription": "OpenAI Codex 使用 ChatGPT 订阅登录，不使用 API Key。",
@@ -671,7 +739,7 @@
     }
   },
   "settingsModelApiKeyPool": "API Key 池",
-  "settingsModelApiKeyPoolDescription": "给同一个模型配置准备多个 Key，用于多 Key 轮换。",
+  "settingsModelApiKeyPoolDescription": "持续使用健康的 Key；遇到鉴权、额度、限流或临时故障时切换，并跳过冷却中的 Key。",
   "settingsModelApiKeyPoolCount": "{count} 个 Key",
   "@settingsModelApiKeyPoolCount": {
     "placeholders": {
@@ -680,11 +748,20 @@
       }
     }
   },
-  "settingsModelApiKeyPoolEmpty": "还没有 Key。添加后，运行时会按当前配置使用 Key 池。",
+  "settingsModelApiKeyPoolEmpty": "Key 池为空，请添加 Key 后再启用。",
   "settingsModelAddApiKey": "添加 Key",
   "settingsModelEditApiKey": "编辑 Key",
   "settingsModelApiKeyName": "Key 名称",
   "settingsModelApiKeyEnabled": "启用这个 Key",
+  "settingsModelPoolAddSingle": "添加当前单 Key",
+  "settingsModelPoolPaste": "每行粘贴一个 Key，可批量添加。",
+  "settingsModelPoolNoEligible": "请至少启用一个非空且未标记为不可用的 Key。",
+  "settingsModelPoolUntested": "未测试",
+  "settingsModelPoolAvailable": "可用",
+  "settingsModelPoolUnavailable": "不可用",
+  "settingsModelPoolClearMarks": "重置 Key 状态",
+  "settingsModelPoolTest": "测试未检测的 Key",
+  "settingsModelPoolNeedsModel": "保存供应商并添加模型后，即可测试 Key。",
   "settingsModelProviderId": "供应商 ID",
   "settingsModelProvidersSection": "LLM 供应商",
   "settingsModelProviderType": "供应商类型",
@@ -743,7 +820,28 @@
       "error": {}
     }
   },
-  "localModelsAddModel": "添加模型",
+  "localModelsAddModel": "在线找模型",
+  "localModelsImportFromDevice": "从设备导入",
+  "localModelsImportGgufHint": "选择一个适用于 llama.cpp 的完整 GGUF 聊天模型。",
+  "localModelsImportMnnHint": "一次选中解压后的 MNN 模型文件，包括 config.json 和权重。",
+  "localModelsImportInvalidGguf": "请只选择一个 .gguf 文件。",
+  "localModelsImportMissingConfig": "所选文件中缺少 config.json。",
+  "localModelsImportFileSizeRequired": "所选文件必须非空，并且能读取文件大小。",
+  "localModelsImportChangeFiles": "重新选择",
+  "localModelsImportFileCount": "已选择 {count} 个文件",
+  "@localModelsImportFileCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "localModelsImportName": "模型名称",
+  "localModelsImportCopyNotice": "文件将复制到应用存储，并保留在当前设备。",
+  "localModelsImportCopying": "正在复制模型文件…",
+  "localModelsImportFinishing": "正在校验并登记模型…",
+  "localModelsImportComplete": "模型已导入，打开「推理与设置」即可试跑。",
+  "localModelsImportedFile": "设备导入",
   "localModelsFilterDownloads": "下载任务",
   "localModelsAllTypes": "全部类型",
   "localModelsNoMatches": "没有符合条件的模型",
@@ -753,8 +851,12 @@
   "localModelsResultCount": "显示 {count} / {total} 个模型",
   "@localModelsResultCount": {
     "placeholders": {
-      "count": {"type": "int"},
-      "total": {"type": "int"}
+      "count": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
     }
   },
   "localModelsHubRepositoryTab": "仓库地址",
@@ -885,8 +987,8 @@
       }
     }
   },
-  "settingsModelCatalogNotDownloaded": "模型信息还没有下载",
-  "settingsModelCatalogRetry": "重试",
+  "settingsModelCatalogBundled": "使用内置模型信息，联网更新成功后自动替换",
+  "settingsModelCatalogRetry": "更新",
   "settingsModelCustomModel": "自定义模型",
   "settingsModelModelId": "模型 ID",
   "settingsModelDuplicateModelId": "该模型已添加到当前供应商。",
@@ -911,8 +1013,6 @@
   "settingsModelMaxContextLength": "最大上下文长度",
   "settingsModelMaxContextLengthInvalid": "请输入大于 0 的最大上下文长度",
   "settingsModelSummaryThreshold": "总结阈值",
-  "settingsModelSummaryByMessageCount": "按消息数总结",
-  "settingsModelSummaryMessageCount": "总结消息数阈值",
   "settingsModelCustomHeaders": "自定义 Headers",
   "settingsModelCustomParameters": "自定义参数 JSON",
   "settingsModelToolCall": "工具调用",
@@ -970,6 +1070,7 @@
   "settingsModelTestAll": "测试全部",
   "settingsModelTestProgress": "测试中 {done}/{total}",
   "settingsModelTestSummary": "{passed} 个通过，{failed} 个失败",
+  "settingsModelTestSummaryWithRestricted": "{passed} 个通过，{failed} 个失败，{restricted} 个受限",
   "settingsModelTestAllPassed": "{count} 个全部通过",
   "settingsModelTestCouldNotRun": "测试没能运行",
   "settingsModelCopyError": "复制错误信息",
@@ -985,6 +1086,9 @@
   "settingsModelTestedModel": "测试模型",
   "settingsModelConnectionTestPassed": "全部通过",
   "settingsModelConnectionTestFailed": "存在失败项",
+  "settingsModelConnectionTestRestricted": "检测受限",
+  "settingsModelTestCreditRestricted": "账户额度或输出预算受限",
+  "settingsModelTestRateRestricted": "上游限流或冷却中",
   "settingsModelCapabilitiesApplied": "已按测试结果更新模型能力开关。",
   "settingsModelCapabilitiesNeedChat": "聊天测试未通过，模型能力开关未更新。",
   "settingsModelConnectionTestError": "连接测试失败：{error}",
@@ -1474,8 +1578,13 @@
   "settingsAppearanceBubbleImageNinePatch": "拉伸九宫格",
   "settingsAppearanceBubbleImageAdjustUser": "调整用户气泡图片",
   "settingsAppearanceBubbleImageAdjustAi": "调整 AI 气泡图片",
-  "settingsAppearanceBubbleImagePreview": "预览",
-  "settingsAppearanceBubbleImagePreviewText": "这是一条气泡预览，切线展示九宫格区域",
+  "settingsAppearanceBubbleImagePreview": "实时预览",
+  "settingsAppearanceBubbleImagePreviewText": "这是一条气泡预览消息。\n可以查看边角和中间区域的实际效果。",
+  "settingsAppearanceBubbleImageSource": "原图",
+  "settingsAppearanceBubbleImageSourceHint": "原图 · 白框为裁切边界，蓝线分出九宫格；可双指缩放、拖动查看",
+  "settingsAppearanceBubbleImageFitSource": "完整显示原图",
+  "settingsAppearanceBubbleImageGrid": "九宫格",
+  "settingsAppearanceBubbleImageGridHint": "两横两竖分出九块：四角保留，上下边横向重复、左右边纵向重复，中间双向重复；拉伸模式则拉伸对应区域。起点和终点相对于裁切后的图片。",
   "settingsAppearanceBubbleImageImportFailed": "气泡图片没有生效：{error}",
   "@settingsAppearanceBubbleImageImportFailed": {
     "placeholders": {
@@ -1586,14 +1695,10 @@
       }
     }
   },
-  "settingsDataTokenSection": "使用统计",
   "settingsDataInputTokens": "输入",
   "settingsDataOutputTokens": "输出",
-  "settingsDataOpenDetailedStats": "查看详细统计",
-  "settingsDataOpenDetailedStatsDescription": "查看使用热力图，以及可按分钟缩放的各模型用量时间线。",
-  "settingsDataRefreshTokenStats": "刷新统计",
   "settingsDataResetTokenStats": "重置统计",
-  "settingsDataDetailedStatsTitle": "详细统计",
+  "settingsUsageReportResetConfirmation": "这将永久删除所有已保存的模型用量记录，聊天记录会保留。",
   "settingsDataDetailedStatsDescription": "统计基于独立保存的模型请求明细计算。",
   "settingsDataDetailedStatsEmpty": "暂无可展示的详细使用记录",
   "settingsDataDetailedStatsDateRange": "{start} 至 {end}",
@@ -1749,9 +1854,41 @@
     }
   },
   "settingsDataSnapshotBackupTitle": "完整快照",
-  "settingsDataExportRawSnapshot": "导出快照",
-  "settingsDataImportRawSnapshot": "恢复快照",
-  "settingsDataExportRawSnapshotDescription": "把聊天、插件数据、模型设置和本地文件打包成一个备份文件。恢复时会用备份里的数据覆盖当前数据。",
+  "settingsDataExportRawSnapshot": "导出完整快照",
+  "settingsDataImportRawSnapshot": "恢复完整快照",
+  "settingsDataExportRawSnapshotDescription": "将聊天、插件数据、模型设置和本地文件打包为 .opsnapshot 文件。",
+  "settingsDataDatabaseBackup": "数据库备份",
+  "settingsDataDatabaseBackupDescription": "每天保存一份数据库文件，保留最近 10 份自动备份。附件和工作区文件单独存放。",
+  "settingsDataBackupScheduled": "每日备份已开启",
+  "settingsDataBackupUnavailable": "请选择可用的文件夹以开启每日备份",
+  "settingsDataBackupNow": "立即备份",
+  "settingsDataBackupSaved": "数据库备份已保存。",
+  "settingsDataRecoverySection": "恢复数据",
+  "settingsDataRestoreDatabaseDescription": "从备份目录按日期选择一份数据库，恢复后以这份数据为准同步到其他设备。",
+  "settingsDataRestoreArchiveDescription": "用 Operit2 的完整快照替换当前运行数据，恢复后会重启应用。",
+  "settingsDataImportSection": "导入数据",
+  "settingsDataImportOperit1Description": "选择 Operit1 快照，预览后迁移聊天、模型配置和资源。",
+  "settingsDataImportChatJson": "导入聊天 JSON",
+  "settingsDataImportChatJsonDescription": "新增聊天，已有相同 ID 的聊天会更新。",
+  "settingsDataImportModelJson": "导入模型配置 JSON",
+  "settingsDataImportModelJsonDescription": "新增模型服务商配置，已有相同 ID 的配置会更新。",
+  "settingsDataImportAction": "确认导入",
+  "settingsDataReadingSnapshot": "正在读取快照",
+  "settingsDataPreparingPreview": "正在生成预览",
+  "settingsDataOperit1ImportResult": "已导入 {chatCount} 个聊天、{messageCount} 条消息。",
+  "@settingsDataOperit1ImportResult": {
+    "placeholders": {
+      "chatCount": {
+        "type": "int"
+      },
+      "messageCount": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataExportSection": "导出文件",
+  "settingsDataExportChatJson": "导出聊天 JSON",
+  "settingsDataExportModelJson": "导出模型配置 JSON",
   "settingsDataSnapshotBytes": "快照大小：{bytes} 字节",
   "@settingsDataSnapshotBytes": {
     "placeholders": {
@@ -2144,6 +2281,14 @@
   "settingsPeerPortMode": "端口分配方式",
   "settingsPeerPortModeFixed": "固定监听地址和端口",
   "settingsPeerPortModeAutomatic": "自动分配端口",
+  "settingsPeerNetworkDiscoveryHelp": "跨网络发现需要共同的目录地址和组密钥。要由本机提供目录，请留空目录地址并设置组密钥。",
+  "settingsPeerDiscoveryDirectory": "发现目录地址（可选）",
+  "settingsPeerDiscoveryGroup": "发现组密钥",
+  "settingsPeerDiscoveryGenerateKey": "生成新的发现组密钥",
+  "settingsPeerDiscoveryCopyKey": "复制发现组密钥",
+  "settingsPeerDiscoveryPort": "目录监听端口",
+  "settingsPeerDiscoveryPortHelp": "仅目录设备使用此端口；其他设备使用目录地址中的端口。",
+  "settingsPeerNetworkDiscoveryInvalid": "请检查发现设置：目录为不含路径的 HTTP(S) 地址，密钥为 16–128 字节；本机提供目录时，监听端口应为 1–65535。",
   "settingsPeerAdvanced": "高级选项",
   "settingsPeerDiscoveryUnavailable": "当前 Host 不支持在局域网广播监听服务。支持的协议仍可通过地址直接连接。",
   "settingsPeerTransportUnavailable": "当前 Host 不支持 {transport} 监听。",
@@ -2219,7 +2364,7 @@
   "deviceSpaceAddDevice": "添加设备",
   "deviceSpaceDevices": "设备",
   "deviceSpaceMemberNotPaired": "空间成员 · 未直连",
-  "deviceSpaceMemberPaired": "空间成员 · 已直连",
+  "deviceSpaceMemberPaired": "空间成员 · 已配对",
   "deviceSpacePairedOnly": "已配对",
   "deviceSpaceDirectLink": "直连",
   "deviceSpaceRelayHops": "经中继 {hops} 跳",
@@ -2253,7 +2398,13 @@
   "deviceSpaceViewRequest": "查看申请",
   "devicePickerNearby": "附近设备",
   "devicePickerDiscoveryFailed": "附近设备发现失败：{error}",
-  "@devicePickerDiscoveryFailed": {"placeholders": {"error": {"type": "String"}}},
+  "@devicePickerDiscoveryFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "devicePickerEmpty": "暂未发现附近设备",
   "devicePickerHint": "请让两台设备连接同一网络，并在对方设备开启允许被搜索。",
   "devicePickerManual": "通过地址连接",
@@ -2324,6 +2475,48 @@
   "settingsAppearanceThemeConfigSourceHint": "模板来自已安装的插件。新建后可独立编辑，并沿用外观配置同步。",
   "settingsAppearanceLoadFailed": "无法加载外观设置",
   "settingsAppearanceRepairHint": "已保存的外观没有被替换。修复资源后可以重试，也可以主动重置外观。重置会保留头像和已保存的配置，并切换到自定义外观。",
+  "settingsAppearanceAssetBackgroundFailed": "背景图片无法加载，已使用默认背景（{reference}）。",
+  "@settingsAppearanceAssetBackgroundFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetVideoFailed": "背景视频无法播放，已使用默认背景（{reference}）。",
+  "@settingsAppearanceAssetVideoFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetBubbleFailed": "气泡图片无法加载，已使用默认气泡颜色（{reference}）。",
+  "@settingsAppearanceAssetBubbleFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetPreviousRetained": "此主题资源无法加载，暂用上一张图片或媒体（{reference}），其他主题设置仍有效。",
+  "@settingsAppearanceAssetPreviousRetained": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetRetry": "重试",
+  "settingsAppearanceAssetReimportHint": "重试后仍无法加载时，请重新选择并导入可读取的图片或可播放的视频。",
+  "settingsAppearanceAssetImportFailed": "背景资源没有生效：{reason}。请选择可读取的图片或可播放的视频。",
+  "@settingsAppearanceAssetImportFailed": {
+    "placeholders": {
+      "reason": {
+        "type": "String"
+      }
+    }
+  },
   "settingsAppearanceRetry": "重试",
   "settingsAppearanceResetAfterError": "重置外观",
   "backgroundWorkIdle": "当前没有正在运行的工作",
@@ -2381,14 +2574,38 @@
   "deviceSpaceSyncChecking": "正在检查数据差异",
   "deviceSpaceSyncRecords": "正在交换数据记录",
   "deviceSpaceSyncRecordProgress": "{completed} / {total} 条 · {percent}%",
-  "@deviceSpaceSyncRecordProgress": {"placeholders": {"completed": {"type": "int"}, "total": {"type": "int"}, "percent": {"type": "int"}}},
+  "@deviceSpaceSyncRecordProgress": {
+    "placeholders": {
+      "completed": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      },
+      "percent": {
+        "type": "int"
+      }
+    }
+  },
   "deviceSpaceSyncPendingCount": "待应用 {count} 条",
-  "@deviceSpaceSyncPendingCount": {"placeholders": {"count": {"type": "int"}}},
+  "@deviceSpaceSyncPendingCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "deviceSpaceSyncCounting": "正在统计总量 · 已处理 {count} 条",
-  "@deviceSpaceSyncCounting": {"placeholders": {"count": {"type": "int"}}},
+  "@deviceSpaceSyncCounting": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "deviceSpaceSyncFiles": "正在传输并校验文件",
   "deviceSpaceSyncRetrying": "同步暂时中断，稍后自动重试",
-  "deviceSpaceSyncPending": "部分数据尚未处理完成，稍后自动重试",
+  "deviceSpaceSyncPending": "部分数据尚未处理完成",
   "deviceSpaceSyncCurrentFile": "当前文件：{done} / {total}",
   "@deviceSpaceSyncCurrentFile": {
     "placeholders": {
@@ -2433,6 +2650,7 @@
   "peerQrPaste": "或粘贴连接信息",
   "peerQrRead": "识别连接信息",
   "peerQrWrongDevice": "此连接码属于其他设备，请扫描当前所选设备的连接码。",
+  "peerPairTimeoutHint": "连接超时：未能与对方设备建立连接。常见原因是对方设备的防火墙拦截了入站连接。可改由对方设备发起连接，或在对方设备的防火墙中放行 Operit（公用网络尤其需要）。",
   "peerQrImageInvalid": "未能从图片中识别二维码。请选择清晰的二维码图片（不超过 16 MB）。",
   "peerQrCameraUnavailable": "此设备暂时无法使用相机扫码，你可以导入二维码图片或粘贴连接信息。",
   "peerQrCameraPermission": "需要相机权限才能扫码。请在系统设置中允许相机访问，也可导入图片。",
@@ -2447,13 +2665,43 @@
   "toolEditedFileCount": "已编辑 {count} 个文件",
   "toolViewChanges": "查看变更",
   "toolViewFileDiff": "查看 {fileName} 的变更",
-  "@toolEditedFileCount": {"placeholders": {"count": {"type": "int"}}},
-  "@toolViewFileDiff": {"placeholders": {"fileName": {"type": "String"}}},
+  "@toolEditedFileCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "@toolViewFileDiff": {
+    "placeholders": {
+      "fileName": {
+        "type": "String"
+      }
+    }
+  },
   "toolGroupCompleted": "已完成",
   "toolGroupExecuting": "正在执行",
-  "@toolGroupThinkingCount": {"placeholders": {"count": {"type": "int"}}},
-  "@toolGroupCallCount": {"placeholders": {"count": {"type": "int"}}},
-  "@toolGroupSearchCount": {"placeholders": {"count": {"type": "int"}}},
+  "@toolGroupThinkingCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "@toolGroupCallCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "@toolGroupSearchCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "settingsDataTimelineTitle": "模型使用时间线",
   "settingsDataTimelineHint": "每个模型一条线。双指或滚轮缩放，拖动查看其他时段，点击查看具体用量。",
   "settingsDataTimelineHours": "{hours} 小时",
@@ -2534,6 +2782,103 @@
   "settingsAppearanceThemeDeleteConfirm": "确定删除「{name}」？删除后无法恢复。",
   "settingsAppearancePreviewCollapse": "收起",
   "settingsAppearancePreviewExpand": "展开",
-  "@settingsAppearanceThemeDeleteConfirm": {"placeholders": {"name": {"type": "String"}}},
-  "settingsAppearanceThemeNew": "新建主题"
+  "@settingsAppearanceThemeDeleteConfirm": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceThemeNew": "新建主题",
+  "settingsAppearanceDeviceFonts": "设备字体",
+  "settingsAppearanceChooseDeviceFont": "选择设备字体",
+  "settingsAppearanceNoDeviceFonts": "没有匹配的设备字体",
+  "settingsAppearanceDeviceFontPreview": "字体预览：你好，世界\nThe quick brown fox · 0123456789",
+  "workspaceFileRename": "重命名",
+  "workspaceFileCopy": "复制",
+  "workspaceFileCut": "剪切",
+  "workspaceFilePaste": "粘贴",
+  "workspaceFileName": "名称",
+  "workspaceFileInvalidName": "请输入有效名称，不能包含路径分隔符。",
+  "workspaceDeleteFolderTitle": "删除文件夹？",
+  "workspaceDeleteFolderMessage": "确定删除“{name}”及其全部内容？此操作无法撤销。",
+  "@workspaceDeleteFolderMessage": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileOperationFailed": "文件操作失败：{error}",
+  "@workspaceFileOperationFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileCopyName": "{name}（副本 {index}）",
+  "@workspaceFileCopyName": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "index": {
+        "type": "int"
+      }
+    }
+  },
+  "workspaceFileSaving": "文件正在保存，请保存完成后重试。",
+  "chatBackupChooseTitle": "选择你的备份目录",
+  "chatBackupTitle": "每日聊天备份",
+  "chatBackupDescription": "应用运行时每天直接复制整个 SQLite 数据库文件，保留最近 10 份自动备份。包含数据库中的全部数据；附件文件、工作区和单独存储的配置文件不随之复制。",
+  "chatRestoreTitle": "从数据库备份恢复",
+  "chatRestoreDescription": "打开存有备份的文件夹，选择要恢复的日期。",
+  "chatRestoreChooseFolder": "选择恢复来源",
+  "chatRestoreRefresh": "刷新列表",
+  "chatRestoreSelected": "恢复所选备份",
+  "chatRestoreAction": "恢复",
+  "chatRestoreCancel": "取消",
+  "chatRestoreEmpty": "此文件夹中没有数据库备份。",
+  "chatRestoreConfirmTitle": "恢复这份数据库备份？",
+  "chatRestoreConfirmDescription": "将用 {name} 直接覆盖当前数据库文件，数据库中的全部数据都会被替换。请先停止正在运行的对话。恢复后将以这份数据库建立新的同步基线，覆盖其他设备的旧数据。",
+  "@chatRestoreConfirmDescription": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "chatRestoreSuccess": "数据库已恢复。下次同步将以这份数据为准。",
+  "chatRestoreOnboardingTitle": "从以前的备份恢复",
+  "chatRestoreOnboardingDescription": "找回重装前或卸载前保存在外部目录的聊天记录",
+  "chatBackupExternalDescription": "请选择应用外的文件夹，确保卸载后备份仍保留。iPhone 和 iPad 请在 iCloud Drive 或其他外部文件提供者中选择目录。",
+  "chatBackupChoose": "选择备份目录",
+  "chatBackupLater": "稍后设置",
+  "chatBackupChange": "更改备份目录",
+  "chatBackupMissing": "尚未设置备份目录，或原目录已不存在、无法访问。请选择目录以开启每日聊天备份。",
+  "chatBackupDirectoryUnavailable": "无法使用所选文件夹。请在可用的文件夹（如“文档”或“下载”）下新建目录，并选择该目录。",
+  "chatBackupReady": "备份目录已就绪。应用启动、回到前台及运行期间会检查每日备份。",
+  "chatBackupNow": "立即备份聊天",
+  "chatBackupNever": "尚无成功备份",
+  "chatBackupLastSuccess": "最近成功备份：{time}",
+  "@chatBackupLastSuccess": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      }
+    }
+  },
+  "terminalDistributionsTitle": "下载 Linux 发行版",
+  "terminalDistributionsDescription": "软件仅内置 Alpine。按需下载 ARM64 根文件系统，安装为独立实例后可设为默认；同一发行版可以安装多套。",
+  "terminalDistributionDownload": "下载安装",
+  "terminalInstallQueued": "等待安装",
+  "terminalInstallDownloading": "正在下载根文件系统",
+  "terminalInstallVerifying": "正在校验 SHA-256",
+  "terminalInstallExtracting": "正在安装根文件系统",
+  "terminalInstallCompleted": "安装完成，可在终端配置中选择",
+  "terminalInstallCancelled": "已取消安装",
+  "terminalInstallFailed": "安装失败",
+  "terminalProfileWslDistribution": "WSL 发行版（可选）",
+  "terminalProfileWslHelp": "使用 WSL 时选择 Bash，填写 wsl.exe 的绝对路径及 wsl --list --quiet 列出的发行版名称，例如 Ubuntu-24.04。使用本机 Bash 时留空。"
 }

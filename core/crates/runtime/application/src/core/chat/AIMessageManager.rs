@@ -6,7 +6,7 @@ use crate::core::chat::plugins::MessageProcessingPluginRegistry::{
     MessageProcessingHookParams, MessageProcessingPluginRegistry,
 };
 use crate::data::preferences::ApiPreferences::ApiPreferences;
-use operit_host_api::FileSystemHost;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 use operit_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost;
 use operit_model::AttachmentInfo::AttachmentInfo;
 use operit_model::ChatMessage::ChatMessage;
@@ -52,7 +52,7 @@ pub struct BuildUserMessageContentRequest {
     pub messageText: String,
     pub proxySenderName: Option<String>,
     pub attachments: Vec<AttachmentInfo>,
-    pub fileSystemHost: Option<Arc<dyn FileSystemHost>>,
+    pub filesystem: Option<VisualFileSystem>,
     pub workspacePath: Option<String>,
     pub replyToMessage: Option<ChatMessage>,
     pub enableDirectImageProcessing: bool,
@@ -77,7 +77,6 @@ pub struct SendMessageRequest<'a> {
     pub maxTokens: i32,
     pub tokenUsageThreshold: f64,
     pub proxySenderName: Option<String>,
-    pub notifyReplyOverride: Option<bool>,
     pub chatProviderIdOverride: Option<String>,
     pub chatModelIdOverride: Option<String>,
     pub disableWarning: bool,
@@ -274,7 +273,7 @@ impl AIMessageManager {
             .map(|attachment| {
                 Self::buildAttachmentTag(
                     attachment,
-                    request.fileSystemHost.as_deref(),
+                    request.filesystem.as_ref(),
                     request.enableDirectImageProcessing,
                     request.enableDirectAudioProcessing,
                     request.enableDirectVideoProcessing,
@@ -310,6 +309,7 @@ impl AIMessageManager {
     }
 
     #[allow(non_snake_case)]
+    /// Registers a cancellable send before preparation and transfers its stream to the collector.
     pub async fn sendMessage(
         request: SendMessageRequest<'_>,
     ) -> Result<
@@ -405,7 +405,7 @@ impl AIMessageManager {
         let enableStream = !disableStreamOutput;
 
         let mut options = SendMessageOptions::new();
-        options.cancellationToken = Some(cancellationToken);
+        options.cancellationToken = Some(cancellationToken.clone());
         options.guidanceInbox = request.guidanceInbox;
         options.message = request.messageContent;
         options.chatId = request.chatId;
@@ -418,7 +418,6 @@ impl AIMessageManager {
         options.maxTokens = request.maxTokens;
         options.tokenUsageThreshold = request.tokenUsageThreshold;
         options.proxySenderName = request.proxySenderName;
-        options.notifyReplyOverride = request.notifyReplyOverride;
         options.chatProviderIdOverride = request.chatProviderIdOverride;
         options.chatModelIdOverride = request.chatModelIdOverride;
         options.disableWarning = request.disableWarning;
@@ -459,13 +458,19 @@ impl AIMessageManager {
             return Err(AiServiceError::RequestCancelled);
         }
         options.chatConfiguration = Some(request.chatConfiguration.clone());
-        let providerResponse = if request.resume {
-            request
-                .enhancedAiService
-                .resume(ResumeRequest { options })
-                .await
-        } else {
-            request.enhancedAiService.sendMessageWithConfiguration(options, request.chatConfiguration).await
+        let providerResponse = cancellationToken.runUntilCancelled(async {
+            if request.resume {
+                request
+                    .enhancedAiService
+                    .resume(ResumeRequest { options })
+                    .await
+            } else {
+                request.enhancedAiService.sendMessageWithConfiguration(options, request.chatConfiguration).await
+            }
+        }).await;
+        let providerResponse = match providerResponse {
+            Some(result) => result,
+            None => Err(AiServiceError::RequestCancelled),
         };
         match providerResponse {
             Ok(stream) => {
@@ -523,6 +528,7 @@ impl AIMessageManager {
     }
 
     #[allow(non_snake_case)]
+    /// Builds a summary message and forwards retry errors to the owning chat surface.
     pub async fn summarizeMemory(
         enhancedAiService: &mut EnhancedAIService,
         messages: Vec<ChatMessage>,
@@ -530,6 +536,8 @@ impl AIMessageManager {
         chatId: String,
         configuration: &ChatConfigurationResult,
         progress: Option<operit_providers::chat::enhance::ConversationService::SummaryProgressCallback>,
+        trigger: Option<operit_providers::chat::enhance::ConversationService::SummaryTriggerContext>,
+        onNonFatalError: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<Option<ChatMessage>, operit_providers::chat::llmprovider::AIService::AiServiceError>
     {
         let lastSummaryIndex = messages
@@ -575,8 +583,8 @@ impl AIMessageManager {
         }).collect::<Vec<_>>();
 
         let startTime = ChatMessageTimestampAllocator::currentTimeMillis();
-        let summary = enhancedAiService
-            .generateSummaryForConfiguration(conversationToSummarize, previousSummary, chatId, configuration, progress)
+        let (summary, usage) = enhancedAiService
+            .generateSummaryForConfiguration(conversationToSummarize, previousSummary, chatId, configuration, progress, trigger, onNonFatalError)
             .await?;
         let endTime = ChatMessageTimestampAllocator::currentTimeMillis();
         if summary.trim().is_empty() {
@@ -596,9 +604,6 @@ impl AIMessageManager {
             summaryWithQuotes.trim_end().to_string()
         };
 
-        let estimatedInputTokens = (summaryWithQuotes.len() * 3 / 2).max(1) as i64;
-        let estimatedOutputTokens = (finalSummary.len() / 2).max(1) as i64;
-
         Ok(Some(ChatMessage {
             sender: "summary".to_string(),
             parts: vec![operit_model::MessagePart::MessagePart::markdown(
@@ -608,8 +613,9 @@ impl AIMessageManager {
             )],
             timestamp: ChatMessageTimestampAllocator::next(),
             roleName: "system".to_string(),
-            inputTokens: estimatedInputTokens,
-            outputTokens: estimatedOutputTokens,
+            inputTokens: usage.input,
+            outputTokens: usage.output,
+            cachedInputTokens: usage.cached_input,
             waitDurationMs: (endTime - startTime).max(1),
             sentAt: startTime,
             completedAt: endTime,
@@ -643,39 +649,16 @@ impl AIMessageManager {
     }
 
     #[allow(non_snake_case)]
+    /// Automatic summaries depend only on the configured context token threshold.
     pub fn shouldGenerateSummary(
-        messages: Vec<ChatMessage>,
         currentTokens: i64,
         maxTokens: i32,
         tokenUsageThreshold: f64,
         enableSummary: bool,
-        enableSummaryByMessageCount: bool,
-        summaryMessageCountThreshold: i32,
     ) -> bool {
-        if !enableSummary {
-            return false;
-        }
-        if maxTokens > 0 {
-            let usageRatio = currentTokens as f64 / f64::from(maxTokens);
-            if usageRatio >= tokenUsageThreshold {
-                return true;
-            }
-        }
-        if enableSummaryByMessageCount {
-            let lastSummaryIndex = messages
-                .iter()
-                .rposition(|message| message.sender == "summary");
-            let relevantMessages = match lastSummaryIndex {
-                Some(index) => &messages[index + 1..],
-                None => messages.as_slice(),
-            };
-            let userAiMessagesSinceLastSummary = relevantMessages
-                .iter()
-                .filter(|message| message.sender == "user")
-                .count() as i32;
-            return userAiMessagesSinceLastSummary >= summaryMessageCountThreshold;
-        }
-        false
+        enableSummary
+            && maxTokens > 0
+            && currentTokens as f64 / f64::from(maxTokens) >= tokenUsageThreshold
     }
 
     /// Projects history using persisted participant identities and the owner's explicit history policy.
@@ -813,22 +796,33 @@ impl AIMessageManager {
     /// Builds the serialized markup for one attachment.
     fn buildAttachmentTag(
         attachment: &AttachmentInfo,
-        fileSystemHost: Option<&dyn FileSystemHost>,
+        filesystem: Option<&VisualFileSystem>,
         enableDirectImageProcessing: bool,
         enableDirectAudioProcessing: bool,
         enableDirectVideoProcessing: bool,
     ) -> Result<String, String> {
+        if attachment.vfsPath.is_none()
+            && attachment.nodeId.is_none()
+            && attachment.filePath.starts_with("pasted_text_")
+            && attachment.mimeType == "text/plain"
+        {
+            let attributes = Self::buildAttachmentAttributes(attachment);
+            // Selected document text is data and must not close or introduce markup.
+            let content = attachment
+                .content
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            return Ok(format!("<attachment {attributes}>{content}</attachment>"));
+        }
         // A synchronized attachment has a device-independent VFS locator. Resolve
         // that exact shared path locally before considering its original host path.
-        let replica = fileSystemHost.and_then(|host| {
+        let replica = filesystem.and_then(|files| {
             let path = attachment.fileToolPath();
             if !["/operitapp/outputs/", "/operitapp/workspaces/", "/operitapp/data/data/chat_attachments/", "/app/workspaces/", "/app/outputs/", "/app/data/data/chat_attachments/"].iter().any(|root| path.starts_with(root)) { return None; }
-            let storage = operit_store::RuntimeStorageHost::defaultRuntimeStorageHostOption()?;
-            let mapper = operit_tools::files::PathMapper::PathMapper::new(storage.runtimeRootDir()?, storage.workspaceRootDir()?, storage);
-            let physical = mapper.resolve(&path).ok()?.nativePath().ok()?;
-            let found = host.fileExists(&physical).ok()?;
+            let found = files.fileExists(&path).ok()?;
             if !found.exists || found.isDirectory || found.size != attachment.fileSize { return None; }
-            let mut local = attachment.clone(); local.filePath = physical;
+            let mut local = attachment.clone(); local.filePath = path;
             Some(local)
         });
         let attachment = replica.as_ref().unwrap_or(attachment);
@@ -848,7 +842,7 @@ impl AIMessageManager {
                 .to_ascii_lowercase()
                 .starts_with("image/")
         {
-            match Self::buildDirectImageAttachmentTag(attachment, fileSystemHost) {
+            match Self::buildDirectImageAttachmentTag(attachment, filesystem) {
                 Ok(tag) => return Ok(tag),
                 Err(error) => {
                     // Match the Kotlin chain: a failed image-pool registration must fall
@@ -869,7 +863,7 @@ impl AIMessageManager {
                 .to_ascii_lowercase()
                 .starts_with("audio/")
         {
-            return Self::buildDirectMediaAttachmentTag(attachment, fileSystemHost, "audio");
+            return Self::buildDirectMediaAttachmentTag(attachment, filesystem, "audio");
         }
         if enableDirectVideoProcessing
             && attachment
@@ -877,7 +871,7 @@ impl AIMessageManager {
                 .to_ascii_lowercase()
                 .starts_with("video/")
         {
-            return Self::buildDirectMediaAttachmentTag(attachment, fileSystemHost, "video");
+            return Self::buildDirectMediaAttachmentTag(attachment, filesystem, "video");
         }
 
         let attributes = Self::buildAttachmentAttributes(attachment);
@@ -890,10 +884,10 @@ impl AIMessageManager {
     /// Builds an attachment tag and media link for a direct image attachment.
     fn buildDirectImageAttachmentTag(
         attachment: &AttachmentInfo,
-        fileSystemHost: Option<&dyn FileSystemHost>,
+        filesystem: Option<&VisualFileSystem>,
     ) -> Result<String, String> {
         let attributes = Self::buildAttachmentAttributes(attachment);
-        let imageId = Self::registerDirectImageAttachment(attachment, fileSystemHost)?;
+        let imageId = Self::registerDirectImageAttachment(attachment, filesystem)?;
         let imageLink = MediaLinkBuilder::image(&imageId);
         let mut attachedContent = "Image content has been attached as multimodal input with this message. Do not call file reading tools to read this path.".to_string();
         if !attachment.content.trim().is_empty() {
@@ -908,14 +902,13 @@ impl AIMessageManager {
     /// Registers an image attachment in the process image pool.
     fn registerDirectImageAttachment(
         attachment: &AttachmentInfo,
-        fileSystemHost: Option<&dyn FileSystemHost>,
+        filesystem: Option<&VisualFileSystem>,
     ) -> Result<String, String> {
-        let Some(fileSystemHost) = fileSystemHost else {
-            return Err("FileSystemHost is required for direct image attachment".to_string());
+        let Some(filesystem) = filesystem else {
+            return Err("VFS is required for direct image attachment".to_string());
         };
-        let bytes = fileSystemHost
-            .readFileBytes(&attachment.filePath)
-            .map_err(|error| error.message)?;
+        let source = filesystem.fileResource(None, &attachment.filePath)?;
+        let bytes = operit_host_api::FileSource::readBytes(&source).map_err(|error| error.message)?;
         if bytes.is_empty() {
             return Err(format!(
                 "image attachment is empty: {}",
@@ -935,10 +928,10 @@ impl AIMessageManager {
     /// Builds a canonical audio or video media link backed by the process media pool.
     fn buildDirectMediaAttachmentTag(
         attachment: &AttachmentInfo,
-        fileSystemHost: Option<&dyn FileSystemHost>,
+        filesystem: Option<&VisualFileSystem>,
         mediaType: &str,
     ) -> Result<String, String> {
-        let mediaId = Self::registerDirectMediaAttachment(attachment, fileSystemHost, mediaType)?;
+        let mediaId = Self::registerDirectMediaAttachment(attachment, filesystem, mediaType)?;
         let mediaLink = match mediaType {
             "audio" => MediaLinkBuilder::audio(&mediaId),
             "video" => MediaLinkBuilder::video(&mediaId),
@@ -953,17 +946,16 @@ impl AIMessageManager {
     /// Registers an audio or video attachment in the process media pool.
     fn registerDirectMediaAttachment(
         attachment: &AttachmentInfo,
-        fileSystemHost: Option<&dyn FileSystemHost>,
+        filesystem: Option<&VisualFileSystem>,
         mediaType: &str,
     ) -> Result<String, String> {
-        let Some(fileSystemHost) = fileSystemHost else {
+        let Some(filesystem) = filesystem else {
             return Err(format!(
-                "FileSystemHost is required for direct {mediaType} attachment"
+                "VFS is required for direct {mediaType} attachment"
             ));
         };
-        let bytes = fileSystemHost
-            .readFileBytes(&attachment.filePath)
-            .map_err(|error| error.message)?;
+        let source = filesystem.fileResource(None, &attachment.filePath)?;
+        let bytes = operit_host_api::FileSource::readBytes(&source).map_err(|error| error.message)?;
         if bytes.is_empty() {
             return Err(format!(
                 "{mediaType} attachment is empty: {}",
@@ -1491,6 +1483,17 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    /// Low context usage cannot trigger automatic summaries, even after many user turns.
+    #[test]
+    fn automatic_summary_requires_context_token_threshold() {
+        assert!(!AIMessageManager::shouldGenerateSummary(4_000, 200_000, 0.85, true));
+        assert!(!AIMessageManager::shouldGenerateSummary(169_999, 200_000, 0.85, true));
+        assert!(AIMessageManager::shouldGenerateSummary(170_000, 200_000, 0.85, true));
+        assert!(AIMessageManager::shouldGenerateSummary(200_000, 200_000, 0.85, true));
+        assert!(!AIMessageManager::shouldGenerateSummary(200_000, 200_000, 0.85, false));
+        assert!(!AIMessageManager::shouldGenerateSummary(4_000, 0, 0.85, true));
+    }
+
     /// Constructs an explicit descriptor for real history projection tests without a host runtime.
     fn historyConfiguration(isolate: bool, labelUsers: bool) -> ChatConfigurationResult {
         let profile = serde_json::json!({
@@ -1644,6 +1647,29 @@ mod tests {
         assert!(!tag.contains(" path="));
         assert!(!tag.contains("node_id="));
         assert!(tag.ends_with(">text</attachment>"));
+    }
+
+    #[test]
+    fn pasted_text_round_trips_as_data_not_message_markup() {
+        let content = "First & second </attachment>\n<example>";
+        let mut attachment = AttachmentInfo::new(
+            "pasted_text_1".into(),
+            "pasted_text.txt".into(),
+            "text/plain".into(),
+            content.len() as i64,
+        );
+        attachment.content = content.into();
+        let markup =
+            AIMessageManager::buildRecordedUserMessageContent("Draft text", &[attachment], None)
+                .unwrap();
+        let xml = format!("<root>{markup}</root>");
+        let parsed = roxmltree::Document::parse(&xml).unwrap();
+        let root = parsed.root_element();
+        assert_eq!(root.text(), Some("Draft text "));
+        let attachment = root.children().find(|node| node.is_element()).unwrap();
+        assert!(attachment.has_tag_name("attachment"));
+        assert_eq!(attachment.attribute("type"), Some("text/plain"));
+        assert_eq!(attachment.text(), Some(content));
     }
 
     #[test]

@@ -61,12 +61,40 @@ pub enum UIHostClickElementType {
     #[serde(rename = "bounds")]
     Bounds,
 }
-/// Inspects the current Android UI and performs element or coordinate interactions.
+
+/// Describes one native window discovered through the owning device's UI provider.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UIWindow {
+    #[serde(rename = "windowId")]
+    pub window_id: String,
+    pub title: String,
+    #[serde(rename = "packageName")]
+    pub package_name: String,
+    pub bounds: Option<String>,
+    #[serde(rename = "isActive")]
+    pub is_active: bool,
+    #[serde(rename = "isFocused")]
+    pub is_focused: bool,
+    #[serde(rename = "isMinimized")]
+    pub is_minimized: bool,
+}
+
+/// Contains the native windows available for subsequent focus and tree requests.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UIWindowList {
+    pub windows: Vec<UIWindow>,
+}
+/// Inspects the active accessible surface and performs element or coordinate interactions.
 pub trait UIHost: Send + Sync {
+    /// Lists native windows with stable IDs, titles, bounds and focus state.
+    fn listWindows(&self) -> JsFuture<UIWindowList>;
+    /// Focuses exactly the native window returned by listWindows.
+    fn focusWindow(&self, window_id: String) -> JsFuture<UIActionResultData>;
     ///
     ///Get current page information
     ///
-    fn getPageInfo(&self) -> JsFuture<UIPageResultData>;
+    fn getPageInfo(&self, window_id: Option<String>) -> JsFuture<UIPageResultData>;
     ///
     ///Tap at coordinates
     ///@param x - X coordinate
@@ -172,6 +200,10 @@ pub trait UIHost: Send + Sync {
         endY: f64,
         duration: Option<f64>,
     ) -> JsFuture<UIActionResultData>;
+}
+
+/// Declares the separate high-level automation agent API.
+pub trait UIAgentHost: Send + Sync {
     ///
     ///Run the built-in UI automation subagent.
     ///@param intent - High-level task description for the subagent, such as opening an app and sending a message.
@@ -208,7 +240,7 @@ pub struct UINodeSearchOptions {
     /// Enables case-sensitive string comparison.
     pub caseSensitive: Option<bool>,
 }
-/// Stores one Android UI element together with its hierarchy and geometry.
+/// Stores one accessible UI element together with its hierarchy and geometry.
 #[js_declaration(kind = "class")]
 pub struct UINode {
     ///
@@ -260,7 +292,7 @@ pub struct UINode {
     ///
     pub childCount: f64,
 }
-/// Traverses, searches, formats, and interacts with Android UI node trees.
+/// Traverses, searches, formats, and interacts with accessible UI node trees.
 pub trait UINodeMethods: Send + Sync {
     /// Constructs a node wrapper from a simplified node and optional parent.
     fn new(node: SimplifiedUINode, parent: Option<Arc<UINode>>) -> Arc<UINode>;

@@ -564,7 +564,24 @@ struct StateFlowInner<T> {
 
 struct StateFlowSubscribers<T> {
     nextId: usize,
-    callbacks: HashMap<usize, Arc<Mutex<dyn FnMut(T) + Send>>>,
+    callbacks: HashMap<usize, Arc<Mutex<StateFlowSubscriber<T>>>>,
+}
+
+/// Serializes one observer without retaining another copy of its state value.
+struct StateFlowSubscriber<T> {
+    callback: Box<dyn FnMut(T) + Send>,
+    lastVersion: Option<u64>,
+}
+
+impl<T> StateFlowSubscriber<T> {
+    /// Delivers a snapshot only when this observer has not received its revision.
+    fn emit(&mut self, (value, version): (T, u64)) {
+        if self.lastVersion.is_some_and(|previous| previous >= version) {
+            return;
+        }
+        self.lastVersion = Some(version);
+        (self.callback)(value);
+    }
 }
 
 struct StateFlowUpstreamSubscription {
@@ -661,6 +678,22 @@ where
             .clone()
     }
 
+    /// Reads a value and its publication revision under the writer's lock order.
+    #[allow(non_snake_case)]
+    fn versionedValue(&self) -> (T, u64) {
+        let value = self
+            .inner
+            .value
+            .lock()
+            .expect("StateFlow value mutex must not be poisoned");
+        let version = *self
+            .inner
+            .version
+            .lock()
+            .expect("StateFlow version mutex must not be poisoned");
+        (value.clone(), version)
+    }
+
     /// Reads the current state value.
     pub fn first(&self) -> FlowResult<T> {
         Ok(self.value())
@@ -755,8 +788,7 @@ where
         if *guard == value {
             return;
         }
-        *guard = value.clone();
-        drop(guard);
+        *guard = value;
         let mut version = self
             .inner
             .version
@@ -765,6 +797,7 @@ where
         *version += 1;
         self.inner.changed.notify_all();
         drop(version);
+        drop(guard);
         let subscribers = self
             .inner
             .subscribers
@@ -776,7 +809,8 @@ where
             .collect::<Vec<_>>();
         for subscriber in subscribers {
             if let Ok(mut subscriber) = subscriber.lock() {
-                subscriber(value.clone());
+                // A later writer may have published while this callback was busy.
+                subscriber.emit(self.versionedValue());
             }
         }
     }
@@ -789,8 +823,7 @@ where
             .lock()
             .expect("StateFlow value mutex must not be poisoned");
         if *guard == expect {
-            *guard = update.clone();
-            drop(guard);
+            *guard = update;
             let mut version = self
                 .inner
                 .version
@@ -799,6 +832,7 @@ where
             *version += 1;
             self.inner.changed.notify_all();
             drop(version);
+            drop(guard);
             let subscribers = self
                 .inner
                 .subscribers
@@ -810,7 +844,7 @@ where
                 .collect::<Vec<_>>();
             for subscriber in subscribers {
                 if let Ok(mut subscriber) = subscriber.lock() {
-                    subscriber(update.clone());
+                    subscriber.emit(self.versionedValue());
                 }
             }
             true
@@ -824,9 +858,12 @@ where
     where
         F: FnMut(T) + Send + 'static,
     {
-        let callback = Arc::new(Mutex::new(subscriber));
+        let callback = Arc::new(Mutex::new(StateFlowSubscriber {
+            callback: Box::new(subscriber),
+            lastVersion: None,
+        }));
         if let Ok(mut subscriber) = callback.lock() {
-            subscriber(self.value());
+            subscriber.emit(self.versionedValue());
         }
         let mut subscribers = self
             .inner
@@ -835,7 +872,13 @@ where
             .expect("StateFlow subscribers mutex must not be poisoned");
         let id = subscribers.nextId;
         subscribers.nextId += 1;
-        subscribers.callbacks.insert(id, callback);
+        subscribers.callbacks.insert(id, callback.clone());
+        drop(subscribers);
+        // Reconcile after registration so an update during the initial callback
+        // cannot leave a live observer permanently holding the old snapshot.
+        if let Ok(mut subscriber) = callback.lock() {
+            subscriber.emit(self.versionedValue());
+        }
         id
     }
 
@@ -1578,8 +1621,9 @@ pub fn stringPreferencesKey(name: &str) -> PreferencesKey {
 pub struct Preferences {
     pub(crate) values: Arc<HashMap<String, Value>>,
     pub(crate) pendingMutations: BTreeMap<String, PreferencesTransactionMutation>,
-    pub(crate) commit: Option<crate::Transaction::kernel::FileCommit>,
+    pub(crate) commit: Option<Arc<crate::Transaction::kernel::FileCommit>>,
     pub(crate) legacy: Option<Value>,
+    // Replay metadata only; business values have one owner in `values`.
     pub(crate) view: Option<crate::Transaction::Data>,
 }
 
@@ -1593,6 +1637,16 @@ impl PartialEq for Preferences {
 impl Eq for Preferences {}
 
 impl Preferences {
+    pub(crate) fn setReplayContext(&mut self, source: &crate::Transaction::Data) {
+        let mut context = crate::Transaction::Data::empty(source.owner.clone());
+        context.revision = source.revision.clone();
+        context.deleted = source.deleted.clone();
+        context.aliases = source.aliases.clone();
+        context.versions = source.versions.clone();
+        context.additions = source.additions.clone();
+        self.view = Some(context);
+    }
+
     /// Identifies the exact immutable snapshot, including intervening writes that restore old values.
     pub(crate) fn sharesSnapshot(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.values, &other.values)
@@ -1800,8 +1854,8 @@ impl<'de> Deserialize<'de> for Preferences {
     {
         let mut values = HashMap::<String, Value>::deserialize(deserializer)?;
         let legacy = values.remove(PREFERENCES_REPLICATION_KEY);
-        let commit = values.remove("__operit_transaction_commit").map(serde_json::from_value)
-            .transpose().map_err(serde::de::Error::custom)?;
+        let commit = values.remove("__operit_transaction_commit").map(serde_json::from_value::<crate::Transaction::kernel::FileCommit>)
+            .transpose().map_err(serde::de::Error::custom)?.map(Arc::new);
         Ok(Self {
             values: Arc::new(values),
             pendingMutations: BTreeMap::new(),
@@ -1841,7 +1895,7 @@ pub struct PreferencesDataStore {
     pub(crate) path: PathBuf,
     pub(crate) storagePath: String,
     pub(crate) storageHost: Arc<dyn RuntimeStorageHost>,
-    pub(crate) encryption: Option<PreferencesEncryption>,
+    pub(crate) encryption: Option<Arc<OnceLock<PreferencesEncryption>>>,
     pub(crate) syncOperationStore: Option<SyncOperationStore>,
     pub(crate) syncDescriptor: Option<PreferencesSyncDescriptor>,
     changeSignal: Arc<PreferencesDataStoreChangeSignal>,
@@ -2346,7 +2400,7 @@ impl std::ops::Deref for CoreNodeStateStore {
 }
 
 #[derive(Clone)]
-/// Stores encrypted credentials and secrets owned by one CoreNode.
+/// Stores node-local credentials and secrets, accepting legacy encrypted files.
 pub struct CoreNodeSecretStore {
     inner: PreferencesDataStore,
 }
@@ -2364,7 +2418,7 @@ impl CoreNodeSecretStore {
         self
     }
 
-    /// Opens encrypted node-local secrets through the default runtime storage host.
+    /// Opens plaintext node-local secrets through the default runtime storage host.
     pub fn new(path: PathBuf) -> Self {
         let storageHost = defaultRuntimeStorageHost();
         let storagePath = runtimeStoragePath(&path);
@@ -2373,19 +2427,19 @@ impl CoreNodeSecretStore {
                 storageHost,
                 path,
                 storagePath,
-                true,
+                false,
             ),
         }
     }
 
-    /// Opens encrypted node-local secrets through an explicit runtime storage host.
+    /// Opens plaintext node-local secrets through an explicit runtime storage host.
     #[allow(non_snake_case)]
     pub fn newWithStorage(
         storageHost: Arc<dyn RuntimeStorageHost>,
         storagePath: impl Into<String>,
     ) -> Self {
         Self {
-            inner: PreferencesDataStore::newNodeLocalWithStorage(storageHost, storagePath, true),
+            inner: PreferencesDataStore::newNodeLocalWithStorage(storageHost, storagePath, false),
         }
     }
 }
@@ -2539,17 +2593,6 @@ enum PreferencesSyncedMutation {
 }
 
 impl PreferencesSyncedMutation {
-    fn visit<F>(&mut self, visitor: &mut F) -> Result<(), PreferencesDataStoreError>
-    where F: FnMut(&mut Self) -> Result<(), PreferencesDataStoreError> {
-        match self {
-            Self::Transaction(mutations) => {
-                for mutation in mutations { mutation.visit(visitor)?; }
-                Ok(())
-            }
-            mutation => visitor(mutation),
-        }
-    }
-
     /// Enumerates root entities without interpreting encoded string contents.
     fn keys(&self) -> Vec<&str> {
         match self {
@@ -2892,11 +2935,6 @@ impl Hash for PreferencesDataStoreRegistryKey {
     }
 }
 
-enum StoredEncryptedPreferences {
-    LegacyPlaintext(Preferences),
-    EncryptedEnvelope(Vec<u8>),
-}
-
 impl Drop for PreferencesDataStoreFlowSubscription {
     fn drop(&mut self) {
         let Some(signal) = self.signal.upgrade() else {
@@ -2957,10 +2995,7 @@ impl PreferencesDataStore {
     ) -> Self {
         let changeSignal = preferencesDataStoreChangeSignal(&storageHost, &storagePath);
         let sharedState = preferencesDataStoreSharedState(&storageHost, &storagePath);
-        let encryption = encrypted.then(|| {
-            PreferencesEncryption::load_or_create(storageHost.as_ref())
-                .expect("preferences encryption key must be available")
-        });
+        let encryption = encrypted.then(|| Arc::new(OnceLock::new()));
         let syncDescriptor = PreferencesSyncDescriptor::forStoragePath(&storagePath);
         Self {
             path,
@@ -3000,10 +3035,7 @@ impl PreferencesDataStore {
     ) -> Self {
         let changeSignal = preferencesDataStoreChangeSignal(&storageHost, &storagePath);
         let sharedState = preferencesDataStoreSharedState(&storageHost, &storagePath);
-        let encryption = encrypted.then(|| {
-            PreferencesEncryption::load_or_create(storageHost.as_ref())
-                .expect("preferences encryption key must be available")
-        });
+        let encryption = encrypted.then(|| Arc::new(OnceLock::new()));
         Self {
             path,
             storagePath,
@@ -3244,46 +3276,58 @@ impl PreferencesDataStore {
         stringPreferencesKey(PREFERENCES_SCHEMA_VERSION_KEY_NAME)
     }
 
+    /// Reads by the on-disk format, independently of the next-write policy.
+    /// Reading never rewrites a file or creates a replacement decryption key.
+    fn decodeStoredContent<'a>(
+        &self,
+        stored: &'a [u8],
+    ) -> Result<std::borrow::Cow<'a, [u8]>, PreferencesDataStoreError> {
+        if stored.iter().all(u8::is_ascii_whitespace) {
+            return Ok(std::borrow::Cow::Borrowed(stored));
+        }
+        if storedPreferencesAreEncrypted(stored)? {
+            let encryption = PreferencesEncryption::load_existing()?;
+            return Ok(std::borrow::Cow::Owned(encryption.decrypt(&self.storagePath, stored)?));
+        }
+        Ok(std::borrow::Cow::Borrowed(stored))
+    }
+
+    /// Resolves encryption only for an explicitly encrypted write.
+    fn encryptionForWrite(&self) -> Result<Option<PreferencesEncryption>, PreferencesDataStoreError> {
+        let Some(slot) = &self.encryption else { return Ok(None); };
+        if let Some(encryption) = slot.get() { return Ok(Some(encryption.clone())); }
+        let encryption = PreferencesEncryption::load_or_create()?;
+        let _ = slot.set(encryption);
+        Ok(slot.get().cloned())
+    }
+
+    /// Allows a no-op edit to finish a pending format conversion on its next write.
+    fn storedFormatMatchesWritePolicy(&self) -> Result<bool, PreferencesDataStoreError> {
+        if !self.storageHost.exists(&self.storagePath)? { return Ok(true); }
+        let stored = self.storageHost.readBytes(&self.storagePath)?;
+        if stored.iter().all(u8::is_ascii_whitespace) { return Ok(self.encryption.is_none()); }
+        let encrypted = storedPreferencesAreEncrypted(&stored)?;
+        Ok(encrypted == self.encryption.is_some())
+    }
+
     pub(crate) fn readFromStorage(&self) -> Result<Preferences, PreferencesDataStoreError> {
         if !self.storageHost.exists(&self.storagePath)? {
             return Ok(emptyPreferences());
         }
-        let storedContent = self.storageHost.readBytes(&self.storagePath)?;
-        let contentBytes = match &self.encryption {
-            Some(encryption) => match classifyStoredEncryptedPreferences(&storedContent)? {
-                StoredEncryptedPreferences::LegacyPlaintext(preferences) => {
-                    let encrypted = encryption.encrypt(&self.storagePath, &storedContent)?;
-                    self.storageHost.writeBytes(&self.storagePath, &encrypted)?;
-                    return Ok(preferences);
-                }
-                StoredEncryptedPreferences::EncryptedEnvelope(content) => {
-                    encryption.decrypt(&self.storagePath, &content)?
-                }
-            },
-            None => storedContent,
-        };
-        let content = String::from_utf8(contentBytes)
-            .map_err(|error| PreferencesDataStoreError::Message(error.to_string()))?;
-        if content.trim().is_empty() {
-            return Ok(emptyPreferences());
-        }
-        Ok(serde_json::from_str(&content)?)
+        let stored = self.storageHost.readBytes(&self.storagePath)?;
+        let bytes = self.decodeStoredContent(&stored)?;
+        if bytes.iter().all(u8::is_ascii_whitespace) { return Ok(emptyPreferences()); }
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub(crate) fn readPlaintextFile(&self) -> Result<String, PreferencesDataStoreError> {
         let stored = self.storageHost.readBytes(&self.storagePath)?;
-        let bytes = match &self.encryption {
-            Some(encryption) => match classifyStoredEncryptedPreferences(&stored)? {
-                StoredEncryptedPreferences::LegacyPlaintext(_) => stored,
-                StoredEncryptedPreferences::EncryptedEnvelope(content) => encryption.decrypt(&self.storagePath, &content)?,
-            },
-            None => stored,
-        };
+        let bytes = self.decodeStoredContent(&stored)?.into_owned();
         String::from_utf8(bytes).map_err(|e| PreferencesDataStoreError::Message(e.to_string()))
     }
 
     pub(crate) fn writePlaintextFile(&self, content: &str) -> Result<(), PreferencesDataStoreError> {
-        let bytes = match &self.encryption {
+        let bytes = match self.encryptionForWrite()? {
             Some(encryption) => encryption.encrypt(&self.storagePath, content.as_bytes())?,
             None => content.as_bytes().to_vec(),
         };
@@ -3404,7 +3448,7 @@ impl PreferencesDataStore {
         preferences.pendingMutations.clear();
         let result = transform(&mut preferences)?;
         if !migrated && (Arc::ptr_eq(&preferences.values, &currentPreferences.values)
-            || preferences == currentPreferences) {
+            || preferences == currentPreferences) && self.storedFormatMatchesWritePolicy().map_err(E::from)? {
             self.releaseNodeLocalCacheUnlocked();
             return Ok(result);
         }
@@ -3438,9 +3482,10 @@ impl PreferencesDataStore {
             let bytes = if self.storageHost.exists(&self.storagePath)? {
                 self.storageHost.readBytes(&self.storagePath)?
             } else { Vec::new() };
-            let entries: BTreeMap<String, &serde_json::value::RawValue> = if bytes.iter().all(u8::is_ascii_whitespace) {
+            let plaintext = self.decodeStoredContent(&bytes)?;
+            let entries: BTreeMap<String, &serde_json::value::RawValue> = if plaintext.iter().all(u8::is_ascii_whitespace) {
                 BTreeMap::new()
-            } else { serde_json::from_slice(&bytes)? };
+            } else { serde_json::from_slice(&plaintext)? };
             let mut probe = emptyPreferences();
             if let Some(version) = entries.get(PREFERENCES_SCHEMA_VERSION_KEY_NAME) {
                 probe.set(&Self::schemaVersionKey(), serde_json::from_str::<Value>(version.get())?);
@@ -3451,6 +3496,7 @@ impl PreferencesDataStore {
                 }
 
                 drop(entries);
+                drop(plaintext);
                 let content = self.encodeStoredPreferences(&preferences)?;
                 if content == bytes { return Ok(()); }
                 drop(bytes);
@@ -3468,7 +3514,7 @@ impl PreferencesDataStore {
         if let Some(schema) = &self.schema {
             preferences.set(&Self::schemaVersionKey(), schema.currentVersion);
         }
-        if !migrated && currentPreferences == preferences {
+        if !migrated && currentPreferences == preferences && self.storedFormatMatchesWritePolicy()? {
             self.releaseNodeLocalCacheUnlocked();
             return Ok(());
         }
@@ -3512,11 +3558,16 @@ impl PreferencesDataStore {
                 "Replication metadata is reserved for the dataset commit protocol".into(),
             ));
         }
-        // Preserve the existing sorted JSON encoding without copying business
-        // value trees while both the old and new snapshots are still live.
-        let mut values = preferences.iterEntries().collect::<BTreeMap<_, _>>();
-        let commit = preferences.commit.as_ref().map(serde_json::to_value).transpose()?;
-        if let Some(ref commit) = commit { values.insert("__operit_transaction_commit", commit); }
+        // Borrow the intent as well as business values; its originals may contain
+        // large JSON trees and must not be materialized again just for encoding.
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum Entry<'a> { Value(&'a Value), Commit(&'a crate::Transaction::kernel::FileCommit) }
+        let mut values = preferences.iterEntries().map(|(key, value)| (key, Entry::Value(value)))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(commit) = preferences.commit.as_deref() {
+            values.insert("__operit_transaction_commit", Entry::Commit(commit));
+        }
 
         let bounded = self.syncDescriptor.is_none() && !self.storageHost.retainPreferencesCache();
         let mut content = PreferencesJsonBuffer { bytes: Vec::new(), measured: 0, countOnly: bounded, bounded };
@@ -3534,7 +3585,7 @@ impl PreferencesDataStore {
             content.countOnly = false;
         }
         encode(&mut content)?;
-        let storedContent = match &self.encryption {
+        let storedContent = match self.encryptionForWrite()? {
             Some(encryption) => encryption.encrypt(&self.storagePath, &content.bytes)?,
             None => content.bytes,
         };
@@ -3588,19 +3639,15 @@ impl PreferencesDataStore {
     }
 }
 
-/// Classifies encrypted-store bytes as a legacy plaintext preferences map or an envelope.
-fn classifyStoredEncryptedPreferences(
-    content: &[u8],
-) -> Result<StoredEncryptedPreferences, PreferencesDataStoreError> {
-    let value: serde_json::Value = serde_json::from_slice(content)?;
-    if value.get("format").and_then(Value::as_str) == Some("operit.preferences.encrypted") {
-        return Ok(StoredEncryptedPreferences::EncryptedEnvelope(
-            content.to_vec(),
-        ));
+/// Identifies the envelope without allocating an entire parsed plaintext dataset.
+fn storedPreferencesAreEncrypted(content: &[u8]) -> Result<bool, PreferencesDataStoreError> {
+    #[derive(Deserialize)]
+    struct Format {
+        #[serde(default)]
+        format: Value,
     }
-    Ok(StoredEncryptedPreferences::LegacyPlaintext(
-        serde_json::from_value(value)?,
-    ))
+    let marker: Format = serde_json::from_slice(content)?;
+    Ok(marker.format.as_str() == Some("operit.preferences.encrypted"))
 }
 
 /// Decodes one validated wire payload into its exact in-memory mutation.
@@ -3947,10 +3994,14 @@ impl PreferencesSyncedEntry {
                 .map_err(PreferencesDataStoreError::Message)?
         } else { BTreeSet::new() };
         let mut data = preferences.view.clone().ok_or_else(|| PreferencesDataStoreError::Message("Owner replay context is missing".into()))?;
-        for transaction in transactions.iter().filter(|transaction| !retired.contains(&transaction.id)) {
-            data.apply(transaction).map_err(PreferencesDataStoreError::Message)?;
-        }
-        preferences.values = Arc::new(data.values.iter().map(|(k,v)| (k.clone(),v.clone())).collect());
+        data.values = preferences.iterEntries()
+            .filter(|(key, _)| *key != "__operit_preferences_schema_version")
+            .map(|(key, value)| (key.to_owned(), value.clone())).collect();
+        // Coverage permits payload reclamation only after the complete history
+        // has been validated. Do not hide an invalid increment/path merely
+        // because a later assignment would overwrite its final value.
+        let mut data = data.into_applied_batch(&transactions).map_err(PreferencesDataStoreError::Message)?;
+        preferences.values = Arc::new(std::mem::take(&mut data.values).into_iter().collect());
         preferences.set(&PreferencesDataStore::schemaVersionKey(), data.owner.format);
         preferences.view = Some(data);
         Ok(retired)

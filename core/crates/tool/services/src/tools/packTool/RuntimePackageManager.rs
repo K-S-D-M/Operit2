@@ -1,3 +1,4 @@
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 #[path = "PackageRegistryReadiness.rs"]
 mod package_registry_readiness;
 pub use package_registry_readiness::{PackageRegistryLoadState, PackageRegistryReadiness};
@@ -13,6 +14,9 @@ mod text_resource_cache;
 use text_resource_cache::ToolPkgTextResourceCache;
 #[path = "ToolPkgResourceReader.rs"]
 mod resource_reader;
+#[path = "PackageRegistryScan.rs"]
+mod registry_scan;
+use registry_scan::{PackageRegistryScanner, PreparedPackageRegistry};
 
 use crate::tools::packTool::ToolPkgPublicApiUiCatalog::{
     discover_public_api_owners, ToolPkgPublicApiOwner,
@@ -23,6 +27,7 @@ use crate::tools::packTool::ToolPkgDesktopWidgetService::ToolPkgDesktopWidgetSna
 use operit_store::ExtensionStore::{ExtensionRecord, ExtensionStore};
 use operit_store::PreferencesDataStore::CoreNodeStateStore;
 use operit_store::RuntimeStorageHost::defaultRuntimeStorageHost;
+use operit_store::RuntimeFileSyncStore::RuntimeFileSyncStore;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -46,7 +51,7 @@ use crate::tools::ToolJsRuntime::{JsExecutionEngine, JsExecutionProvider};
 use crate::tools::ToolResultDataClasses::stringResultData;
 use crate::ConversationMarkupManager::ToolResult;
 use operit_host_api::{
-    FileSystemHost, HostEnvironmentDescriptor, HostManager::HostManager, HostPlatform,
+    HostEnvironmentDescriptor, HostManager::HostManager, HostPlatform,
     TimeUtils::{currentLocalDateTime, currentTimeMillis},
 };
 use operit_plugin_sdk::javascript::{
@@ -68,7 +73,7 @@ use operit_plugin_sdk::toolpkg::ToolPkgPackageService::{
     ToolPkgPackageHost, ToolPkgPackageService,
 };
 use operit_plugin_sdk::toolpkg::ToolPkgParser::{
-    ToolPkgArchiveParser, ToolPkgContainerRuntime, ToolPkgLoadResult,
+    ToolPkgArchiveParser, ToolPkgContainerRuntime, ToolPkgLoadResult, ToolPkgManifestPreview,
     ToolPkgMarketOrigin, ToolPkgResourceRuntime, ToolPkgSourceType,
     ToolPkgSubpackageRuntime,
 };
@@ -78,6 +83,7 @@ use operit_plugin_sdk::PackageManager::{PackageStateResolver, PluginPackageManag
 use operit_store::PreferencesDataStore::{stringPreferencesKey, PreferencesDataStoreError};
 use operit_store::RuntimeStorePaths::RuntimeStorePaths;
 use operit_util::AppLogger::AppLogger;
+use operit_util::RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -229,8 +235,24 @@ pub struct ExternalPackageImportResult {
     pub sourceNotice: Option<String>,
 }
 
+/// Keeps marketplace artifacts out of the local archive replacement path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PackageFileImportSource {
+    Local,
+    MarketArtifact,
+}
+
+/// Captures the exact installation whose archive a local import may replace.
+#[derive(Clone, Debug)]
+struct LocalToolPkgUpdateTarget {
+    record: ExtensionRecord,
+    runtime: ToolPkgContainerRuntime,
+    scope: ToolPkgConfigScope,
+    archive: PathBuf,
+}
+
 /// Describes one package load or import failure shown by the package manager UI.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(non_snake_case)]
 pub struct ToolPkgLoadIssue {
     pub sourcePath: String,
@@ -261,6 +283,56 @@ struct PackageScanCandidateResult {
     toolPkgLoadResult: Option<ToolPkgLoadResult>,
     sourcePath: String,
     issues: Vec<ToolPkgLoadIssue>,
+    registrationEnabled: bool,
+}
+
+/// Captures activation from installation owners before any package code is evaluated.
+#[derive(Default)]
+struct PackageScanActivation {
+    states: BTreeMap<String, (bool, bool)>,
+    selection: operit_store::ExtensionStore::ExtensionSelection,
+}
+
+impl PackageScanActivation {
+    /// Reads activation flags once for an entire scan, including the initial cold start.
+    fn read() -> Result<Self, String> {
+        let mut states = BTreeMap::new();
+        let selection = ExtensionStore::default().selection("package")?;
+        for record in &selection.records {
+            let enabled: Vec<String> = serde_json::from_value(record.settings["enabledNames"].clone())
+                .map_err(|error| format!("Invalid activation state for {}: {error}", record.id))?;
+            let disabled: Vec<String> = serde_json::from_value(record.settings["disabledNames"].clone())
+                .map_err(|error| format!("Invalid activation state for {}: {error}", record.id))?;
+            states.insert(record.id.clone(), (
+                enabled.iter().any(|name| name.trim() == record.id),
+                disabled.iter().any(|name| name.trim() == record.id),
+            ));
+        }
+        Ok(Self { states, selection })
+    }
+
+    /// Rejects a local candidate by identity before its registration code can execute.
+    fn shadowedIssue(&self, id: &str, scope: &str, path: &str) -> Option<ToolPkgLoadIssue> {
+        (scope == "device" && self.selection.records.iter()
+            .any(|record| record.id == id && record.scope == "space"))
+            .then(|| newToolPkgLoadIssue(path.into(), Some(id.into()), id.into(),
+                "duplicate_scope", format!("重复安装：{id} 已使用 space 版本，local 版本已跳过，本地数据保留。"), "package"))
+    }
+
+    /// Applies the same owner and built-in defaults as the effective enabled-package projection.
+    fn isEnabled(&self, package: &ToolPackage) -> bool {
+        let (enabled, disabled) = self.states.get(&package.name).copied().unwrap_or((false, false));
+        enabled || (package.is_built_in && package.enabled_by_default && !disabled)
+    }
+
+    /// Reuses parsed declarations only while their registration mode still matches activation.
+    fn matches(&self, result: &PackageScanCandidateResult) -> bool {
+        match &result.toolPkgLoadResult {
+            Some(loaded) => self.isEnabled(&loaded.containerPackage) == result.registrationEnabled,
+            None => result.toolPackage.as_ref().is_some_and(|package|
+                self.isEnabled(package) == result.registrationEnabled),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -275,18 +347,21 @@ pub struct RuntimePackageManager {
     pluginPackageManager: PluginPackageManager,
     cachedMcpTools: Arc<BTreeMap<String, Vec<CachedMcpToolInfo>>>,
     externalPackageScanCache: Arc<BTreeMap<String, ExternalPackageScanCacheEntry>>,
+    builtInPackageScanCache: Arc<BTreeMap<String, ExternalPackageScanCacheEntry>>,
     bundledExternalPackageScanCache: Arc<BTreeMap<String, ExternalPackageScanCacheEntry>>,
     toolPkgLoadIssues: Arc<Vec<ToolPkgLoadIssue>>,
     manualToolPkgLoadIssues: Arc<Vec<ToolPkgLoadIssue>>,
     toolPkgCacheLock: Arc<Mutex<()>>,
     toolPkgTextResourceCache: Arc<ToolPkgTextResourceCache>,
     packageRegistryReadiness: PackageRegistryReadiness,
+    registryScanSerial: Arc<tokio::sync::Mutex<()>>,
+    registryScanGeneration: u64,
     scopeState: Arc<Mutex<BTreeMap<String, ExtensionRecord>>>,
     toolPkgExecutionEngineFactory: Arc<dyn ToolPkgExecutionEngineFactory>,
     composeDslSessions: Arc<Mutex<BTreeMap<(String, String), ToolPkgComposeDslSession>>>,
     dataStore: CoreNodeStateStore,
     storePaths: RuntimeStorePaths,
-    fileSystemHost: Arc<dyn FileSystemHost>,
+    filesystem: Arc<VisualFileSystem>,
     context: Arc<HostManager>,
     toolHandler: crate::tools::AIToolHandler::AIToolHandler,
     mcpManager: MCPManager,
@@ -305,29 +380,29 @@ impl RuntimePackageManager {
                 toolHandler: toolHandler.clone(),
                 jsExecutionProvider: runtimeDependencies.shared_js_execution_provider(),
             });
-        let fileSystemHost = context
-            .fileSystemHost
-            .clone()
-            .expect("RuntimePackageManager requires a FileSystemHost");
+        let filesystem = Arc::new(context.vfs().expect("RuntimePackageManager requires VFS"));
         let mut manager = Self {
             pluginPackageManager: PluginPackageManager::new(
                 toolPkgExecutionEngineFactory.clone(),
                 Arc::new(RuntimeToolPkgAssetSource {
                     runtimeSupport: runtimeDependencies.shared_runtime_support(),
                 }),
-                fileSystemHost.clone(),
+                filesystem.clone(),
                 Arc::new(RuntimePackageStateResolver {
                     hostEnvironment: context.hostEnvironment.clone(),
                 }),
             ),
             cachedMcpTools: Arc::new(BTreeMap::new()),
             externalPackageScanCache: Arc::new(BTreeMap::new()),
+            builtInPackageScanCache: Arc::new(BTreeMap::new()),
             bundledExternalPackageScanCache: Arc::new(BTreeMap::new()),
             toolPkgLoadIssues: Arc::new(Vec::new()),
             manualToolPkgLoadIssues: Arc::new(Vec::new()),
             toolPkgCacheLock: Arc::new(Mutex::new(())),
             toolPkgTextResourceCache: Arc::new(ToolPkgTextResourceCache::default()),
             packageRegistryReadiness: PackageRegistryReadiness::new(),
+            registryScanSerial: Arc::new(tokio::sync::Mutex::new(())),
+            registryScanGeneration: 0,
             scopeState: Arc::new(Mutex::new(BTreeMap::new())),
             toolPkgExecutionEngineFactory,
             composeDslSessions: Arc::new(Mutex::new(BTreeMap::new())),
@@ -344,7 +419,7 @@ impl RuntimePackageManager {
                 from => Err(PreferencesDataStoreError::MissingMigration { from, to: from + 1 }),
             }),
             storePaths: paths,
-            fileSystemHost,
+            filesystem,
             mcpManager: MCPManager::getInstance(context.clone()),
             context: Arc::new(context),
             toolHandler,
@@ -409,32 +484,46 @@ impl RuntimePackageManager {
         Ok(captured)
     }
 
-    /// Finds exact registerApi owners from the ready catalog without invoking their handlers or building domain UI inputs.
+    /// Waits for startup before finding exact registerApi owners in the canonical catalog.
     #[allow(non_snake_case)]
     pub fn getToolPkgPublicApiOwners(
         &self,
         apiName: &str,
-    ) -> Result<Vec<ToolPkgPublicApiOwner>, String> {
-        self.packageRegistryReadiness.require_ready()?;
-        let registered = self.toolPkgManager().getToolPkgContainerRuntimes();
-        let enabled = self.getEnabledToolPkgContainerRuntimes();
-        discover_public_api_owners(apiName, &registered, &enabled)
+    ) -> impl Future<Output = Result<Vec<ToolPkgPublicApiOwner>, String>> + 'static {
+        let manager = self.toolHandler.getOrCreatePackageManager();
+        let apiName = apiName.to_string();
+        async move {
+            Self::withReady(manager, |manager| {
+                let registered = manager.toolPkgManager().getToolPkgContainerRuntimes();
+                let enabled = manager.getEnabledToolPkgContainerRuntimes();
+                discover_public_api_owners(&apiName, &registered, &enabled)
+            }).await
+        }
     }
 
-    /// Lists only methods actually published by one enabled ToolPkg in this ready snapshot.
+    /// Waits for startup before listing methods published by one enabled ToolPkg.
     #[allow(non_snake_case)]
-    pub fn getToolPkgPublicApis(&self, packageName: &str) -> Result<Vec<String>, String> {
-        let runtime = self.requireToolPkgPublicApiRuntime(packageName)?;
-        let mut names = BTreeSet::new();
-        for declaration in runtime.publicApis {
-            if !names.insert(declaration.id.clone()) {
-                return Err(format!(
-                    "Duplicate public API: {}/{}",
-                    runtime.packageName, declaration.id
-                ));
-            }
+    pub fn getToolPkgPublicApis(
+        &self,
+        packageName: &str,
+    ) -> impl Future<Output = Result<Vec<String>, String>> + 'static {
+        let manager = self.toolHandler.getOrCreatePackageManager();
+        let packageName = packageName.to_string();
+        async move {
+            Self::withReady(manager, |manager| {
+                let runtime = manager.requireToolPkgPublicApiRuntime(&packageName)?;
+                let mut names = BTreeSet::new();
+                for declaration in runtime.publicApis {
+                    if !names.insert(declaration.id.clone()) {
+                        return Err(format!(
+                            "Duplicate public API: {}/{}",
+                            runtime.packageName, declaration.id
+                        ));
+                    }
+                }
+                Ok(names.into_iter().collect())
+            }).await
         }
-        Ok(names.into_iter().collect())
     }
 
     /// Calls one registerApi export in its owning main runtime without dispatching an AI tool.
@@ -460,6 +549,7 @@ impl RuntimePackageManager {
         self.invokeToolPkgPublicApiWithDeadline(packageName, methodName, payload, Some(timeoutMillis))
     }
 
+    /// Waits outside the registry lock before preparing an invocation from its published owner.
     #[allow(non_snake_case)]
     fn invokeToolPkgPublicApiWithDeadline(
         &self,
@@ -469,6 +559,29 @@ impl RuntimePackageManager {
         timeoutMillis: Option<u64>,
     ) -> impl Future<Output = Result<serde_json::Value, String>> + 'static {
         let startedAt = currentTimeMillis();
+        let manager = self.toolHandler.getOrCreatePackageManager();
+        let packageName = packageName.to_string();
+        let methodName = methodName.to_string();
+        async move {
+            let pending = Self::withReady(manager, |manager| {
+                Ok(manager.prepareToolPkgPublicApiInvocation(
+                    &packageName, &methodName, payload, timeoutMillis, startedAt,
+                ))
+            }).await?;
+            pending.await
+        }
+    }
+
+    /// Captures one enabled publication after startup and executes it outside the registry lock.
+    #[allow(non_snake_case)]
+    fn prepareToolPkgPublicApiInvocation(
+        &self,
+        packageName: &str,
+        methodName: &str,
+        payload: serde_json::Value,
+        timeoutMillis: Option<u64>,
+        startedAt: i64,
+    ) -> impl Future<Output = Result<serde_json::Value, String>> + 'static {
         let manager = self.toolPkgManager().clone();
         let reader = self.resourceReader();
         let apiName = format!("{packageName}/{methodName}");
@@ -728,8 +841,8 @@ impl RuntimePackageManager {
     }
 
     /// Returns the file-system host required by package-adjacent services.
-    pub fn fileSystemHost(&self) -> Arc<dyn FileSystemHost> {
-        self.fileSystemHost.clone()
+    pub fn filesystem(&self) -> Arc<VisualFileSystem> {
+        self.filesystem.clone()
     }
 
     #[allow(non_snake_case)]
@@ -769,58 +882,21 @@ impl RuntimePackageManager {
 
     /// Returns the stable local identifier that binds installed market ToolPkg seals to this client.
     #[allow(non_snake_case)]
-    fn marketToolPkgInstallationId(
-        &self,
-    ) -> Result<[u8; ToolPkgProtection::MARKET_INSTALLATION_ID_SIZE], String> {
-        let key = stringPreferencesKey(MARKET_TOOLPKG_INSTALLATION_ID_KEY);
-        self.dataStore
-            .try_edit_result(|preferences| {
-                let existing = preferences.getTyped::<String>(&key)?;
-                match existing {
-                    Some(encoded) => decodeMarketToolPkgInstallationId(&encoded)
-                        .map_err(PreferencesDataStoreError::Message),
-                    None => {
-                        let installationId = ToolPkgProtection::createMarketInstallationId();
-                        preferences.set(&key, encodeMarketToolPkgInstallationId(&installationId));
-                        Ok(installationId)
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())
+    fn marketToolPkgInstallationId(&self) -> Result<[u8; ToolPkgProtection::MARKET_INSTALLATION_ID_SIZE], String> {
+        self.registryScanner().marketToolPkgInstallationId()
     }
 
     /// Verifies an archive using the seal identity of its exact installation owner.
     #[allow(non_snake_case)]
     fn isInstalledMarketToolPkg(&self, file: &Path) -> Result<bool, String> {
-        let root = self.storePaths.runtime_storage_key(file)?;
-        let records = ExtensionStore::default().records("package")?;
-        let record = records.iter().find(|record| {
-            ExtensionStore::root("package", &record.scope)
-                .is_ok_and(|directory| format!("{directory}/{}", record.sourceName) == root)
-        });
-        let installationId = match record {
-            Some(record) => decodeMarketToolPkgInstallationId(
-                record.settings["installationId"]
-                    .as_str()
-                    .ok_or("Registered installation seal is missing")?,
-            )?,
-            None => self.marketToolPkgInstallationId()?,
-        };
-        let bytes = self
-            .fileSystemHost
-            .readFileBytes(&hostPath(file))
-            .map_err(|e| e.to_string())?;
-        Ok(matches!(
-            ToolPkgProtection::verifyMarketInstallSeal(&bytes, &installationId),
-            Ok(true)
-        ))
+        self.registryScanner().isInstalledMarketToolPkg(file)
     }
 
     /// Captures only the capabilities and shared caches needed for resource I/O.
     fn resourceReader(&self) -> resource_reader::ToolPkgResourceReader {
         resource_reader::ToolPkgResourceReader {
             storePaths: self.storePaths.clone(),
-            fileSystemHost: self.fileSystemHost.clone(),
+            filesystem: self.filesystem.clone(),
             runtimeSupport: self.toolHandler.runtimeSupport(),
             toolPkgCacheLock: self.toolPkgCacheLock.clone(),
             toolPkgTextResourceCache: self.toolPkgTextResourceCache.clone(),
@@ -829,7 +905,7 @@ impl RuntimePackageManager {
 
     /// Invalidates the shared resources for one package.
     fn deleteToolPkgCacheDir(&self, packageName: &str) {
-        self.resourceReader().deleteToolPkgCacheDir(packageName);
+        let _ = self.resourceReader().deleteToolPkgCacheDir(packageName);
     }
 
     /// Ensures resources exist for synchronous package installation operations.
@@ -877,8 +953,8 @@ impl RuntimePackageManager {
         };
         if let Some(parent) = destinationFile.parent() {
             if self
-                .fileSystemHost
-                .makeDirectory(&hostPath(parent), true)
+                .filesystem
+                .makeDirectory(&vfsPathString(parent), true)
                 .is_err()
             {
                 return false;
@@ -886,27 +962,27 @@ impl RuntimePackageManager {
         }
         if ToolPkgArchiveParser::isDirectoryResourceMime(Some(&resource.mime)) {
             if !self
-                .fileSystemHost
-                .fileExists(&hostPath(&resourceFile))
+                .filesystem
+                .fileExists(&vfsPathString(&resourceFile))
                 .map(|info| info.exists && info.isDirectory)
                 .unwrap_or(false)
             {
                 return false;
             }
-            self.fileSystemHost
-                .zipFiles(&hostPath(&resourceFile), &hostPath(destinationFile))
+            self.filesystem
+                .zipFiles(&vfsPathString(&resourceFile), &vfsPathString(destinationFile))
                 .is_ok()
         } else {
             if !self
-                .fileSystemHost
-                .fileExists(&hostPath(&resourceFile))
+                .filesystem
+                .fileExists(&vfsPathString(&resourceFile))
                 .map(|info| info.exists && !info.isDirectory)
                 .unwrap_or(false)
             {
                 return false;
             }
-            self.fileSystemHost
-                .copyFile(&hostPath(&resourceFile), &hostPath(destinationFile), false)
+            self.filesystem
+                .copyFile(&vfsPathString(&resourceFile), &vfsPathString(destinationFile), false)
                 .is_ok()
         }
     }
@@ -956,7 +1032,7 @@ impl RuntimePackageManager {
             return self.generatePackageSystemPrompt(&selectedPackage);
         }
 
-        let skillManager = SkillManager::fromDefaultPaths(self.fileSystemHost());
+        let skillManager = SkillManager::fromDefaultPaths(self.filesystem());
         if skillManager
             .getAvailableSkills()
             .contains_key(&normalizedPackageName)
@@ -1008,7 +1084,7 @@ impl RuntimePackageManager {
             };
         }
 
-        let skillManager = SkillManager::fromDefaultPaths(self.fileSystemHost());
+        let skillManager = SkillManager::fromDefaultPaths(self.filesystem());
         if skillManager
             .getAvailableSkills()
             .contains_key(&normalizedPackageName)
@@ -1058,6 +1134,10 @@ impl RuntimePackageManager {
             if enabledPackageNames.contains(&child.containerPackageName) && states[&child.packageName] {
                 enabledPackageNames.insert(child.packageName.clone());
             }
+        }
+        // A2A state can only affect packages already published by reloadA2APackages.
+        if !availablePackages.values().any(is_a2a_package) {
+            return enabledPackageNames.into_iter().collect();
         }
         if let Ok(repository) = crate::tools::a2a::A2ARepository::A2ARepository::new(self.context.as_ref().clone()) {
             if let Ok(records) = repository.records() {
@@ -1133,9 +1213,10 @@ impl RuntimePackageManager {
         let mut enabledPackageNames = BTreeSet::from_iter(self.getEnabledPackageNames());
         let mut subpackageStates = self.getToolPkgSubpackageStatesInternal();
 
-        if let Some(containerRuntime) = self
+        if self
             .toolPkgManager()
             .getToolPkgContainerRuntime(&normalizedPackageName)
+            .is_some()
         {
             let containerAlreadyEnabled = enabledPackageNames.contains(&normalizedPackageName);
             enabledPackageNames.insert(normalizedPackageName.clone());
@@ -1152,13 +1233,14 @@ impl RuntimePackageManager {
                     normalizedPackageName, error
                 );
             }
-            self.ensureToolPkgCache(&containerRuntime);
-            self.notifyToolPkgRuntimeChangeListeners();
             if containerAlreadyEnabled {
                 return format!(
                     "ToolPkg container '{}' is already enabled",
                     normalizedPackageName
                 );
+            }
+            if let Err(error) = self.reloadEnabledToolPkg(&normalizedPackageName) {
+                return error;
             }
             return format!(
                 "Successfully enabled toolpkg container: {}",
@@ -1193,13 +1275,9 @@ impl RuntimePackageManager {
                     normalizedPackageName, error
                 );
             }
-            if let Some(runtime) = self
-                .toolPkgManager()
-                .getToolPkgContainerRuntime(&subpackageRuntime.containerPackageName)
-            {
-                self.ensureToolPkgCache(&runtime);
+            if let Err(error) = self.reloadEnabledToolPkg(&subpackageRuntime.containerPackageName) {
+                return error;
             }
-            self.notifyToolPkgRuntimeChangeListeners();
             return format!(
                 "Successfully enabled toolpkg subpackage: {}",
                 normalizedPackageName
@@ -1223,7 +1301,7 @@ impl RuntimePackageManager {
                 normalizedPackageName, error
             );
         }
-        self.notifyToolPkgRuntimeChangeListeners();
+        self.loadAvailablePackages();
         format!("Successfully enabled package: {}", normalizedPackageName)
     }
 
@@ -1275,7 +1353,7 @@ impl RuntimePackageManager {
             self.deleteToolPkgCacheDir(&normalizedPackageName);
             self.toolPkgManager()
                 .revokeContainerExecutionContexts(&normalizedPackageName);
-            self.notifyToolPkgRuntimeChangeListeners();
+            self.loadAvailablePackages();
             if packageWasRemoved {
                 return format!(
                     "Successfully disabled toolpkg container: {}",
@@ -1331,7 +1409,7 @@ impl RuntimePackageManager {
                     normalizedPackageName, error
                 );
             }
-            self.notifyToolPkgRuntimeChangeListeners();
+            self.loadAvailablePackages();
             return format!("Successfully disabled package: {}", normalizedPackageName);
         }
         format!("Package is already disabled: {}", normalizedPackageName)
@@ -1395,12 +1473,13 @@ impl RuntimePackageManager {
         &self,
         issue: &ToolPkgLoadIssue,
     ) -> Result<FailedPackageDeletionTarget, String> {
+        if issue.code == "duplicate_scope" { return Err("A skipped local installation is not a load failure".into()); }
         let source = Path::new(&issue.sourcePath);
         let installedScope = ["device", "space"].into_iter().find(|scope| {
             let root = ExtensionStore::root("package", scope).expect("valid package scope");
             source.parent() == Some(self.storePaths.runtime_storage_path(&root).as_path())
         });
-        let records = ExtensionStore::default().records("package")?;
+        let records = ExtensionStore::default().activeRecords("package")?;
         // Even an unreadable archive can still have a registered installation owner.
         let owner = if issue.packageName.is_none() {
             records
@@ -1425,7 +1504,7 @@ impl RuntimePackageManager {
         // directly inside an installation directory, never an asset or a scan directory.
         let sourcePath = if installedScope.is_some() {
             let info = self
-                .fileSystemHost
+                .filesystem
                 .fileExists(&issue.sourcePath)
                 .map_err(|error| error.to_string())?;
             (info.exists && !info.isDirectory).then(|| issue.sourcePath.clone())
@@ -1435,9 +1514,18 @@ impl RuntimePackageManager {
         Ok(FailedPackageDeletionTarget { owner, sourcePath })
     }
 
-    /// Reports deletion eligibility using the same installed targets as the delete operation.
+    /// Identifies a failed import operation whose diagnostic can be cleared independently.
+    #[allow(non_snake_case)]
+    fn isManualImportFailure(&self, issue: &ToolPkgLoadIssue) -> bool {
+        issue.code == "import_failed"
+            && self.manualToolPkgLoadIssues.iter().any(|current| current == issue)
+    }
+
+    /// Reports whether a failed import record or installed failure source can be removed.
     #[allow(non_snake_case)]
     pub fn canDeleteToolPkgLoadIssue(&self, issue: &ToolPkgLoadIssue) -> Result<bool, String> {
+        if issue.code == "duplicate_scope" { return Ok(false); }
+        if self.isManualImportFailure(issue) { return Ok(true); }
         if issue.packageKind == "a2a" {
             return Ok(ExtensionStore::default().records("a2a")?.iter().any(|record| Some(&record.id) == issue.packageName.as_ref()));
         }
@@ -1445,7 +1533,7 @@ impl RuntimePackageManager {
         Ok(target.owner.is_some() || target.sourcePath.is_some())
     }
 
-    /// Deletes the persisted source of a current load failure without requiring a loaded package.
+    /// Clears a failed import record or deletes the installed source of a current load failure.
     #[allow(non_snake_case)]
     pub fn deleteToolPkgLoadIssue(&mut self, issue: ToolPkgLoadIssue) -> Result<(), String> {
         let issue = self
@@ -1458,6 +1546,11 @@ impl RuntimePackageManager {
                     && current.packageKind == issue.packageKind
             })
             .ok_or("Package load issue is no longer present; refresh the package list")?;
+        if self.isManualImportFailure(&issue) {
+            Arc::make_mut(&mut self.manualToolPkgLoadIssues).retain(|current| current != &issue);
+            operit_store::ExtensionStore::notifyCatalogChanged();
+            return Ok(());
+        }
         if issue.packageKind == "a2a" {
             let id = issue.packageName.as_deref().ok_or("A2A load issue has no installation identity")?;
             crate::tools::a2a::A2ARepository::A2ARepository::new(self.context.as_ref().clone())?.delete(id)?;
@@ -1472,11 +1565,11 @@ impl RuntimePackageManager {
         }
         if let Some(sourcePath) = target.sourcePath {
             let info = self
-                .fileSystemHost
+                .filesystem
                 .fileExists(&sourcePath)
                 .map_err(|error| error.to_string())?;
             if info.exists && !info.isDirectory {
-                self.fileSystemHost
+                self.filesystem
                     .deleteFile(&sourcePath, false)
                     .map_err(|error| error.to_string())?;
                 removed = true;
@@ -1501,6 +1594,20 @@ impl RuntimePackageManager {
     /// Disables a ToolPkg container through the normal package disable flow.
     pub fn disableToolPkgContainer(&mut self, containerPackageName: &str) -> String {
         self.disablePackage(containerPackageName)
+    }
+
+    /// Materializes newly enabled declarations before publishing runtime changes to consumers.
+    fn reloadEnabledToolPkg(&mut self, packageName: &str) -> Result<(), String> {
+        self.loadAvailablePackages();
+        self.packageRegistryReadiness.require_ready()?;
+        let runtime = self.toolPkgManager().getToolPkgContainerRuntime(packageName)
+            .ok_or_else(|| {
+                let messages = self.getToolPkgLoadIssues().iter()
+                    .map(|issue| issue.message.as_str()).collect::<Vec<_>>().join("\n");
+                format!("Failed to load enabled ToolPkg '{packageName}': {messages}")
+            })?;
+        self.ensureToolPkgCache(&runtime);
+        Ok(())
     }
 
     #[allow(non_snake_case)]
@@ -2012,12 +2119,29 @@ impl RuntimePackageManager {
     #[allow(non_snake_case)]
     /// Lists bundled packages available for installation or an explicit source update.
     pub fn getBundledExternalPackageCandidates(&mut self) -> Vec<BundledExternalPackageCandidate> {
-        let scanned = self.scanBundledExternalPackageCandidates();
         let mut candidates = Vec::new();
-        for candidate in scanned
-            .into_iter()
-            .filter_map(Self::bundledExternalPackageCandidateFromScanResult)
-        {
+        let support = self.toolHandler.runtimeSupport();
+        for asset in support.bundledExternalPluginAssets().iter().chain(support.builtinPluginAssets()) {
+            if !isPackageCandidateAssetName(asset.name) {
+                continue;
+            }
+            // Catalog display must never create an engine or execute an uninstalled plugin.
+            let candidate = if asset.name.to_ascii_lowercase().ends_with(".toolpkg") {
+                match bundledToolPkgCatalogCandidate(asset.name, asset.bytes) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        self.recordAndReturnPackageError(asset.name, "toolpkg_manifest", &error, "toolpkg");
+                        continue;
+                    }
+                }
+            } else {
+                let result = self.parseBundledExternalPackageAsset(asset);
+                appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &result.issues);
+                let Some(candidate) = Self::bundledExternalPackageCandidateFromScanResult(result) else {
+                    continue;
+                };
+                candidate
+            };
             match self.bundledCandidateNeedsInstallation(&candidate) {
                 Ok(true) => candidates.push(candidate),
                 Ok(false) => {}
@@ -2040,7 +2164,7 @@ impl RuntimePackageManager {
         candidates
     }
 
-    /// Compares the installed source with its bundled asset without replacing custom implementations.
+    /// Offers only a strictly newer bundled release, including after another device updates it.
     fn bundledCandidateNeedsInstallation(
         &self,
         candidate: &BundledExternalPackageCandidate,
@@ -2049,32 +2173,15 @@ impl RuntimePackageManager {
         let Some(record) = records.get(&candidate.packageName) else {
             return Ok(true);
         };
-        if record.settings["builtin"] == true || record.settings["customized"] == true {
+        if record.settings["builtin"] == true || record.settings["customized"] == true
+            || record.sourceName != candidate.sourceFileName {
             return Ok(false);
         }
-        if record.sourceName != candidate.sourceFileName {
-            return Ok(false);
-        }
-        let root = ExtensionStore::root("package", &record.scope)?;
-        let path = self
-            .storePaths
-            .runtime_storage_path(&root)
-            .join(&record.sourceName);
-        let installed = self
-            .fileSystemHost
-            .readFileBytes(&hostPath(&path))
-            .map_err(|error| {
-                format!(
-                    "Cannot read installed package {}: {error}",
-                    candidate.packageName
-                )
-            })?;
-        let asset = bundledExternalPluginAssetByName(
-            self.toolHandler.runtimeSupport().as_ref(),
-            &candidate.sourcePath,
-        )
-        .ok_or_else(|| format!("Bundled package asset not found: {}", candidate.sourcePath))?;
-        Ok(installed.as_slice() != asset.bytes)
+        Ok(self.getToolPkgContainerRuntime(&candidate.packageName).is_some_and(|installed| {
+            operit_util::GithubReleaseUtil::GithubReleaseUtil::compareVersions(
+                &candidate.version, &installed.version,
+            ).is_ok_and(|order| order > 0)
+        }))
     }
 
     #[allow(non_snake_case)]
@@ -2189,8 +2296,8 @@ impl RuntimePackageManager {
             &ExtensionStore::root("package", scope.as_str()).expect("Validated package scope"),
         );
         if let Err(error) = self
-            .fileSystemHost
-            .makeDirectory(&hostPath(&packagesDir), true)
+            .filesystem
+            .makeDirectory(&vfsPathString(&packagesDir), true)
         {
             return self.recordAndReturnPackageError(
                 &sourcePath,
@@ -2201,8 +2308,8 @@ impl RuntimePackageManager {
         }
         let destinationFile = packagesDir.join(&sourceFileName);
         if let Err(error) = self
-            .fileSystemHost
-            .writeFileBytes(&hostPath(&destinationFile), sourceAsset.bytes)
+            .filesystem
+            .writeFileBytes(&vfsPathString(&destinationFile), sourceAsset.bytes)
         {
             return self.recordAndReturnPackageError(
                 &sourcePath,
@@ -2250,7 +2357,7 @@ impl RuntimePackageManager {
             );
         }
         Arc::make_mut(&mut self.externalPackageScanCache)
-            .remove(&destinationFile.to_string_lossy().to_string());
+            .remove(&destinationFile.to_string_lossy().replace('\\', "/"));
         self.loadAvailablePackages();
         format!(
             "Successfully imported package: {}\nStored at: {}",
@@ -2293,6 +2400,12 @@ impl RuntimePackageManager {
     pub(crate) fn selectPackageTool(&self, packageName: &str, functionName: &str)
         -> Result<operit_plugin_sdk::package::PackageTool, String> {
         self.pluginPackageManager.effectiveTool(packageName, functionName)
+    }
+
+    /// Reads the package contract without cloning its tool scripts.
+    pub(crate) fn packageApiVersion(&self, packageName: &str) -> Option<&str> {
+        self.availablePackages().get(&self.normalizePackageName(packageName))
+            .map(|package| package.api_version.as_str())
     }
 
     /// Returns raw package tool metadata by package name.
@@ -2507,19 +2620,108 @@ impl RuntimePackageManager {
     #[allow(non_snake_case)]
     /// Returns the external package storage path as display text.
     pub fn getExternalPackagesPath(&self) -> String {
-        self.storePaths.packages_dir().to_string_lossy().to_string()
+        self.storePaths.packages_dir().to_string_lossy().replace('\\', "/")
     }
 
     #[allow(non_snake_case)]
     /// Scans package sources while preserving execution engines leased by active owners.
     pub fn loadAvailablePackages(&mut self) {
+        let _ = self.loadAvailablePackagesInternal(true);
+    }
+
+    /// Local archive transactions defer runtime notifications until their publication is verified.
+    fn loadAvailablePackagesInternal(&mut self, notify: bool) -> Result<(), String> {
+        self.registryScanGeneration += 1;
         self.packageRegistryReadiness.begin_scan();
-        let assetSnapshot = self.scanBuiltInPackageAssets();
-        let mergedSnapshot = self.scanExternalPackages(&assetSnapshot);
-        self.applyPackageScanSnapshot(mergedSnapshot);
+        match self.registryScanner().scan() {
+            Ok(prepared) => {
+                let retired = self.publishPackageRegistry(prepared);
+                self.context.hostRuntimeTaskSchedulerHost.as_ref()
+                    .expect("Package scanning requires a runtime scheduler")
+                    .scheduleHostRuntimeTask("operit-package-retire", Box::new(move || {
+                        for engine in retired { engine.destroy(); }
+                    })).expect("Retired package workers must be destroyed outside the manager lock");
+                if notify { self.notifyToolPkgRuntimeChangeListeners(); }
+                self.packageRegistryReadiness.complete_scan();
+                Ok(())
+            }
+            Err(error) => {
+                self.packageRegistryReadiness.fail(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// Captures only scan capabilities and immutable parse caches from the canonical registry.
+    fn registryScanner(&self) -> PackageRegistryScanner {
+        PackageRegistryScanner {
+            runtimeSupport: self.toolHandler.runtimeSupport(),
+            toolPkgExecutionEngineFactory: self.toolPkgExecutionEngineFactory.clone(),
+            filesystem: self.filesystem.clone(), storePaths: self.storePaths.clone(),
+            dataStore: self.dataStore.clone(),
+            externalPackageScanCache: self.externalPackageScanCache.clone(),
+            builtInPackageScanCache: self.builtInPackageScanCache.clone(),
+            runtimes: self.toolPkgManager().clone(),
+        }
+    }
+
+    /// Publishes prepared declarations into the existing registry and retains its execution owner.
+    fn publishPackageRegistry(&mut self, prepared: PreparedPackageRegistry) -> Vec<Arc<dyn JsExecutionEngine>> {
+        let PreparedPackageRegistry { snapshot, scopes, externalCache, builtinCache, runtimes } = prepared;
+        self.externalPackageScanCache = externalCache;
+        self.builtInPackageScanCache = builtinCache;
+        *self.scopeState.lock().expect("package scope state mutex poisoned") = scopes;
+        self.toolPkgTextResourceCache.clear();
+        self.pluginPackageManager.replaceAvailablePackages(snapshot.availablePackages);
+        let retired = self.pluginPackageManager.publishToolPkgRuntimes(runtimes);
+        self.toolPkgLoadIssues = Arc::new(snapshot.toolPkgLoadIssues);
         self.reloadA2APackages();
-        self.notifyToolPkgRuntimeChangeListeners();
-        self.packageRegistryReadiness.complete_scan();
+        retired
+    }
+
+    /// Scans in the caller's background task while reads retain access to the published registry.
+    pub async fn reloadRegistry(manager: Arc<Mutex<Self>>) -> Result<(), String> {
+        let serial = manager.lock().map_err(|e| e.to_string())?.registryScanSerial.clone();
+        let _loading = serial.lock().await;
+        let (scanner, readiness, generation) = {
+            let mut owner = manager.lock().map_err(|e| e.to_string())?;
+            owner.registryScanGeneration += 1;
+            let readiness = owner.packageRegistryReadiness();
+            readiness.begin_scan();
+            (owner.registryScanner(), readiness, owner.registryScanGeneration)
+        };
+        let prepared = async {
+            let scheduler = manager.lock().map_err(|error| error.to_string())?
+                .context.hostRuntimeTaskSchedulerHost.clone().ok_or("Package scanning requires a runtime scheduler")?;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            scheduler.scheduleHostRuntimeTask("operit-package-scan", Box::new(move || {
+                let _ = sender.send(scanner.scan());
+            })).map_err(|error| error.to_string())?;
+            receiver.await.map_err(|error| error.to_string())?
+        }.await;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if manager.lock().map_err(|e| e.to_string())?.registryScanGeneration == generation {
+                    readiness.fail(error.clone());
+                }
+                return Err(error);
+            }
+        };
+        let retired = {
+            let mut owner = manager.lock().map_err(|e| e.to_string())?;
+            if owner.registryScanGeneration != generation {
+                return Err("Package registry scan was superseded by a newer publication".into());
+            }
+            let retired = owner.publishPackageRegistry(prepared);
+            owner.notifyToolPkgRuntimeChangeListeners();
+            readiness.complete_scan();
+            retired
+        };
+        drop(_loading);
+        for engine in retired { engine.destroy(); }
+        operit_store::ExtensionStore::notifyCatalogChanged();
+        Ok(())
     }
 
     /// Projects A2A installations into the same package catalog used by activation and tool search.
@@ -2607,8 +2809,8 @@ impl RuntimePackageManager {
                 continue;
             };
             if !self
-                .fileSystemHost
-                .fileExists(&hostPath(&sourceFile))
+                .filesystem
+                .fileExists(&vfsPathString(&sourceFile))
                 .map(|info| info.exists && !info.isDirectory)
                 .unwrap_or(false)
             {
@@ -2627,10 +2829,10 @@ impl RuntimePackageManager {
                 displayName,
                 description: toolPackage.description.resolve(false),
                 author: toolPackage.author,
-                sourcePath: sourceFile.to_string_lossy().to_string(),
+                sourcePath: sourceFile.to_string_lossy().replace('\\', "/"),
                 sourceFileName: sourceFile
                     .file_name()
-                    .map(|value| value.to_string_lossy().to_string())
+                    .map(|value| value.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_default(),
                 fileExtension: sourceFile
                     .extension()
@@ -2638,7 +2840,7 @@ impl RuntimePackageManager {
                     .unwrap_or_default(),
                 isToolPkg: false,
                 inferredVersion: None,
-                apiVersion: None,
+                apiVersion: Some(toolPackage.api_version),
             });
         }
 
@@ -2648,8 +2850,8 @@ impl RuntimePackageManager {
             }
             let sourceFile = PathBuf::from(&runtime.sourcePath);
             if !self
-                .fileSystemHost
-                .fileExists(&hostPath(&sourceFile))
+                .filesystem
+                .fileExists(&vfsPathString(&sourceFile))
                 .map(|info| info.exists && !info.isDirectory)
                 .unwrap_or(false)
             {
@@ -2668,10 +2870,10 @@ impl RuntimePackageManager {
                 displayName,
                 description: runtime.description.resolve(false),
                 author: runtime.author,
-                sourcePath: sourceFile.to_string_lossy().to_string(),
+                sourcePath: sourceFile.to_string_lossy().replace('\\', "/"),
                 sourceFileName: sourceFile
                     .file_name()
-                    .map(|value| value.to_string_lossy().to_string())
+                    .map(|value| value.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_default(),
                 fileExtension: sourceFile
                     .extension()
@@ -2695,159 +2897,6 @@ impl RuntimePackageManager {
             })
         });
         sources
-    }
-
-    #[allow(non_snake_case)]
-    /// Selects bundled assets from their current installation owner.
-    fn scanBuiltInPackageAssets(&self) -> PackageScanSnapshot {
-        let mut results = Vec::new();
-        for asset in self.toolHandler.runtimeSupport().builtinPluginAssets() {
-            if isProgressTrackedPackageSource(asset.name) {
-                beginPackageLoadProgress(asset.name);
-            }
-            let mut result = self.parseBuiltInPackageAsset(asset);
-            let packageName = Self::packageNameFromScanResult(&result);
-            let selected = match packageName.as_deref() {
-                Some(name) => ExtensionStore::default().acceptsBuiltinPackage(name),
-                None => Ok(true),
-            };
-            match selected {
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(error) => {
-                    result.toolPackage = None;
-                    result.toolPkgLoadResult = None;
-                    result.issues.push(newToolPkgLoadIssue(
-                        asset.name.to_string(), packageName, packageProgressDisplayName(asset.name),
-                        "scope_failed", error, "package",
-                    ));
-                }
-            }
-            if isProgressTrackedPackageSource(asset.name) {
-                reportPackageScanProgress(&result);
-            }
-            results.push(result);
-        }
-        self.mergePackageScanCandidateResults(results, None)
-    }
-
-    #[allow(non_snake_case)]
-    fn scanExternalPackages(&mut self, baseSnapshot: &PackageScanSnapshot) -> PackageScanSnapshot {
-        let mut files = Vec::new();
-        for scope in ["device", "space"] {
-            let root =
-                ExtensionStore::root("package", scope).expect("Package scope constants are valid");
-            let directory = self.storePaths.runtime_storage_path(&root);
-            let scan = (|| -> Result<(), String> {
-                self.fileSystemHost
-                    .makeDirectory(&hostPath(&directory), true)
-                    .map_err(|e| e.to_string())?;
-                // Upgrade old bundles before scanning; a file arriving before its descriptor
-                // is staged data, not an unregistered device-local installation.
-                let sharedSources = if scope == "space" {
-                    Some(
-                        ExtensionStore::default()
-                            .records("package")?
-                            .into_iter()
-                            .filter(|record| record.scope == "space")
-                            .map(|record| record.sourceName)
-                            .collect::<BTreeSet<_>>(),
-                    )
-                } else {
-                    None
-                };
-                let entries = self
-                    .fileSystemHost
-                    .listFiles(&hostPath(&directory))
-                    .map_err(|e| e.to_string())?;
-                files.extend(
-                    entries
-                        .into_iter()
-                        .filter(|entry| {
-                            !entry.isDirectory
-                                && sharedSources
-                                    .as_ref()
-                                    .is_none_or(|sources| sources.contains(&entry.name))
-                        })
-                        .map(|entry| directory.join(entry.name)),
-                );
-                Ok(())
-            })();
-            if let Err(error) = scan {
-                let mut snapshot = baseSnapshot.clone();
-                snapshot.toolPkgLoadIssues.push(newToolPkgLoadIssue(
-                    hostPath(&directory),
-                    None,
-                    scope.to_string(),
-                    "scan_failed",
-                    error,
-                    "external",
-                ));
-                return snapshot;
-            }
-        }
-        files.sort_by_key(|path| path.file_name().map(|name| name.to_os_string()));
-
-        let previousCache = self.externalPackageScanCache.clone();
-        let mut nextCache = BTreeMap::new();
-        let mut results = Vec::new();
-        for file in files {
-            let cacheKey = file.to_string_lossy().to_string();
-            let isMarketToolPkg = match self.isInstalledMarketToolPkg(&file) {
-                Ok(value) => value,
-                Err(error) => {
-                    let mut result = PackageScanCandidateResult::default();
-                    result.sourcePath = cacheKey.clone();
-                    result.phase = "external".to_string();
-                    result.issues.push(newToolPkgLoadIssue(
-                        cacheKey.clone(),
-                        None,
-                        hostPath(&file),
-                        "scope_failed",
-                        error,
-                        packageLoadIssueKind(&cacheKey, false, false),
-                    ));
-                    results.push(result);
-                    continue;
-                }
-            };
-            let signature = format!(
-                "{}|{}",
-                self.buildExternalPackageScanSignature(&file),
-                if isMarketToolPkg {
-                    "market"
-                } else {
-                    "external"
-                }
-            );
-            if isExternalPackageCandidateFile(&file) {
-                beginPackageLoadProgress(&cacheKey);
-            }
-            let result = previousCache
-                .get(&cacheKey)
-                .filter(|entry| entry.signature == signature)
-                .map(|entry| entry.result.clone())
-                .unwrap_or_else(|| {
-                    if isMarketToolPkg {
-                        self.parseMarketToolPkgCandidate(&file)
-                    } else {
-                        self.parseExternalPackageCandidate(&file)
-                    }
-                });
-            if isExternalPackageCandidateFile(&file) {
-                reportPackageScanProgress(&result);
-            }
-            nextCache.insert(
-                cacheKey,
-                ExternalPackageScanCacheEntry {
-                    signature,
-                    result: result.clone(),
-                },
-            );
-            results.push(result);
-        }
-        self.externalPackageScanCache = Arc::new(nextCache);
-        self.mergePackageScanCandidateResults(results, Some(baseSnapshot))
     }
 
     #[allow(non_snake_case)]
@@ -2940,333 +2989,13 @@ impl RuntimePackageManager {
         None
     }
 
+    /// Parses bundled metadata without activating an installation.
     #[allow(non_snake_case)]
-    fn parseBuiltInPackageAsset(&self, asset: &RuntimePluginAsset) -> PackageScanCandidateResult {
-        let mut result = PackageScanCandidateResult {
-            phase: "asset".to_string(),
-            sourcePath: asset.name.to_string(),
-            ..Default::default()
-        };
-        let lowerName = asset.name.to_ascii_lowercase();
-        if lowerName.ends_with(".js") || lowerName.ends_with(".ts") {
-            match ToolPkgProtection::decodeUtf8(asset.bytes).and_then(|script| {
-                JsPackageLoader::parse(&script).map(|package| ToolPackage {
-                    is_built_in: true,
-                    ..package
-                })
-            }) {
-                Ok(package) => result.toolPackage = Some(package),
-                Err(error) => result.issues.push(newToolPkgLoadIssue(
-                    asset.name.to_string(),
-                    None,
-                    packageProgressDisplayName(asset.name),
-                    "package_parse",
-                    error,
-                    "javascript",
-                )),
-            }
-        } else if lowerName.ends_with(".hjson") || lowerName.ends_with(".json") {
-            match std::str::from_utf8(asset.bytes)
-                .map_err(|error| error.to_string())
-                .and_then(|content| {
-                    JsPackageLoader::parse_metadata(content, "").map(|package| ToolPackage {
-                        is_built_in: true,
-                        ..package
-                    })
-                }) {
-                Ok(package) => result.toolPackage = Some(package),
-                Err(error) => result.issues.push(newToolPkgLoadIssue(
-                    asset.name.to_string(),
-                    None,
-                    packageProgressDisplayName(asset.name),
-                    "package_parse",
-                    error,
-                    "metadata",
-                )),
-            }
-        } else if lowerName.ends_with(".toolpkg") {
-            match self.loadToolPkgFromBuiltInAssetWithIssues(asset.name, asset.bytes) {
-                Ok((loadResult, issues)) => {
-                    result.toolPkgLoadResult = Some(loadResult);
-                    result.issues.extend(issues);
-                }
-                Err(error) => result.issues.push(newToolPkgLoadIssue(
-                    asset.name.to_string(),
-                    None,
-                    packageProgressDisplayName(asset.name),
-                    "toolpkg_load",
-                    error,
-                    "toolpkg",
-                )),
-            }
-        }
-        result
-    }
-
-    #[allow(non_snake_case)]
-    fn parseBundledExternalPackageAsset(
-        &self,
-        asset: &RuntimePluginAsset,
-    ) -> PackageScanCandidateResult {
-        let mut result = PackageScanCandidateResult {
-            phase: "bundled_external".to_string(),
-            sourcePath: asset.name.to_string(),
-            ..Default::default()
-        };
-        let lowerName = asset.name.to_ascii_lowercase();
-        if lowerName.ends_with(".js") || lowerName.ends_with(".ts") {
-            match ToolPkgProtection::decodeUtf8(asset.bytes)
-                .and_then(|script| JsPackageLoader::parse(&script))
-            {
-                Ok(package) => result.toolPackage = Some(package),
-                Err(error) => result.issues.push(newToolPkgLoadIssue(
-                    asset.name.to_string(),
-                    None,
-                    packageProgressDisplayName(asset.name),
-                    "package_parse",
-                    error,
-                    "javascript",
-                )),
-            }
-        } else if lowerName.ends_with(".hjson") || lowerName.ends_with(".json") {
-            match std::str::from_utf8(asset.bytes)
-                .map_err(|error| error.to_string())
-                .and_then(|content| JsPackageLoader::parse_metadata(content, ""))
-            {
-                Ok(package) => result.toolPackage = Some(package),
-                Err(error) => result.issues.push(newToolPkgLoadIssue(
-                    asset.name.to_string(),
-                    None,
-                    packageProgressDisplayName(asset.name),
-                    "package_parse",
-                    error,
-                    "metadata",
-                )),
-            }
-        } else if lowerName.ends_with(".toolpkg") {
-            match self.loadToolPkgFromBundledExternalAssetWithIssues(asset.name, asset.bytes) {
-                Ok((loadResult, issues)) => {
-                    result.toolPkgLoadResult = Some(loadResult);
-                    result.issues.extend(issues);
-                }
-                Err(error) => result.issues.push(newToolPkgLoadIssue(
-                    asset.name.to_string(),
-                    None,
-                    packageProgressDisplayName(asset.name),
-                    "toolpkg_load",
-                    error,
-                    "toolpkg",
-                )),
-            }
-        }
-        result
-    }
-
-    #[allow(non_snake_case)]
-    fn parseExternalPackageCandidate(&self, path: &Path) -> PackageScanCandidateResult {
-        let sourcePath = path.to_string_lossy().to_string();
-        let mut result = PackageScanCandidateResult {
-            phase: "external".to_string(),
-            sourcePath: sourcePath.clone(),
-            ..Default::default()
-        };
-        let lowerPath = sourcePath.to_ascii_lowercase();
-        if lowerPath.ends_with(".js") || lowerPath.ends_with(".ts") {
-            match self.loadPackageFromJsFileResult(path) {
-                Ok(package) => result.toolPackage = Some(package),
-                Err(error) => result.issues.push(newToolPkgLoadIssue(
-                    sourcePath.clone(),
-                    None,
-                    packageProgressDisplayName(&sourcePath),
-                    "package_parse",
-                    error,
-                    "javascript",
-                )),
-            }
-        } else if lowerPath.ends_with(".hjson") {
-            let parseResult = self
-                .context
-                .fileSystemHost
-                .as_ref()
-                .ok_or_else(|| {
-                    "FileSystemHost is required for external package loading".to_string()
-                })
-                .and_then(|fileSystemHost| {
-                    fileSystemHost
-                        .readFile(&sourcePath)
-                        .map_err(|error| error.to_string())
-                })
-                .and_then(|content| JsPackageLoader::parse_metadata(&content, ""));
-            match parseResult {
-                Ok(package) => result.toolPackage = Some(package),
-                Err(error) => result.issues.push(newToolPkgLoadIssue(
-                    sourcePath.clone(),
-                    None,
-                    packageProgressDisplayName(&sourcePath),
-                    "package_parse",
-                    error,
-                    "metadata",
-                )),
-            }
-        } else if lowerPath.ends_with(".toolpkg") {
-            match self
-                .installedPackageConfigScope(path)
-                .and_then(|scope| self.loadToolPkgFromExternalFileWithIssues(path, scope))
-            {
-                Ok((loadResult, issues)) => {
-                    result.toolPkgLoadResult = Some(loadResult);
-                    result.issues.extend(issues);
-                }
-                Err(error) => result.issues.push(newToolPkgLoadIssue(
-                    sourcePath.clone(),
-                    None,
-                    packageProgressDisplayName(&sourcePath),
-                    "toolpkg_load",
-                    error,
-                    "toolpkg",
-                )),
-            }
-        }
-        result
-    }
-
-    /// Parses one locally sealed marketplace ToolPkg from the normal package storage directory.
-    #[allow(non_snake_case)]
-    fn parseMarketToolPkgCandidate(&self, path: &Path) -> PackageScanCandidateResult {
-        let sourcePath = path.to_string_lossy().to_string();
-        let mut result = PackageScanCandidateResult {
-            phase: "external".to_string(),
-            sourcePath: sourcePath.clone(),
-            ..Default::default()
-        };
-        if !sourcePath.to_ascii_lowercase().ends_with(".toolpkg") {
-            return result;
-        }
-        match self
-            .installedPackageConfigScope(path)
-            .and_then(|scope| self.loadToolPkgFromMarketFileWithIssues(path, scope))
-        {
-            Ok((loadResult, issues)) => {
-                result.toolPkgLoadResult = Some(loadResult);
-                result.issues.extend(issues);
-            }
-            Err(error) => result.issues.push(newToolPkgLoadIssue(
-                sourcePath.clone(),
-                None,
-                packageProgressDisplayName(&sourcePath),
-                "toolpkg_load",
-                error,
-                "market_toolpkg",
-            )),
-        }
-        result
-    }
-
-    /// Merges candidate registrations while preserving explicit conflict diagnostics.
-    #[allow(non_snake_case)]
-    fn mergePackageScanCandidateResults(
-        &self,
-        candidateResults: Vec<PackageScanCandidateResult>,
-        baseSnapshot: Option<&PackageScanSnapshot>,
-    ) -> PackageScanSnapshot {
-        let mut stagedAvailablePackages = baseSnapshot
-            .map(|snapshot| snapshot.availablePackages.clone())
-            .unwrap_or_default();
-        let mut stagedToolPkgContainers = baseSnapshot
-            .map(|snapshot| snapshot.toolPkgContainers.clone())
-            .unwrap_or_default();
-        let mut stagedToolPkgSubpackages = baseSnapshot
-            .map(|snapshot| snapshot.toolPkgSubpackages.clone())
-            .unwrap_or_default();
-        let mut stagedToolPkgLoadIssues = baseSnapshot
-            .map(|snapshot| snapshot.toolPkgLoadIssues.clone())
-            .unwrap_or_default();
-
-        for result in candidateResults {
-            appendUniqueToolPkgLoadIssues(&mut stagedToolPkgLoadIssues, &result.issues);
-            if let Some(packageMetadata) = result.toolPackage {
-                if result.phase == "external"
-                    && !Self::prepareExternalStandalonePackageOverride(
-                        &packageMetadata.name,
-                        &mut stagedAvailablePackages,
-                        &mut stagedToolPkgContainers,
-                        &mut stagedToolPkgSubpackages,
-                    )
-                {
-                    stagedToolPkgLoadIssues.push(newToolPkgLoadIssue(
-                        result.sourcePath.clone(),
-                        Some(packageMetadata.name.clone()),
-                        packageMetadata.display_name.resolve(false),
-                        "duplicate_package",
-                        format!(
-                            "A package with name '{}' is already registered",
-                            packageMetadata.name
-                        ),
-                        "package",
-                    ));
-                    continue;
-                }
-                if stagedAvailablePackages.contains_key(&packageMetadata.name) {
-                    stagedToolPkgLoadIssues.push(newToolPkgLoadIssue(
-                        result.sourcePath.clone(),
-                        Some(packageMetadata.name.clone()),
-                        packageMetadata.display_name.resolve(false),
-                        "duplicate_package",
-                        format!(
-                            "A package with name '{}' is already registered",
-                            packageMetadata.name
-                        ),
-                        "package",
-                    ));
-                } else {
-                    stagedAvailablePackages.insert(packageMetadata.name.clone(), packageMetadata);
-                }
-            }
-            if let Some(loadResult) = result.toolPkgLoadResult {
-                if result.phase == "external" {
-                    if let Err(error) = Self::prepareExternalToolPkgOverride(
-                        &loadResult,
-                        &mut stagedAvailablePackages,
-                        &mut stagedToolPkgContainers,
-                        &mut stagedToolPkgSubpackages,
-                    ) {
-                        stagedToolPkgLoadIssues.push(newToolPkgLoadIssue(
-                            result.sourcePath.clone(),
-                            Some(loadResult.containerPackage.name.clone()),
-                            loadResult.containerRuntime.displayName.resolve(false),
-                            "duplicate_package",
-                            error,
-                            "toolpkg",
-                        ));
-                        continue;
-                    }
-                }
-                let packageName = loadResult.containerPackage.name.clone();
-                let displayName = loadResult.containerRuntime.displayName.resolve(false);
-                if !Self::registerToolPkgInto(
-                    loadResult,
-                    &mut stagedAvailablePackages,
-                    &mut stagedToolPkgContainers,
-                    &mut stagedToolPkgSubpackages,
-                ) {
-                    stagedToolPkgLoadIssues.push(newToolPkgLoadIssue(
-                        result.sourcePath.clone(),
-                        Some(packageName),
-                        displayName,
-                        "toolpkg_registration",
-                        "ToolPkg package registration failed".to_string(),
-                        "toolpkg",
-                    ));
-                }
-            }
-        }
-
-        PackageScanSnapshot {
-            availablePackages: stagedAvailablePackages,
-            toolPkgContainers: stagedToolPkgContainers,
-            toolPkgSubpackages: stagedToolPkgSubpackages,
-            toolPkgLoadIssues: stagedToolPkgLoadIssues,
-        }
+    fn parseBundledExternalPackageAsset(&self, asset: &RuntimePluginAsset) -> PackageScanCandidateResult {
+        self.registryScanner().parseCandidate(
+            asset.name, Ok(asset.bytes), ToolPkgSourceType::EXTERNAL,
+            Ok(ToolPkgConfigScope::Device), None,
+        )
     }
 
     /// Returns validated in-memory ownership state for the currently loaded catalog.
@@ -3315,24 +3044,7 @@ impl RuntimePackageManager {
         scope: ToolPkgConfigScope,
         requiredScope: Option<ToolPkgConfigScope>,
     ) -> Result<(), String> {
-        if requiredScope.is_some_and(|required| required != scope) {
-            return Err(format!(
-                "Package {id} cannot be installed in {} scope",
-                scope.as_str()
-            ));
-        }
-        let store = ExtensionStore::default();
-        let mut settings = serde_json::json!({
-            "builtin": builtin, "members": members, "enabledNames": [], "disabledNames": [],
-            "subpackageStates": {}, "order": 0,
-            "installationId": encodeMarketToolPkgInstallationId(&self.marketToolPkgInstallationId()?)
-        });
-        if let Some(required) = requiredScope {
-            settings["installationScope"] =
-                serde_json::to_value(required).map_err(|error| error.to_string())?;
-        }
-        store.registerInScope("package", id, source, settings, scope.as_str())?;
-        let record = store.record("package", id)?;
+        let record = self.registryScanner().registerScope(id, source, builtin, members, scope, requiredScope)?;
         self.scopeState
             .lock()
             .map_err(|e| e.to_string())?
@@ -3370,198 +3082,7 @@ impl RuntimePackageManager {
         Ok(())
     }
 
-    #[allow(non_snake_case)]
-    fn applyPackageScanSnapshot(&mut self, mut snapshot: PackageScanSnapshot) {
-        self.scopeState
-            .lock()
-            .expect("package scope state mutex poisoned")
-            .clear();
-        let mut rejected = Vec::new();
-        for (name, package) in &snapshot.availablePackages {
-            if snapshot.toolPkgSubpackages.contains_key(name) {
-                continue;
-            }
-            let registration = (|| -> Result<(), String> {
-                let (builtin, sourceName, members) = match snapshot.toolPkgContainers.get(name) {
-                    Some(container) => {
-                        let builtin = container.sourceType == ToolPkgSourceType::ASSET;
-                        let sourceName = if builtin {
-                            String::new()
-                        } else {
-                            Path::new(&container.sourcePath)
-                                .file_name()
-                                .ok_or("Package source filename is missing")?
-                                .to_string_lossy()
-                                .to_string()
-                        };
-                        let mut members = vec![name.clone()];
-                        members.extend(
-                            container
-                                .subpackages
-                                .iter()
-                                .map(|child| child.packageName.clone()),
-                        );
-                        (builtin, sourceName, members)
-                    }
-                    None => {
-                        let sourceName = if package.is_built_in {
-                            String::new()
-                        } else {
-                            let entry = self
-                                .externalPackageScanCache
-                                .values()
-                                .find(|entry| {
-                                    entry
-                                        .result
-                                        .toolPackage
-                                        .as_ref()
-                                        .is_some_and(|candidate| candidate.name == *name)
-                                })
-                                .ok_or("Scanned package lost its concrete source")?;
-                            Path::new(&entry.result.sourcePath)
-                                .file_name()
-                                .ok_or("Package source filename is missing")?
-                                .to_string_lossy()
-                                .to_string()
-                        };
-                        (package.is_built_in, sourceName, vec![name.clone()])
-                    }
-                };
-                let store = ExtensionStore::default();
-                let requiredScope = snapshot
-                    .toolPkgContainers
-                    .get(name)
-                    .map(Self::requiredInstallationScope)
-                    .transpose()?
-                    .flatten();
-                let existing = store
-                    .records("package")?
-                    .into_iter()
-                    .any(|record| record.id == *name);
-                if !existing {
-                    let scope = match snapshot.toolPkgContainers.get(name) {
-                        Some(container) if !builtin => {
-                            self.installedPackageConfigScope(Path::new(&container.sourcePath))?
-                        }
-                        _ => match requiredScope {
-                            Some(scope) => scope,
-                            None => ToolPkgConfigScope::Device,
-                        },
-                    };
-                    self.registerScope(name, &sourceName, builtin, members.clone(), scope, requiredScope)?;
-                }
-                let mut record = store.record("package", name)?;
-                if requiredScope.is_some_and(|required| required.as_str() != record.scope) {
-                    return Err(format!(
-                        "Package {name} is installed outside its required scope"
-                    ));
-                }
-                if record.sourceName != sourceName
-                    || record.settings["builtin"].as_bool() != Some(builtin)
-                {
-                    return Err(format!("Package source does not match its owner: {name}"));
-                }
-                if !builtin {
-                    let sourcePath = match snapshot.toolPkgContainers.get(name) {
-                        Some(container) => container.sourcePath.clone(),
-                        None => self
-                            .externalPackageScanCache
-                            .values()
-                            .find(|entry| {
-                                entry
-                                    .result
-                                    .toolPackage
-                                    .as_ref()
-                                    .is_some_and(|candidate| candidate.name == *name)
-                            })
-                            .ok_or("Package source is missing")?
-                            .result
-                            .sourcePath
-                            .clone(),
-                    };
-                    let actual = self
-                        .storePaths
-                        .runtime_storage_key(Path::new(&sourcePath))?;
-                    let expected = format!(
-                        "{}/{}",
-                        ExtensionStore::root("package", &record.scope)?,
-                        record.sourceName
-                    );
-                    if actual != expected {
-                        return Err(format!("Package location conflicts with its owner: {name}"));
-                    }
-                }
-                let declaredEnvironment = members.iter()
-                    .filter_map(|member| snapshot.availablePackages.get(member))
-                    .flat_map(|package| package.env.iter().map(|variable| variable.name.clone()))
-                    .collect::<Vec<_>>();
-                store.initializePackageEnvironment(name, &declaredEnvironment)?;
-                let mut settings = record.settings.clone();
-                settings["members"] =
-                    serde_json::to_value(members).map_err(|error| error.to_string())?;
-                let fields = settings
-                    .as_object_mut()
-                    .ok_or("Package settings must be an object")?;
-                match requiredScope {
-                    Some(scope) => {
-                        fields.insert(
-                            "installationScope".into(),
-                            serde_json::to_value(scope).map_err(|error| error.to_string())?,
-                        );
-                    }
-                    None => {
-                        fields.remove("installationScope");
-                    }
-                }
-                if record.settings != settings {
-                    store.setSettings("package", name, settings.clone())?;
-                    record.settings = settings;
-                }
-                self.scopeState
-                    .lock()
-                    .map_err(|e| e.to_string())?
-                    .insert(name.clone(), record);
-                Ok(())
-            })();
-            if let Err(error) = registration {
-                let ownsToolPkg = snapshot.toolPkgContainers.contains_key(name);
-                let market = snapshot
-                    .toolPkgContainers
-                    .get(name)
-                    .is_some_and(|container| container.sourceType == ToolPkgSourceType::MARKET);
-                snapshot.toolPkgLoadIssues.push(newToolPkgLoadIssue(
-                    name.clone(),
-                    Some(name.clone()),
-                    name.clone(),
-                    "scope_failed",
-                    error,
-                    packageLoadIssueKind(name, ownsToolPkg, market),
-                ));
-                rejected.push(name.clone());
-            }
-        }
-        for name in rejected {
-            if snapshot.toolPkgContainers.contains_key(&name) {
-                Self::removeToolPkgContainerFromTargets(
-                    &name,
-                    &mut snapshot.availablePackages,
-                    &mut snapshot.toolPkgContainers,
-                    &mut snapshot.toolPkgSubpackages,
-                );
-            } else {
-                snapshot.availablePackages.remove(&name);
-            }
-        }
-        // A reload also invalidates directory sources whose child files can change
-        // without changing the parent directory metadata or declared package version.
-        self.toolPkgTextResourceCache.clear();
-        self.pluginPackageManager
-            .replaceAvailablePackages(snapshot.availablePackages);
-        self.pluginPackageManager
-            .replaceToolPkgRuntimes(snapshot.toolPkgContainers, snapshot.toolPkgSubpackages);
-        self.toolPkgLoadIssues = Arc::new(snapshot.toolPkgLoadIssues);
-    }
-
+    /// Registers scanned declarations after applying the canonical ownership checks.
     #[allow(non_snake_case)]
     fn registerToolPkgInto(
         loadResult: ToolPkgLoadResult,
@@ -3569,17 +3090,13 @@ impl RuntimePackageManager {
         toolPkgContainersTarget: &mut BTreeMap<String, ToolPkgContainerRuntime>,
         toolPkgSubpackageByPackageNameTarget: &mut BTreeMap<String, ToolPkgSubpackageRuntime>,
     ) -> bool {
+        if !ToolPkgManager::canRegisterToolPkgInRegistry(
+            &loadResult, availablePackagesTarget, toolPkgContainersTarget,
+            toolPkgSubpackageByPackageNameTarget, None,
+        ) {
+            return false;
+        }
         let containerName = loadResult.containerPackage.name.clone();
-        if availablePackagesTarget.contains_key(&containerName) {
-            return false;
-        }
-        if loadResult
-            .subpackagePackages
-            .iter()
-            .any(|subpackage| availablePackagesTarget.contains_key(&subpackage.name))
-        {
-            return false;
-        }
         availablePackagesTarget.insert(containerName.clone(), loadResult.containerPackage);
         toolPkgContainersTarget.insert(containerName, loadResult.containerRuntime.clone());
         for subpackage in loadResult.subpackagePackages {
@@ -3615,48 +3132,21 @@ impl RuntimePackageManager {
         toolPkgContainersTarget: &mut BTreeMap<String, ToolPkgContainerRuntime>,
         toolPkgSubpackageByPackageNameTarget: &mut BTreeMap<String, ToolPkgSubpackageRuntime>,
     ) -> bool {
-        if let Some(existingContainer) = toolPkgContainersTarget.get(packageName).cloned() {
-            if existingContainer.sourceType != ToolPkgSourceType::ASSET {
-                return false;
-            }
-            Self::removeToolPkgContainerFromTargets(
-                &existingContainer.packageName,
-                availablePackagesTarget,
-                toolPkgContainersTarget,
-                toolPkgSubpackageByPackageNameTarget,
-            );
-            return true;
-        }
-
-        if let Some(existingSubpackage) = toolPkgSubpackageByPackageNameTarget
-            .get(packageName)
-            .cloned()
-        {
-            let Some(ownerContainer) = toolPkgContainersTarget
-                .get(&existingSubpackage.containerPackageName)
-                .cloned()
-            else {
-                return false;
-            };
-            if ownerContainer.sourceType != ToolPkgSourceType::ASSET {
-                return false;
-            }
-            Self::removeToolPkgContainerFromTargets(
-                &ownerContainer.packageName,
-                availablePackagesTarget,
-                toolPkgContainersTarget,
-                toolPkgSubpackageByPackageNameTarget,
-            );
-            return true;
-        }
-
-        let Some(existingPackage) = availablePackagesTarget.get(packageName) else {
-            return true;
+        let owner = match toolPkgSubpackageByPackageNameTarget.get(packageName) {
+            Some(child) => child.containerPackageName.as_str(),
+            None => packageName,
         };
-        if !existingPackage.is_built_in {
-            return false;
+        if let Some(container) = toolPkgContainersTarget.get(owner).cloned() {
+            if container.sourceType != ToolPkgSourceType::ASSET { return false; }
+            Self::removeToolPkgContainerFromTargets(
+                &container.packageName, availablePackagesTarget,
+                toolPkgContainersTarget, toolPkgSubpackageByPackageNameTarget,
+            );
+        } else {
+            if owner != packageName || availablePackagesTarget.get(packageName)
+                .is_some_and(|package| !package.is_built_in) { return false; }
+            availablePackagesTarget.remove(packageName);
         }
-        availablePackagesTarget.remove(packageName);
         true
     }
 
@@ -3680,37 +3170,24 @@ impl RuntimePackageManager {
         );
 
         for packageName in conflictingNames {
-            if let Some(existingContainer) = toolPkgContainersTarget.get(&packageName) {
-                if existingContainer.sourceType != ToolPkgSourceType::ASSET {
-                    return Err(format!(
-                        "ToolPkg member '{}' is already registered by '{}' at '{}'",
-                        packageName, existingContainer.packageName, existingContainer.sourcePath
-                    ));
+            let owner = match toolPkgSubpackageByPackageNameTarget.get(&packageName) {
+                Some(child) => {
+                    if !toolPkgContainersTarget.contains_key(&child.containerPackageName) {
+                        return Err(format!("ToolPkg member '{}' has an unregistered owner '{}'",
+                            packageName, child.containerPackageName));
+                    }
+                    child.containerPackageName.as_str()
                 }
-                builtInContainersToRemove.insert(existingContainer.packageName.clone());
+                None => &packageName,
+            };
+            if let Some(container) = toolPkgContainersTarget.get(owner) {
+                if container.sourceType != ToolPkgSourceType::ASSET {
+                    return Err(format!("ToolPkg member '{}' is already registered by '{}' at '{}'",
+                        packageName, container.packageName, container.sourcePath));
+                }
+                builtInContainersToRemove.insert(container.packageName.clone());
                 continue;
             }
-
-            if let Some(existingSubpackage) = toolPkgSubpackageByPackageNameTarget.get(&packageName)
-            {
-                let Some(ownerContainer) =
-                    toolPkgContainersTarget.get(&existingSubpackage.containerPackageName)
-                else {
-                    return Err(format!(
-                        "ToolPkg member '{}' has an unregistered owner '{}'",
-                        packageName, existingSubpackage.containerPackageName
-                    ));
-                };
-                if ownerContainer.sourceType != ToolPkgSourceType::ASSET {
-                    return Err(format!(
-                        "ToolPkg member '{}' is already registered by '{}' at '{}'",
-                        packageName, ownerContainer.packageName, ownerContainer.sourcePath
-                    ));
-                }
-                builtInContainersToRemove.insert(ownerContainer.packageName.clone());
-                continue;
-            }
-
             if let Some(existingPackage) = availablePackagesTarget.get(&packageName) {
                 if !existingPackage.is_built_in {
                     return Err(format!("ToolPkg member '{}' is already registered as an external standalone package", packageName));
@@ -3731,17 +3208,6 @@ impl RuntimePackageManager {
             availablePackagesTarget.remove(&packageName);
         }
         Ok(())
-    }
-
-    #[allow(non_snake_case)]
-    fn buildExternalPackageScanSignature(&self, file: &Path) -> String {
-        let metadata = self.fileSystemHost.fileInfo(&hostPath(file)).ok();
-        format!(
-            "{}|{}|{}",
-            file.to_string_lossy(),
-            metadata.as_ref().map(|value| value.size).unwrap_or(0),
-            metadata.map(|value| value.lastModified).unwrap_or_default()
-        )
     }
 
     /// Validates source ownership and manifest restrictions before writing an installed update.
@@ -3818,37 +3284,31 @@ impl RuntimePackageManager {
     #[allow(non_snake_case)]
     fn filesHaveSameContent(&self, left: &Path, right: &Path) -> Result<bool, String> {
         let leftBytes = self
-            .fileSystemHost
-            .readFileBytes(&hostPath(left))
+            .filesystem
+            .readFileBytes(&vfsPathString(left))
             .map_err(|error| error.to_string())?;
         let rightBytes = self
-            .fileSystemHost
-            .readFileBytes(&hostPath(right))
+            .filesystem
+            .readFileBytes(&vfsPathString(right))
             .map_err(|error| error.to_string())?;
         Ok(leftBytes == rightBytes)
     }
 
     /// Resolves caller file paths through the runtime VFS, preserving compatibility inputs.
     #[allow(non_snake_case)]
-    fn resolveInputFile(&self, path: &str) -> Result<(crate::files::VisualFileSystem::VisualFileSystem, String), String> {
+    fn resolveInputFile(&self, path: &str) -> Result<(operit_vfs::VisualFileSystem::VisualFileSystem, String), String> {
         let storage = self.context.runtimeStorageHost.clone().ok_or("Package import requires runtime storage")?;
         let context = crate::ToolExecutionManager::ToolExecutionManager::currentToolRuntimeContext();
         let directory = context.as_ref().map(|context| context.fileDirectory(storage)).transpose()?.flatten();
-        let path = crate::files::PathMapper::PathMapper::resolveFileResourcePath(directory.as_deref(), path)?;
-        Ok((crate::files::VisualFileSystem::VisualFileSystem::fromContext(&self.context)?, path))
+        let vfs = (&self.context).vfs()?;
+        let path = vfs.resolveResourcePath(directory.as_deref(), path)?;
+        Ok((vfs, path))
     }
 
-    /// Archive registration requires a native file; materialize resource mounts only at this boundary.
-    #[allow(non_snake_case)]
-    fn resolveNativeImportFile(&self, path: &str) -> Result<NativePackageImportFile, String> {
-        let (vfs, path) = self.resolveInputFile(path)?;
-        let resolved = vfs.resolvePath(&path)?;
-        if let Ok(native) = resolved.nativePath() {
-            return Ok(NativePackageImportFile { path: native.into(), staging: None });
-        }
-        let bytes = vfs.readFileBytes(&path)?;
-        let name = path.rsplit('/').next().filter(|name| !name.is_empty()).ok_or("Invalid package filename")?;
-        NativePackageImportFile::stage(vfs, name, &bytes)
+    /// Keeps imported archives in the virtual namespace without native staging.
+    fn resolveImportFile(&self, path: &str) -> Result<PathBuf, String> {
+        let (_, path) = self.resolveInputFile(path)?;
+        Ok(path.into())
     }
 
     /// Imports a package file from external storage into package storage.
@@ -3866,7 +3326,9 @@ impl RuntimePackageManager {
         &mut self,
         filePath: &str,
     ) -> Result<ExternalPackageImportResult, String> {
-        let result = self.addPackageFileFromExternalStorageResultInternal(filePath);
+        let result = self.addPackageFileFromExternalStorageResultInternal(
+            filePath, PackageFileImportSource::Local,
+        );
         match &result {
             Ok(_importResult) => self.clearManualToolPkgLoadIssues(filePath, None),
             Err(error) => {
@@ -3881,12 +3343,13 @@ impl RuntimePackageManager {
     fn addPackageFileFromExternalStorageResultInternal(
         &mut self,
         filePath: &str,
+        importSource: PackageFileImportSource,
     ) -> Result<ExternalPackageImportResult, String> {
-        let source = self.resolveNativeImportFile(filePath)?;
-        let filePath = source.path.to_str().ok_or("Package path is not UTF-8")?;
+        let source = self.resolveImportFile(filePath)?;
+        let filePath = source.to_str().ok_or("Package path is not UTF-8")?;
         let file = PathBuf::from(filePath);
         let downloadedFileExists = matches!(
-            self.fileSystemHost.fileExists(filePath),
+            self.filesystem.fileExists(filePath),
             Ok(info) if info.exists && !info.isDirectory
         );
         if !downloadedFileExists {
@@ -3904,12 +3367,18 @@ impl RuntimePackageManager {
 
         if isToolPkg {
             let bytes = self
-                .fileSystemHost
-                .readFileBytes(&hostPath(&file))
+                .filesystem
+                .readFileBytes(&vfsPathString(&file))
                 .map_err(|error| error.to_string())?;
+            if importSource == PackageFileImportSource::Local {
+                let preview = Self::readToolPkgImportManifest(&bytes)?;
+                if let Some(target) = self.localToolPkgUpdateTarget(&preview)? {
+                    return self.replaceLocalToolPkgFile(&bytes, target);
+                }
+            }
             let scope = self.importedToolPkgScope(&bytes)?;
             let (loadResult, loadIssues) = self
-                .loadToolPkgFromExternalFileWithIssues(&file, scope)
+                .loadToolPkgFileWithIssues(&file, scope, ToolPkgSourceType::EXTERNAL)
                 .map_err(|error| format!("Error importing package: {error}"))?;
             appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &loadIssues);
             let packageName = loadResult.containerPackage.name.clone();
@@ -3923,20 +3392,20 @@ impl RuntimePackageManager {
             let packageRoot = self
                 .storePaths
                 .runtime_storage_path(&ExtensionStore::root("package", scope.as_str())?);
-            self.fileSystemHost
-                .makeDirectory(&hostPath(&packageRoot), true)
+            self.filesystem
+                .makeDirectory(&vfsPathString(&packageRoot), true)
                 .map_err(|error| error.to_string())?;
             let fileName = file
                 .file_name()
                 .ok_or_else(|| "Error importing package: invalid file name".to_string())?;
             let destinationFile = packageRoot.join(fileName);
             if file != destinationFile {
-                self.fileSystemHost
-                    .copyFile(&hostPath(&file), &hostPath(&destinationFile), false)
+                self.filesystem
+                    .copyFile(&vfsPathString(&file), &vfsPathString(&destinationFile), false)
                     .map_err(|error| format!("Error importing package: {error}"))?;
             }
             let (importedLoadResult, importedLoadIssues) = self
-                .loadToolPkgFromExternalFileWithIssues(&destinationFile, scope)
+                .loadToolPkgFileWithIssues(&destinationFile, scope, ToolPkgSourceType::EXTERNAL)
                 .map_err(|error| format!("Error importing package: {error}"))?;
             appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &importedLoadIssues);
             if !self.registerImportedToolPkg(importedLoadResult)? {
@@ -3957,7 +3426,7 @@ impl RuntimePackageManager {
             return Ok(ExternalPackageImportResult {
                 packageName,
                 packageFormat: "toolpkg".to_string(),
-                storedPath: destinationFile.to_string_lossy().to_string(),
+                storedPath: destinationFile.to_string_lossy().replace('\\', "/"),
                 sourceNotice,
             });
         }
@@ -3971,8 +3440,8 @@ impl RuntimePackageManager {
         };
         let packageMetadata = if isHjson {
             let content = self
-                .fileSystemHost
-                .readFile(&hostPath(&file))
+                .filesystem
+                .readFile(&vfsPathString(&file))
                 .map_err(|error| format!("Error importing package: {error}"))?;
             JsPackageLoader::parse_metadata(&content, "")
                 .map_err(|error| format!("Error importing package: {error}"))?
@@ -3993,8 +3462,8 @@ impl RuntimePackageManager {
             ));
         }
 
-        self.storePaths
-            .ensure_packages_dir()
+        self.filesystem
+            .makeDirectory(&vfsPathString(&self.storePaths.packages_dir()), true)
             .map_err(|error| format!("Error importing package: {error}"))?;
         let fileName = file
             .file_name()
@@ -4005,18 +3474,18 @@ impl RuntimePackageManager {
             None => ToolPkgConfigScope::Device,
         };
         let packageRoot = self.storePaths.runtime_storage_path(&ExtensionStore::root("package", scope.as_str())?);
-        self.fileSystemHost.makeDirectory(&hostPath(&packageRoot), true).map_err(|error| error.to_string())?;
+        self.filesystem.makeDirectory(&vfsPathString(&packageRoot), true).map_err(|error| error.to_string())?;
         let destinationFile = packageRoot.join(fileName);
         if file != destinationFile {
-            self.fileSystemHost
-                .copyFile(&hostPath(&file), &hostPath(&destinationFile), false)
+            self.filesystem
+                .copyFile(&vfsPathString(&file), &vfsPathString(&destinationFile), false)
                 .map_err(|error| format!("Error importing package: {error}"))?;
         }
 
         let scriptMarketOrigin = if isJsLike {
             let script = self
-                .fileSystemHost
-                .readFile(&hostPath(&file))
+                .filesystem
+                .readFile(&vfsPathString(&file))
                 .map_err(|error| format!("Error importing package: {error}"))?;
             ToolPkgProtection::readScriptMarketOrigin(&script, &packageMetadata.name)
         } else {
@@ -4028,7 +3497,7 @@ impl RuntimePackageManager {
             ExtensionStore::default().customizePackage(
                 &packageMetadata.name, &fileName.to_string_lossy(), vec![packageMetadata.name.clone()],
             )?;
-            Arc::make_mut(&mut self.externalPackageScanCache).remove(&hostPath(&destinationFile));
+            Arc::make_mut(&mut self.externalPackageScanCache).remove(&vfsPathString(&destinationFile));
             self.loadAvailablePackages();
         } else {
             self.registerScope(
@@ -4052,7 +3521,7 @@ impl RuntimePackageManager {
         Ok(ExternalPackageImportResult {
             packageName: packageMetadata.name,
             packageFormat: packageFormat.to_string(),
-            storedPath: destinationFile.to_string_lossy().to_string(),
+            storedPath: destinationFile.to_string_lossy().replace('\\', "/"),
             sourceNotice,
         })
     }
@@ -4061,7 +3530,7 @@ impl RuntimePackageManager {
     #[allow(non_snake_case)]
     pub fn getCustomizedPackageNames(&self) -> Result<Vec<String>, String> {
         Ok(ExtensionStore::default()
-            .records("package")?
+            .activeRecords("package")?
             .into_iter()
             .filter(|record| record.settings["customized"] == true)
             .map(|record| record.id)
@@ -4071,7 +3540,7 @@ impl RuntimePackageManager {
     /// Resolves an installed built-in identity that accepts a custom implementation.
     fn customizablePackage(&self, packageName: &str) -> Result<Option<ExtensionRecord>, String> {
         Ok(ExtensionStore::default()
-            .records("package")?
+            .activeRecords("package")?
             .into_iter()
             .find(|record| {
                 record.id == packageName
@@ -4079,13 +3548,357 @@ impl RuntimePackageManager {
             }))
     }
 
+    /// Reads import identity without creating a registration engine.
+    fn readToolPkgImportManifest(bytes: &[u8]) -> Result<ToolPkgManifestPreview, String> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+            .map_err(|error| error.to_string())?;
+        let index = ToolPkgArchiveParser::buildZipEntryIndex(&mut archive);
+        ToolPkgArchiveParser::readToolPkgManifestPreview(&mut archive, &index)
+            .ok_or_else(|| "ToolPkg manifest is missing or invalid".to_string())
+    }
+
+    /// Selects only an ordinary local installation; existing customization keeps its own path.
+    fn localToolPkgUpdateTarget(
+        &self,
+        preview: &ToolPkgManifestPreview,
+    ) -> Result<Option<LocalToolPkgUpdateTarget>, String> {
+        let id = preview.manifest.toolpkgId.as_str();
+        let store = ExtensionStore::default();
+        let records = store.records("package")?;
+        let matching: Vec<_> = records.iter().filter(|record| record.id == id).collect();
+        let Some(record) = matching.first().copied() else {
+            if self.availablePackages().contains_key(id)
+                || self.toolPkgManager().isToolPkgContainer(id)
+                || self.toolPkgManager().hasSubpackage(id)
+            {
+                return Err(format!("A package with name '{id}' already exists in available packages"));
+            }
+            return Ok(None);
+        };
+        if record.settings["builtin"] == true || record.settings["customized"] == true {
+            return Ok(None);
+        }
+        if matching.len() != 1 {
+            return Err(format!("Extension ownership conflict: package:{id}"));
+        }
+        let record = record.clone();
+        let runtime = self.getToolPkgContainerRuntime(id)
+            .ok_or_else(|| format!("Installed ToolPkg container is unavailable: {id}"))?;
+        if id.is_empty() || id != id.trim() || runtime.packageName != id
+            || runtime.sourceType != ToolPkgSourceType::EXTERNAL
+            || !self.availablePackages().get(id).is_some_and(|package| !package.is_built_in)
+        {
+            return Err(format!("ToolPkg cannot be replaced by a local import: {id}"));
+        }
+        let scope: ToolPkgConfigScope = serde_json::from_value(serde_json::Value::String(record.scope.clone()))
+            .map_err(|error| error.to_string())?;
+        if preview.manifest.installationScope.is_some_and(|required| required != scope) {
+            return Err(format!("ToolPkg {id} cannot be updated in {} scope", scope.as_str()));
+        }
+        let root = ExtensionStore::root("package", &record.scope)?;
+        let archive = self.storePaths.runtime_storage_path(&root).join(&record.sourceName);
+        if record.sourceName.is_empty() || !hasToolPkgExtension(&record.sourceName)
+            || self.storePaths.runtime_storage_key(Path::new(&runtime.sourcePath))?
+                != format!("{root}/{}", record.sourceName)
+            || records.iter().any(|other| other.id != id && other.scope == record.scope
+                && other.sourceName == record.sourceName)
+        {
+            return Err(format!("ToolPkg source does not match its installation: {id}"));
+        }
+        let exists = self.filesystem.fileExists(&vfsPathString(&archive))?;
+        if !exists.exists || exists.isDirectory {
+            return Err(format!("Installed ToolPkg archive is missing: {id}"));
+        }
+        let previous = self.filesystem.readFileBytes(&vfsPathString(&archive))?;
+        if ToolPkgProtection::isMarketArchive(&previous) || self.isInstalledMarketToolPkg(&archive)? {
+            return Err(format!("Marketplace ToolPkg cannot be replaced by a local import: {id}"));
+        }
+        let support = self.toolHandler.runtimeSupport();
+        for asset in support.bundledExternalPluginAssets().iter().chain(support.builtinPluginAssets()) {
+            if hasToolPkgExtension(asset.name) && packageSourceFileName(asset.name) == record.sourceName
+                && Self::readToolPkgImportManifest(asset.bytes)?.manifest.toolpkgId == id
+            {
+                return Err(format!("Bundled ToolPkg cannot be replaced by a local import: {id}"));
+            }
+        }
+        Ok(Some(LocalToolPkgUpdateTarget {
+            record, runtime, scope, archive,
+        }))
+    }
+
+    /// Freezes retained child preferences and leaves every newly added child disabled.
+    fn mergeLocalToolPkgUpdateSettings(
+        record: &ExtensionRecord,
+        oldRuntime: &ToolPkgContainerRuntime,
+        newRuntime: &ToolPkgContainerRuntime,
+    ) -> Result<serde_json::Value, String> {
+        if record.id != oldRuntime.packageName || record.id != newRuntime.packageName {
+            return Err("ToolPkg update must preserve its installation identity".into());
+        }
+        let mut oldMembers: BTreeSet<String> = serde_json::from_value(record.settings["members"].clone())
+            .map_err(|error| error.to_string())?;
+        oldMembers.retain(|name| name == &record.id
+            || oldRuntime.subpackages.iter().any(|child| &child.packageName == name));
+        oldMembers.insert(record.id.clone());
+        let mut members = vec![record.id.clone()];
+        let mut memberSet = BTreeSet::from([record.id.clone()]);
+        for child in &newRuntime.subpackages {
+            if child.packageName.is_empty() || child.packageName != child.packageName.trim()
+                || child.packageName.chars().any(char::is_control)
+                || child.containerPackageName != record.id
+                || !memberSet.insert(child.packageName.clone())
+            {
+                return Err("ToolPkg update has inconsistent or duplicate members".into());
+            }
+            members.push(child.packageName.clone());
+        }
+        let oldStates: BTreeMap<String, bool> =
+            serde_json::from_value(record.settings["subpackageStates"].clone())
+                .map_err(|error| error.to_string())?;
+        let retainedStates: BTreeMap<_, _> = oldRuntime.subpackages.iter().map(|child| {
+            (child.packageName.clone(), oldStates.get(&child.packageName)
+                .copied().unwrap_or(child.enabledByDefault))
+        }).collect();
+        let states: BTreeMap<_, _> = newRuntime.subpackages.iter().map(|child| {
+            (child.packageName.clone(), retainedStates.get(&child.packageName).copied().unwrap_or(false))
+        }).collect();
+        let mut settings = record.settings.clone();
+        for field in ["enabledNames", "disabledNames"] {
+            let names: Vec<String> = serde_json::from_value(settings[field].clone())
+                .map_err(|error| error.to_string())?;
+            settings[field] = serde_json::json!(names.into_iter()
+                .filter(|name| oldMembers.contains(name) && memberSet.contains(name))
+                .collect::<Vec<_>>());
+        }
+        settings["members"] = serde_json::json!(members);
+        settings["subpackageStates"] = serde_json::json!(states);
+        let fields = settings.as_object_mut().ok_or("Package settings must be an object")?;
+        match Self::requiredInstallationScope(newRuntime)? {
+            Some(scope) => { fields.insert("installationScope".into(), serde_json::json!(scope)); }
+            None => { fields.remove("installationScope"); }
+        }
+        Ok(settings)
+    }
+
+    /// Loads the complete candidate while the old owner remains registered for conflict checks.
+    fn loadLocalToolPkgUpdate(
+        &self,
+        file: &Path,
+        bytes: &[u8],
+        target: &LocalToolPkgUpdateTarget,
+    ) -> Result<ToolPkgLoadResult, String> {
+        if self.filesystem.readFileBytes(&vfsPathString(file))? != bytes {
+            return Err("ToolPkg archive changed during its update".into());
+        }
+        let (loaded, issues) = self.loadToolPkgFileWithIssues(file, target.scope, ToolPkgSourceType::EXTERNAL)?;
+        if !issues.is_empty() {
+            return Err(issues.into_iter().map(|issue| issue.message).collect::<Vec<_>>().join("; "));
+        }
+        if !self.toolPkgManager().canRegisterToolPkgReplacing(
+            &target.record.id, &loaded, self.availablePackages(),
+        ) {
+            return Err(format!("ToolPkg update has a naming conflict: {}", target.record.id));
+        }
+        Ok(loaded)
+    }
+
+    /// Writes the archive through its existing scope, including shared file synchronization.
+    fn writeLocalToolPkgArchive(
+        &self,
+        target: &LocalToolPkgUpdateTarget,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if target.scope == ToolPkgConfigScope::Space {
+            RuntimeFileSyncStore::new(defaultRuntimeStorageHost(), RUNTIME_SYNC_DIR_PATH)
+                .writeBytes(&self.storePaths.runtime_storage_key(&target.archive)?, bytes)
+        } else {
+            self.filesystem.writeFileBytes(&vfsPathString(&target.archive), bytes)
+        }
+    }
+
+    /// Refreshes imported code through canonical registry publication and engine retirement.
+    fn reloadImportedToolPkg(&mut self, packageName: &str, sourcePath: &str) -> Result<(), String> {
+        Arc::make_mut(&mut self.externalPackageScanCache).remove(sourcePath);
+        self.resourceReader().deleteToolPkgCacheDir(packageName)?;
+        self.loadAvailablePackagesInternal(false)
+    }
+
+    /// Requires a fresh registration, rather than trusting readiness retained from a failed refresh.
+    fn validateLocalToolPkgReload(
+        &self,
+        expected: &ToolPkgContainerRuntime,
+        record: &ExtensionRecord,
+        archive: &[u8],
+    ) -> Result<(), String> {
+        let actual = self.getToolPkgContainerRuntime(&record.id)
+            .ok_or_else(|| format!("Failed to reload ToolPkg '{}'", record.id))?;
+        let childNames = |runtime: &ToolPkgContainerRuntime| runtime.subpackages.iter()
+            .map(|child| (child.packageName.clone(), child.containerPackageName.clone(),
+                child.entryPath.clone(), child.enabledByDefault))
+            .collect::<BTreeSet<_>>();
+        let resources = |runtime: &ToolPkgContainerRuntime| runtime.resources.iter()
+            .map(|resource| (resource.key.clone(), resource.path.clone(), resource.mime.clone()))
+            .collect::<BTreeSet<_>>();
+        if actual.packageName != expected.packageName || actual.sourceType != expected.sourceType
+            || actual.sourcePath != expected.sourcePath || actual.version != expected.version
+            || actual.apiVersion != expected.apiVersion || actual.mainEntry != expected.mainEntry
+            || resources(&actual) != resources(expected)
+            || childNames(&actual) != childNames(expected)
+            || ExtensionStore::default().record("package", &record.id)? != *record
+            || self.filesystem.readFileBytes(&expected.sourcePath)? != archive
+        {
+            return Err(format!("Reloaded ToolPkg does not match its update: {}", record.id));
+        }
+        let mut members = BTreeSet::from([record.id.clone()]);
+        members.extend(expected.subpackages.iter().map(|child| child.packageName.clone()));
+        if members.iter().any(|name| !self.availablePackages().contains_key(name))
+            || self.toolPkgLoadIssues.iter().any(|issue| issue.sourcePath == expected.sourcePath
+                || issue.packageName.as_ref().is_some_and(|name| members.contains(name)))
+        {
+            return Err(format!("ToolPkg registration failed after replacement: {}", record.id));
+        }
+        Ok(())
+    }
+
+    /// Restores raw metadata too, because a failed record write may no longer be parseable.
+    fn rollbackLocalToolPkgUpdate(
+        &mut self,
+        target: &LocalToolPkgUpdateTarget,
+        archive: &[u8],
+        descriptorKey: &str,
+        descriptor: &[u8],
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.writeLocalToolPkgArchive(target, archive) {
+            errors.push(format!("restoring archive failed: {error}"));
+        }
+        let storage = defaultRuntimeStorageHost();
+        let restored = if target.scope == ToolPkgConfigScope::Space {
+            RuntimeFileSyncStore::new(storage.clone(), RUNTIME_SYNC_DIR_PATH)
+                .writeBytes(descriptorKey, descriptor)
+        } else {
+            storage.writeBytes(descriptorKey, descriptor).map_err(|error| error.to_string())
+        };
+        if let Err(error) = restored { errors.push(format!("restoring installation record failed: {error}")); }
+        match storage.readBytes(descriptorKey) {
+            Ok(bytes) if bytes == descriptor => {}
+            Ok(_) => errors.push("restored installation record differs from its backup".into()),
+            Err(error) => errors.push(format!("reading restored installation record failed: {error}")),
+        }
+        if let Err(error) = self.reloadImportedToolPkg(&target.record.id, &vfsPathString(&target.archive)) {
+            errors.push(format!("reloading previous ToolPkg failed: {error}"));
+        }
+        if let Err(error) = self.validateLocalToolPkgReload(&target.runtime, &target.record, archive) {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            self.notifyToolPkgRuntimeChangeListeners();
+            Ok(())
+        } else { Err(errors.join("; ")) }
+    }
+
+    /// Deletes only transaction files; recovery backups survive an unsuccessful rollback.
+    fn cleanLocalToolPkgUpdateFiles(&self, files: &[&Path]) -> Result<(), String> {
+        let mut errors = Vec::new();
+        for file in files {
+            let path = vfsPathString(file);
+            let result = self.filesystem.fileExists(&path).and_then(|entry| {
+                if entry.exists { self.filesystem.deleteFile(&path, false) } else { Ok(()) }
+            });
+            if let Err(error) = result { errors.push(format!("{path}: {error}")); }
+        }
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    }
+
+    /// Replaces one local archive without uninstalling its owner or relocating configuration.
+    fn replaceLocalToolPkgFile(
+        &mut self,
+        bytes: &[u8],
+        target: LocalToolPkgUpdateTarget,
+    ) -> Result<ExternalPackageImportResult, String> {
+        let storage = defaultRuntimeStorageHost();
+        let descriptorKey = operit_store::ExtensionStore::recordPath(
+            "package", &target.record.id, &target.record.scope,
+        )?;
+        let descriptor = storage.readBytes(&descriptorKey).map_err(|error| error.to_string())?;
+        let previous = self.filesystem.readFileBytes(&vfsPathString(&target.archive))?;
+        let directory = target.archive.parent().ok_or("ToolPkg archive has no parent directory")?;
+        let nonce = uuid::Uuid::new_v4();
+        let staging = directory.join(format!(".local-toolpkg-update-{nonce}.staging"));
+        let backup = directory.join(format!(".local-toolpkg-update-{nonce}.backup"));
+        let recordBackup = directory.join(format!(".local-toolpkg-update-{nonce}.record-backup"));
+        let mut mutationStarted = false;
+        let outcome = (|| -> Result<(), String> {
+            self.filesystem.writeFileBytes(&vfsPathString(&staging), bytes)?;
+            let mut loaded = self.loadLocalToolPkgUpdate(&staging, bytes, &target)?;
+            loaded.containerRuntime.sourcePath = vfsPathString(&target.archive);
+            self.filesystem.writeFileBytes(&vfsPathString(&backup), &previous)?;
+            self.filesystem.writeFileBytes(&vfsPathString(&recordBackup), &descriptor)?;
+            if self.filesystem.readFileBytes(&vfsPathString(&backup))? != previous
+                || self.filesystem.readFileBytes(&vfsPathString(&recordBackup))? != descriptor
+                || storage.readBytes(&descriptorKey).map_err(|error| error.to_string())? != descriptor
+                || self.filesystem.readFileBytes(&vfsPathString(&target.archive))? != previous
+                || ExtensionStore::default().record("package", &target.record.id)? != target.record
+            {
+                return Err("ToolPkg installation changed during update validation".into());
+            }
+            mutationStarted = true;
+            if target.scope == ToolPkgConfigScope::Space {
+                self.writeLocalToolPkgArchive(&target, bytes)?;
+            } else {
+                self.filesystem.deleteFile(&vfsPathString(&target.archive), false)?;
+                self.filesystem.moveFile(&vfsPathString(&staging), &vfsPathString(&target.archive))?;
+            }
+            if ExtensionStore::default().record("package", &target.record.id)? != target.record {
+                return Err("ToolPkg installation ownership changed during replacement".into());
+            }
+            let settings = Self::mergeLocalToolPkgUpdateSettings(
+                &target.record, &target.runtime, &loaded.containerRuntime,
+            )?;
+            // Persist member states before scanning, then notify only after validation succeeds.
+            self.writeScopeSettings(&target.record.id, settings.clone())?;
+            self.reloadImportedToolPkg(&target.record.id, &vfsPathString(&target.archive))?;
+            let mut expectedRecord = target.record.clone();
+            expectedRecord.settings = settings;
+            self.validateLocalToolPkgReload(&loaded.containerRuntime, &expectedRecord, bytes)?;
+            self.notifyToolPkgRuntimeChangeListeners();
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                let sourceNotice = self.cleanLocalToolPkgUpdateFiles(&[&staging, &backup, &recordBackup])
+                    .err().map(|error| format!("ToolPkg update succeeded; temporary file cleanup failed: {error}"));
+                Ok(ExternalPackageImportResult {
+                    packageName: target.record.id, packageFormat: "toolpkg".into(),
+                    storedPath: vfsPathString(&target.archive), sourceNotice,
+                })
+            }
+            Err(error) => {
+                let rollback = if mutationStarted {
+                    self.rollbackLocalToolPkgUpdate(&target, &previous, &descriptorKey, &descriptor)
+                } else { Ok(()) };
+                let cleanup = if rollback.is_ok() {
+                    self.cleanLocalToolPkgUpdateFiles(&[&staging, &backup, &recordBackup])
+                } else { self.cleanLocalToolPkgUpdateFiles(&[&staging]) };
+                let mut message = format!("ToolPkg update failed: {error}");
+                if let Err(restore) = rollback {
+                    message.push_str(&format!("; rollback failed: {restore}; recovery backups: {}, {}",
+                        vfsPathString(&backup), vfsPathString(&recordBackup)));
+                }
+                if let Err(cleanup) = cleanup { message.push_str(&format!("; temporary file cleanup failed: {cleanup}")); }
+                Err(message)
+            }
+        }
+    }
+
     /// Resolves an archive's installation scope before executing registration code.
     fn importedToolPkgScope(&self, bytes: &[u8]) -> Result<ToolPkgConfigScope, String> {
-        let mut archive =
-            zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|error| error.to_string())?;
-        let index = ToolPkgArchiveParser::buildZipEntryIndex(&mut archive);
-        let preview = ToolPkgArchiveParser::readToolPkgManifestPreview(&mut archive, &index)
-            .ok_or("ToolPkg manifest is missing or invalid")?;
+        let preview = Self::readToolPkgImportManifest(bytes)?;
+        if let Some(runtime) = self.getToolPkgContainerRuntime(&preview.manifest.toolpkgId) {
+            if matches!(runtime.sourceType, ToolPkgSourceType::MARKET | ToolPkgSourceType::EXTERNAL) {
+                return self.installedPackageConfigScope(Path::new(&runtime.sourcePath));
+            }
+        }
         if let Some(record) = self.customizablePackage(&preview.manifest.toolpkgId)? {
             return serde_json::from_value(serde_json::Value::String(record.scope))
                 .map_err(|error| error.to_string());
@@ -4096,9 +3909,33 @@ impl RuntimePackageManager {
         }
     }
 
-    /// Checks package names with the replaced built-in container removed from the candidate registry.
+    /// Resolves the authenticated installation, including market archives saved
+    /// by releases that incorrectly sent market downloads through external import.
+    fn marketToolPkgUpdateRuntime(&self, incoming: &ToolPkgLoadResult) -> Result<Option<ToolPkgContainerRuntime>, String> {
+        let Some(existing) = self.getToolPkgContainerRuntime(&incoming.containerPackage.name) else {
+            return Ok(None);
+        };
+        if !isSameMarketToolPkg(&existing, incoming) {
+            return Ok(None);
+        }
+        if existing.sourceType == ToolPkgSourceType::EXTERNAL {
+            let bytes = self.filesystem.readFileBytes(&existing.sourcePath)
+                .map_err(|error| error.to_string())?;
+            if ToolPkgProtection::isMarketArchive(&bytes) {
+                let raw = ToolPkgProtection::unwrapMarketArchive(&bytes)?;
+                ToolPkgProtection::validateMarketToolPkgArchive(&raw)?;
+            } else if !self.isInstalledMarketToolPkg(Path::new(&existing.sourcePath))? {
+                // A manifest's market_origin alone is not proof of market ownership.
+                return Ok(None);
+            }
+        }
+        Ok(Some(existing))
+    }
+
+    /// Applies canonical ownership checks to fresh imports and authorized replacements.
     fn canImportToolPkg(&self, loadResult: &ToolPkgLoadResult) -> Result<bool, String> {
-        if self
+        let marketUpdate = self.marketToolPkgUpdateRuntime(loadResult)?.is_some();
+        if !marketUpdate && self
             .customizablePackage(&loadResult.containerPackage.name)?
             .is_none()
         {
@@ -4106,27 +3943,27 @@ impl RuntimePackageManager {
                 .toolPkgManager()
                 .canRegisterToolPkg(loadResult, self.availablePackages()));
         }
-        let mut packages = self.availablePackages().clone();
-        let mut containers = self.toolPkgManager().getToolPkgContainerRuntimeMap();
-        let mut subpackages = self.toolPkgManager().getToolPkgSubpackageRuntimeMap();
-        Self::removeToolPkgContainerFromTargets(
-            &loadResult.containerPackage.name,
-            &mut packages,
-            &mut containers,
-            &mut subpackages,
-        );
-        packages.remove(&loadResult.containerPackage.name);
-        Ok(Self::registerToolPkgInto(
-            loadResult.clone(),
-            &mut packages,
-            &mut containers,
-            &mut subpackages,
+        Ok(ToolPkgManager::canRegisterToolPkgInRegistry(
+            loadResult, self.availablePackages(),
+            &self.toolPkgManager().getToolPkgContainerRuntimeMap(),
+            &self.toolPkgManager().getToolPkgSubpackageRuntimeMap(),
+            Some(&loadResult.containerPackage.name),
         ))
     }
 
     /// Registers an imported archive or switches its built-in owner to the custom source.
     fn registerImportedToolPkg(&mut self, loadResult: ToolPkgLoadResult) -> Result<bool, String> {
         let name = loadResult.containerPackage.name.clone();
+        if self.marketToolPkgUpdateRuntime(&loadResult)?.is_some() {
+            // Market updates replace the owned archive in place. Keep the scope,
+            // configuration, enabled state and record's source filename intact.
+            let path = loadResult.containerRuntime.sourcePath.clone();
+            self.reloadImportedToolPkg(&name, &path)?;
+            self.notifyToolPkgRuntimeChangeListeners();
+            return Ok(self.getToolPkgContainerRuntime(&name).is_some_and(|runtime|
+                runtime.sourcePath == path && runtime.version == loadResult.containerRuntime.version
+                    && runtime.marketOrigin == loadResult.containerRuntime.marketOrigin));
+        }
         if self.customizablePackage(&name)?.is_none() {
             return Ok(self.registerToolPkg(loadResult));
         }
@@ -4146,8 +3983,8 @@ impl RuntimePackageManager {
         self.saveEnabledPackageNames(&enabledNames)
             .map_err(|error| error.to_string())?;
         ExtensionStore::default().customizePackage(&name, &source, members)?;
-        Arc::make_mut(&mut self.externalPackageScanCache).remove(&path);
-        self.loadAvailablePackages();
+        self.reloadImportedToolPkg(&name, &path)?;
+        self.notifyToolPkgRuntimeChangeListeners();
         Ok(self
             .getToolPkgContainerRuntime(&name)
             .is_some_and(|runtime| runtime.sourcePath == path))
@@ -4169,7 +4006,7 @@ impl RuntimePackageManager {
             .toolPkgAssetBytes(&runtime.sourcePath)
             .ok_or_else(|| "Registered ToolPkg asset is missing".to_string()),
             ToolPkgSourceType::EXTERNAL | ToolPkgSourceType::MARKET => self
-                .fileSystemHost
+                .filesystem
                 .readFileBytes(&runtime.sourcePath)
                 .map_err(|error| error.to_string()),
         }
@@ -4214,69 +4051,38 @@ impl RuntimePackageManager {
                 "market_artifact",
             );
         }
-        if let Err(error) = self.storePaths.ensure_packages_dir() {
-            return self.recordAndReturnPackageError(
-                &fileName,
-                "market_import_failed",
-                &format!("Error importing market artifact: {error}"),
-                "market_artifact",
-            );
-        }
-        let temporaryDirectory = self.storePaths.toolpkg_cache_dir().join(format!(
-            ".market-download-{}-{normalizedSha256}",
-            currentTimeMillis()
-        ));
-        if let Err(error) = self
-            .fileSystemHost
-            .makeDirectory(&hostPath(&temporaryDirectory), true)
-        {
-            return self.recordAndReturnPackageError(
-                fileName,
-                "market_import_failed",
-                &format!("Error preparing market artifact download: {error}"),
-                "market_artifact",
-            );
-        }
-        // Keep staging outside scanned packages and preserve the final archive name.
-        let temporaryFile = temporaryDirectory.join(fileName);
-        if let Err(error) = self
-            .fileSystemHost
-            .writeFileBytes(&hostPath(&temporaryFile), &bytes)
-        {
-            let _ = self
-                .fileSystemHost
-                .deleteFile(&hostPath(&temporaryDirectory), true);
-            return self.recordAndReturnPackageError(
-                &fileName,
-                "market_import_failed",
-                &format!("Error importing market artifact: {error}"),
-                "market_artifact",
-            );
-        }
-        let result =
-            self.addPackageFileFromExternalStorageResultInternal(&temporaryFile.to_string_lossy());
-        let _ = self
-            .fileSystemHost
-            .deleteFile(&hostPath(&temporaryDirectory), true);
-        match result {
-            Ok(importResult) => {
-                self.clearManualToolPkgLoadIssues(fileName, None);
-                formatExternalPackageImportResult(&importResult)
-            }
-            Err(error) => self.recordAndReturnPackageError(
+        let (vfs, download) = match self.prepareMarketArtifactDownload(fileName).and_then(
+            /** Keeps staging writes in the same VFS used by package validation. */
+            |path| self.resolveInputFile(&path),
+        ) {
+            Ok(download) => download,
+            Err(error) => return self.recordAndReturnPackageError(
                 fileName,
                 "market_import_failed",
                 &error,
-                if fileName.to_ascii_lowercase().ends_with(".toolpkg") {
-                    "market_toolpkg"
-                } else {
-                    "market_artifact"
-                },
+                "market_artifact",
             ),
+        };
+        let temporaryDirectory = Path::new(&download).parent().expect("artifact staging directory")
+            .to_string_lossy().into_owned();
+        // Keep staging outside scanned packages and preserve the final archive name.
+        if let Err(error) = vfs.writeFileBytes(&download, &bytes) {
+            let _ = vfs.deleteFile(&temporaryDirectory, true);
+            return self.recordAndReturnPackageError(
+                &fileName,
+                "market_import_failed",
+                &format!("Error importing market artifact: {error}"),
+                "market_artifact",
+            );
         }
+        let result = self.addMarketArtifactFile(
+            download, normalizedSha256,
+        );
+        let _ = vfs.deleteFile(&temporaryDirectory, true);
+        result
     }
 
-    /// Creates a package-manager-owned staging path for one market artifact.
+    /// Allocates marketplace staging entirely through the runtime VFS.
     #[allow(non_snake_case)]
     pub fn prepareMarketArtifactDownload(&self, fileName: &str) -> Result<String, String> {
         let fileName = fileName.trim();
@@ -4288,20 +4094,23 @@ impl RuntimePackageManager {
         {
             return Err("Market artifact file name is invalid".to_string());
         }
-        let directory = self
-            .storePaths
-            .toolpkg_cache_dir()
-            .join(format!(".market-download-{}", currentTimeMillis()));
-        self.fileSystemHost
-            .makeDirectory(&hostPath(&directory), true)
+        let cache = operit_vfs::VisualFileSystem::VisualFileSystem::runtimePath(
+            operit_util::RuntimeStorageLayout::RUNTIME_TOOLPKG_CACHE_DIR_PATH,
+        )?;
+        let directory = operit_vfs::VfsPath::joinVfsPath(
+            &cache, &format!(".market-download-{}", currentTimeMillis()),
+        )?;
+        let path = operit_vfs::VfsPath::joinVfsPath(&directory, fileName)?;
+        let vfs = (&self.context).vfs()?;
+        vfs.makeDirectory(&directory, true)
             .map_err(|error| format!("Error preparing market artifact download: {error}"))?;
-        Ok(directory.join(fileName).to_string_lossy().to_string())
+        Ok(path)
     }
 
     /// Imports a downloaded market artifact after checking its declared SHA-256.
     #[allow(non_snake_case)]
     pub fn addMarketArtifactFile(&mut self, filePath: String, expectedSha256: String) -> String {
-        let result = (|| {
+        let validation = (|| -> Result<bool, String> {
             let normalizedSha256 = expectedSha256.trim().to_ascii_lowercase();
             if !isSha256Hex(&normalizedSha256) {
                 return Err("Market artifact SHA-256 is invalid".to_string());
@@ -4311,20 +4120,91 @@ impl RuntimePackageManager {
             if sha256Hex(&bytes) != normalizedSha256 {
                 return Err("Market artifact SHA-256 mismatch".to_string());
             }
-            self.addPackageFileFromExternalStorageResultInternal(&filePath)
+            Ok(ToolPkgProtection::isMarketArchive(&bytes))
         })();
+        match validation {
+            // Market archives need their authenticated installation path so scans
+            // retain MARKET ownership and later updates can replace that owner.
+            Ok(true) => return self.addMarketToolPkgFileFromExternalStorage(&filePath, &expectedSha256),
+            Ok(false) => {},
+            Err(error) => return self.recordAndReturnPackageError(
+                &filePath, "market_import_failed", &error, "market_artifact",
+            ),
+        }
+        let result = self.updateMarketScriptFile(&filePath)
+            .and_then(|updated| match updated {
+                Some(result) => Ok(result),
+                None => self.addPackageFileFromExternalStorageResultInternal(
+                    &filePath, PackageFileImportSource::MarketArtifact,
+                ),
+            });
         match result {
             Ok(importResult) => {
                 self.clearManualToolPkgLoadIssues(&filePath, None);
                 formatExternalPackageImportResult(&importResult)
             }
             Err(error) => self.recordAndReturnPackageError(
-                &filePath,
-                "market_import_failed",
-                &error,
-                "market_artifact",
+                &filePath, "market_import_failed", &error, "market_artifact",
             ),
         }
+    }
+
+    /// Updates an installed standalone marketplace script under its existing owner.
+    fn updateMarketScriptFile(&mut self, filePath: &str) -> Result<Option<ExternalPackageImportResult>, String> {
+        let lower = filePath.to_ascii_lowercase();
+        if !lower.ends_with(".js") && !lower.ends_with(".ts") { return Ok(None); }
+        let source = self.resolveImportFile(filePath)?;
+        let bytes = self.filesystem.readFileBytes(&vfsPathString(&source))
+            .map_err(|error| error.to_string())?;
+        let text = ToolPkgProtection::decodeUtf8(&bytes)?;
+        let package = JsPackageLoader::parse(&text)?;
+        let Some(origin) = ToolPkgProtection::readScriptMarketOrigin(&text, &package.name) else {
+            return Ok(None);
+        };
+        if !self.availablePackages().get(&package.name).is_some_and(|old| !old.is_built_in)
+            || self.toolPkgManager().isToolPkgContainer(&package.name)
+            || self.toolPkgManager().hasSubpackage(&package.name) { return Ok(None); }
+        let store = ExtensionStore::default();
+        let record = store.record("package", &package.name)?;
+        let destination = self.storePaths.runtime_storage_path(&format!("{}/{}",
+            ExtensionStore::root("package", &record.scope)?, record.sourceName));
+        let path = vfsPathString(&destination);
+        let previous = self.filesystem.readFileBytes(&path).map_err(|error| error.to_string())?;
+        let oldText = ToolPkgProtection::decodeUtf8(&previous)?;
+        let Some(oldOrigin) = ToolPkgProtection::readScriptMarketOrigin(&oldText, &package.name) else {
+            return Ok(None);
+        };
+        if !sameMarketOrigin(&oldOrigin, &origin, &package.name) { return Ok(None); }
+        let outcome = (|| -> Result<(), String> {
+            if source != destination {
+                self.filesystem.deleteFile(&path, false).map_err(|error| error.to_string())?;
+                self.filesystem.moveFile(&vfsPathString(&source), &path).map_err(|error| error.to_string())?;
+            }
+            if self.filesystem.readFileBytes(&path).map_err(|error| error.to_string())? != bytes {
+                return Err("Market script changed during installation".into());
+            }
+            Arc::make_mut(&mut self.externalPackageScanCache).remove(&path);
+            self.loadAvailablePackages();
+            let expected = scanStandalonePackageScript(&text, false, &PackageScanActivation::read()?)?;
+            if self.availablePackages().get(&package.name).map(serde_json::to_value).transpose()
+                .map_err(|error| error.to_string())? != Some(serde_json::to_value(expected).map_err(|error| error.to_string())?) {
+                return Err(format!("Failed to reload market script '{}'", package.name));
+            }
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            self.filesystem.writeFileBytes(&path, &previous).map_err(|restore|
+                format!("Market script update failed ({error}); restoring the previous script failed: {restore}"))?;
+            Arc::make_mut(&mut self.externalPackageScanCache).remove(&path);
+            self.loadAvailablePackages();
+            return Err(error);
+        }
+        Ok(Some(ExternalPackageImportResult {
+            packageName: package.name,
+            packageFormat: if lower.ends_with(".ts") { "typescript" } else { "javascript" }.into(),
+            storedPath: path,
+            sourceNotice: Some(format!("Updated marketplace script from {} (version: {})", origin.market, origin.version)),
+        }))
     }
 
     /// Imports one signed marketplace ToolPkg as a locally authenticated package archive.
@@ -4334,14 +4214,14 @@ impl RuntimePackageManager {
         filePath: &str,
         expectedMarketAssetSha256: &str,
     ) -> String {
-        let source = match self.resolveNativeImportFile(filePath) {
+        let source = match self.resolveImportFile(filePath) {
             Ok(source) => source,
             Err(error) => return self.recordAndReturnPackageError(filePath, "market_import_failed", &error, "market_toolpkg"),
         };
-        let filePath = source.path.to_string_lossy();
+        let filePath = source.to_string_lossy();
         let filePath = filePath.as_ref();
         let downloadedFileExists = matches!(
-            self.fileSystemHost.fileExists(filePath),
+            self.filesystem.fileExists(filePath),
             Ok(info) if info.exists && !info.isDirectory
         );
         if !downloadedFileExists {
@@ -4369,7 +4249,7 @@ impl RuntimePackageManager {
                 "market_toolpkg",
             );
         }
-        let downloadedBytes = match self.fileSystemHost.readFileBytes(filePath) {
+        let downloadedBytes = match self.filesystem.readFileBytes(filePath) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return self.recordAndReturnPackageError(
@@ -4452,8 +4332,8 @@ impl RuntimePackageManager {
             &ExtensionStore::root("package", scope.as_str()).expect("Validated package scope"),
         );
         if let Err(error) = self
-            .fileSystemHost
-            .makeDirectory(&hostPath(&packagesDir), true)
+            .filesystem
+            .makeDirectory(&vfsPathString(&packagesDir), true)
         {
             return self.recordAndReturnPackageError(
                 filePath,
@@ -4464,20 +4344,21 @@ impl RuntimePackageManager {
         }
         let stagingFile =
             packagesDir.join(format!(".market-install-{normalizedAssetSha256}.toolpkg"));
-        let destinationFile = packagesDir.join(format!(
+        let mut destinationFile = packagesDir.join(format!(
             "{MARKET_TOOLPKG_FILE_PREFIX}{normalizedAssetSha256}.toolpkg"
         ));
+        let mut previousArchive: Option<Vec<u8>> = None;
         let mut installed = false;
         let mut destinationStored = false;
         let outcome = (|| -> Result<String, String> {
-            self.fileSystemHost
-                .writeFileBytes(&hostPath(&stagingFile), &installedArchive)
+            self.filesystem
+                .writeFileBytes(&vfsPathString(&stagingFile), &installedArchive)
                 .map_err(|error| error.to_string())?;
             if !self.isInstalledMarketToolPkg(&stagingFile)? {
                 return Err("ToolPkg market installation authentication failed".to_string());
             }
             let (preview, previewIssues) =
-                self.loadToolPkgFromMarketFileWithIssues(&stagingFile, scope)?;
+                self.loadToolPkgFileWithIssues(&stagingFile, scope, ToolPkgSourceType::MARKET)?;
             appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &previewIssues);
             let packageName = preview.containerPackage.name.clone();
             if !self.canImportToolPkg(&preview)? {
@@ -4486,21 +4367,26 @@ impl RuntimePackageManager {
                     packageName
                 ));
             }
+            if let Some(existing) = self.marketToolPkgUpdateRuntime(&preview)? {
+                destinationFile = PathBuf::from(&existing.sourcePath);
+                previousArchive = Some(self.filesystem.readFileBytes(&existing.sourcePath)
+                    .map_err(|error| error.to_string())?);
+            }
             let destinationExists = matches!(
-                self.fileSystemHost.fileExists(&hostPath(&destinationFile)),
+                self.filesystem.fileExists(&vfsPathString(&destinationFile)),
                 Ok(info) if info.exists
             );
             if destinationExists {
-                self.fileSystemHost
-                    .deleteFile(&hostPath(&destinationFile), false)
+                self.filesystem
+                    .deleteFile(&vfsPathString(&destinationFile), false)
                     .map_err(|error| error.to_string())?;
             }
-            self.fileSystemHost
-                .moveFile(&hostPath(&stagingFile), &hostPath(&destinationFile))
+            self.filesystem
+                .moveFile(&vfsPathString(&stagingFile), &vfsPathString(&destinationFile))
                 .map_err(|error| error.to_string())?;
             destinationStored = true;
             let (loaded, loadedIssues) =
-                self.loadToolPkgFromMarketFileWithIssues(&destinationFile, scope)?;
+                self.loadToolPkgFileWithIssues(&destinationFile, scope, ToolPkgSourceType::MARKET)?;
             appendUniqueToolPkgLoadIssues(Arc::make_mut(&mut self.manualToolPkgLoadIssues), &loadedIssues);
             if !self.registerImportedToolPkg(loaded)? {
                 return Err(format!(
@@ -4512,22 +4398,30 @@ impl RuntimePackageManager {
             Ok(format!("Successfully imported toolpkg: {packageName}"))
         })();
         let stagingExists = matches!(
-            self.fileSystemHost.fileExists(&hostPath(&stagingFile)),
+            self.filesystem.fileExists(&vfsPathString(&stagingFile)),
             Ok(info) if info.exists
         );
         if stagingExists {
             let _ = self
-                .fileSystemHost
-                .deleteFile(&hostPath(&stagingFile), false);
+                .filesystem
+                .deleteFile(&vfsPathString(&stagingFile), false);
         }
         let destinationExists = matches!(
-            self.fileSystemHost.fileExists(&hostPath(&destinationFile)),
+            self.filesystem.fileExists(&vfsPathString(&destinationFile)),
             Ok(info) if info.exists
         );
-        if !installed && destinationStored && destinationExists {
-            let _ = self
-                .fileSystemHost
-                .deleteFile(&hostPath(&destinationFile), false);
+        if !installed {
+            if let Some(previous) = previousArchive {
+                if let Err(error) = self.filesystem.writeFileBytes(&vfsPathString(&destinationFile), &previous) {
+                    return self.recordAndReturnPackageError(filePath, "market_import_failed",
+                        &format!("Market update failed ({outcome:?}); restoring the previous archive failed: {error}"),
+                        "market_toolpkg");
+                }
+                Arc::make_mut(&mut self.externalPackageScanCache).remove(&vfsPathString(&destinationFile));
+                self.loadAvailablePackages();
+            } else if destinationStored && destinationExists {
+                let _ = self.filesystem.deleteFile(&vfsPathString(&destinationFile), false);
+            }
         }
         match outcome {
             Ok(message) => message,
@@ -4543,14 +4437,13 @@ impl RuntimePackageManager {
     #[allow(non_snake_case)]
     /// Persists the complete enabled package name list.
     pub fn setEnabledPackageNames(
-        &self,
+        &mut self,
         packageNames: &[String],
     ) -> Result<(), PreferencesDataStoreError> {
-        let result = self.saveEnabledPackageNames(packageNames);
-        if result.is_ok() {
-            self.notifyToolPkgRuntimeChangeListeners();
-        }
-        result
+        self.saveEnabledPackageNames(packageNames)?;
+        self.loadAvailablePackages();
+        self.packageRegistryReadiness.require_ready()
+            .map_err(PreferencesDataStoreError::Message)
     }
 
     #[allow(non_snake_case)]
@@ -5119,11 +5012,6 @@ impl RuntimePackageManager {
     }
 
     #[allow(non_snake_case)]
-    fn removeFromCachesAfterDelete(&mut self, packageName: &str) {
-        self.pluginPackageManager.removePackage(packageName);
-    }
-
-    #[allow(non_snake_case)]
     /// Resolves the exact installed source, including HJSON, TS and ToolPkg archives.
     fn findPackageFile(&mut self, packageName: &str) -> Option<PathBuf> {
         let record = ExtensionStore::default()
@@ -5187,180 +5075,46 @@ impl RuntimePackageManager {
         prompt
     }
 
-    #[allow(non_snake_case)]
-    fn loadPackageFromJsFile(&self, file: &Path) -> Option<ToolPackage> {
-        let fileSystemHost = self.context.fileSystemHost.as_ref()?;
-        JsPackageLoader::load_from_file(fileSystemHost.as_ref(), &file.to_string_lossy()).ok()
-    }
-
     /// Loads one JavaScript package and preserves the parser error for the UI.
     #[allow(non_snake_case)]
     fn loadPackageFromJsFileResult(&self, file: &Path) -> Result<ToolPackage, String> {
-        let fileSystemHost =
-            self.context.fileSystemHost.as_ref().ok_or_else(|| {
-                "FileSystemHost is required for external package loading".to_string()
-            })?;
-        JsPackageLoader::load_from_file(fileSystemHost.as_ref(), &file.to_string_lossy())
+        let filesystem = self.filesystem.clone();
+        JsPackageLoader::load_from_file(filesystem.as_ref(), &file.to_string_lossy())
             .map_err(|error| error.to_string())
     }
 
     /// Resolves installed archive scope from its exact host-backed package directory.
     #[allow(non_snake_case)]
     fn installedPackageConfigScope(&self, path: &Path) -> Result<ToolPkgConfigScope, String> {
-        for scope in [ToolPkgConfigScope::Device, ToolPkgConfigScope::Space] {
-            let root = ExtensionStore::root("package", scope.as_str())?;
-            let directory = self.storePaths.runtime_storage_path(&root);
-            if path.parent() == Some(directory.as_path()) {
-                return Ok(scope);
-            }
-        }
-        Err(format!(
-            "Package source is outside installed scope directories: {}",
-            hostPath(path)
-        ))
+        self.registryScanner().installedPackageConfigScope(path)
     }
 
-    /// Loads one external ToolPkg and collects partial registration diagnostics.
+    /// Loads an authenticated archive through one registration and diagnostic path.
     #[allow(non_snake_case)]
-    fn loadToolPkgFromExternalFileWithIssues(
-        &self,
-        file: &Path,
-        configScope: ToolPkgConfigScope,
+    fn loadToolPkgFileWithIssues(
+        &self, file: &Path, configScope: ToolPkgConfigScope, sourceType: ToolPkgSourceType,
     ) -> Result<(ToolPkgLoadResult, Vec<ToolPkgLoadIssue>), String> {
-        let fileSystemHost =
-            self.context.fileSystemHost.as_ref().ok_or_else(|| {
-                "FileSystemHost is required for external ToolPkg loading".to_string()
-            })?;
-        let sourcePath = file.to_string_lossy().to_string();
+        let market = sourceType == ToolPkgSourceType::MARKET;
+        if market && !self.isInstalledMarketToolPkg(file)? {
+            return Err("ToolPkg market installation authentication failed".into());
+        }
+        let sourcePath = vfsPathString(file);
+        let bytes = self.filesystem.readFileBytes(&sourcePath)?;
         let issues = RefCell::new(Vec::new());
-        let loadResult = self.withToolPkgRegistrationEngine(|registrationEngine| {
-            ToolPkgLoader::loadToolPkgFromExternalFile(
-                fileSystemHost.as_ref(),
-                &sourcePath,
-                configScope,
-                registrationEngine,
-                |packageName, error| {
-                    issues.borrow_mut().push(newToolPkgLoadIssue(
-                        sourcePath.clone(),
-                        nonEmptyString(&packageName),
-                        packageName.to_string(),
-                        "toolpkg_registration",
-                        error.to_string(),
-                        "toolpkg",
-                    ));
-                },
+        let loadResult = self.registryScanner().withToolPkgRegistrationEngine(|engine| {
+            ToolPkgLoader::loadToolPkgFromArchiveBytes(
+                &bytes, sourceType, &sourcePath, false, configScope, engine,
+                |packageName, error| issues.borrow_mut().push(newToolPkgLoadIssue(
+                    sourcePath.clone(), nonEmptyString(packageName), packageName.into(),
+                    "toolpkg_registration", error.into(), packageLoadIssueKind(&sourcePath, true, market),
+                )),
             )
         })?;
         Ok((loadResult, issues.into_inner()))
     }
 
     /// Loads one market ToolPkg and collects partial registration diagnostics.
-    #[allow(non_snake_case)]
-    fn loadToolPkgFromMarketFileWithIssues(
-        &self,
-        file: &Path,
-        configScope: ToolPkgConfigScope,
-    ) -> Result<(ToolPkgLoadResult, Vec<ToolPkgLoadIssue>), String> {
-        if !self.isInstalledMarketToolPkg(file)? {
-            return Err("ToolPkg market installation authentication failed".to_string());
-        }
-        let fileSystemHost =
-            self.context.fileSystemHost.as_ref().ok_or_else(|| {
-                "FileSystemHost is required for market ToolPkg loading".to_string()
-            })?;
-        let sourcePath = file.to_string_lossy().to_string();
-        let issues = RefCell::new(Vec::new());
-        let loadResult = self.withToolPkgRegistrationEngine(|registrationEngine| {
-            ToolPkgLoader::loadToolPkgFromMarketFile(
-                fileSystemHost.as_ref(),
-                &sourcePath,
-                configScope,
-                registrationEngine,
-                |packageName, error| {
-                    issues.borrow_mut().push(newToolPkgLoadIssue(
-                        sourcePath.clone(),
-                        nonEmptyString(&packageName),
-                        packageName.to_string(),
-                        "toolpkg_registration",
-                        error.to_string(),
-                        "market_toolpkg",
-                    ));
-                },
-            )
-        })?;
-        Ok((loadResult, issues.into_inner()))
-    }
-
-    /// Loads one built-in ToolPkg and collects partial registration diagnostics.
-    #[allow(non_snake_case)]
-    fn loadToolPkgFromBuiltInAssetWithIssues(
-        &self,
-        assetName: &str,
-        bytes: &'static [u8],
-    ) -> Result<(ToolPkgLoadResult, Vec<ToolPkgLoadIssue>), String> {
-        let issues = RefCell::new(Vec::new());
-        let loadResult = self.withToolPkgRegistrationEngine(|registrationEngine| {
-            ToolPkgLoader::loadToolPkgFromBuiltInAsset(
-                assetName,
-                bytes,
-                registrationEngine,
-                |packageName, error| {
-                    issues.borrow_mut().push(newToolPkgLoadIssue(
-                        assetName.to_string(),
-                        nonEmptyString(&packageName),
-                        packageName.to_string(),
-                        "toolpkg_registration",
-                        error.to_string(),
-                        "toolpkg",
-                    ));
-                },
-            )
-        })?;
-        Ok((loadResult, issues.into_inner()))
-    }
-
-    /// Loads one bundled external ToolPkg and collects partial registration diagnostics.
-    #[allow(non_snake_case)]
-    fn loadToolPkgFromBundledExternalAssetWithIssues(
-        &self,
-        assetName: &str,
-        bytes: &'static [u8],
-    ) -> Result<(ToolPkgLoadResult, Vec<ToolPkgLoadIssue>), String> {
-        let issues = RefCell::new(Vec::new());
-        let loadResult = self.withToolPkgRegistrationEngine(|registrationEngine| {
-            ToolPkgLoader::loadToolPkgFromBundledExternalAsset(
-                assetName,
-                bytes,
-                registrationEngine,
-                |packageName, error| {
-                    issues.borrow_mut().push(newToolPkgLoadIssue(
-                        assetName.to_string(),
-                        nonEmptyString(&packageName),
-                        packageName.to_string(),
-                        "toolpkg_registration",
-                        error.to_string(),
-                        "toolpkg",
-                    ));
-                },
-            )
-        })?;
-        Ok((loadResult, issues.into_inner()))
-    }
-
     /// Executes one ToolPkg load with a dedicated registration engine.
-    #[allow(non_snake_case)]
-    fn withToolPkgRegistrationEngine<T>(
-        &self,
-        operation: impl FnOnce(&dyn JsExecutionEngine) -> Result<T, String>,
-    ) -> Result<T, String> {
-        // Registration runs package-owned code; per-load ownership prevents one timed-out
-        // package from retaining state or blocking registration of the next package.
-        let registrationEngine = ToolPkgRegistrationEngineGuard {
-            engine: self.toolPkgExecutionEngineFactory.createExecutionEngine()?,
-        };
-        operation(registrationEngine.engine.as_ref())
-    }
-
     #[allow(non_snake_case)]
     fn selectToolPackageState(&mut self, toolPackage: &ToolPackage) -> ToolPackage {
         self.pluginPackageManager
@@ -5463,11 +5217,8 @@ impl ToolPkgPackageHost for RuntimePackageManager {
 
     /// Returns the filesystem host owned by this package manager context.
     #[allow(non_snake_case)]
-    fn fileSystemHost(&self) -> Arc<dyn FileSystemHost> {
-        self.context
-            .fileSystemHost
-            .clone()
-            .expect("RuntimePackageManager requires a FileSystemHost")
+    fn filesystem(&self) -> Arc<VisualFileSystem> {
+        self.filesystem.clone()
     }
 
     /// Persists ToolPkg subpackage states for SDK state changes.
@@ -5539,6 +5290,50 @@ fn bundledExternalPluginAssetByName(
         .find(|asset| asset.name == assetName)
 }
 
+/// Reads catalog metadata from the manifest without loading resources or running registration.
+#[allow(non_snake_case)]
+fn bundledToolPkgCatalogCandidate(
+    assetName: &str,
+    bytes: &[u8],
+) -> Result<BundledExternalPackageCandidate, String> {
+    let manifest = ToolPkgArchiveParser::readToolPkgManifest(bytes)?;
+    Ok(BundledExternalPackageCandidate {
+        packageName: manifest.toolpkgId,
+        displayName: manifest.displayName,
+        description: manifest.description,
+        author: manifest.author,
+        packageKind: "toolpkg".into(),
+        sourceFileName: packageSourceFileName(assetName),
+        sourcePath: assetName.into(),
+        isToolPkg: true,
+        version: manifest.version,
+        category: "ToolPkg".into(),
+        toolCount: 0,
+        subpackageCount: manifest.subpackages.len(),
+        requiredInstallationScope: manifest.installationScope.map(|scope| scope.as_str().into()),
+    })
+}
+
+/// Retains script bodies only for enabled standalone packages after reading their metadata.
+#[allow(non_snake_case)]
+fn scanStandalonePackageScript(
+    script: &str,
+    isBuiltIn: bool,
+    activation: &PackageScanActivation,
+) -> Result<ToolPackage, String> {
+    let metadata = JsPackageLoader::extract_metadata(script);
+    let mut package = ToolPackage {
+        is_built_in: isBuiltIn,
+        ..JsPackageLoader::parse_metadata(&metadata, "")?
+    };
+    if activation.isEnabled(&package) {
+        for tool in package.tools.iter_mut().chain(package.states.iter_mut().flat_map(|state| &mut state.tools)) {
+            tool.script = script.into();
+        }
+    }
+    Ok(package)
+}
+
 #[allow(non_snake_case)]
 fn buildBundledPluginAssetSignature(asset: &RuntimePluginAsset) -> String {
     format!("{}|{}|{}", asset.name, asset.bytes.len(), asset.sha256)
@@ -5607,9 +5402,9 @@ fn javaStringHashCodeHex(value: &str) -> String {
     format!("{:x}", hash as u32)
 }
 
-/// Converts a package metadata path into the corresponding host path string.
-fn hostPath(path: &Path) -> String {
-    path.to_string_lossy().to_string()
+/// Serializes a virtual package path with portable separators.
+fn vfsPathString(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[allow(non_snake_case)]
@@ -5818,12 +5613,12 @@ fn packageProgressDisplayName(sourcePath: &str) -> String {
     Path::new(sourcePath)
         .file_stem()
         .or_else(|| Path::new(sourcePath).file_name())
-        .map(|value| value.to_string_lossy().to_string())
+        .map(|value| value.to_string_lossy().replace('\\', "/"))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| sourcePath.to_string())
 }
 
-/// Builds one structured issue with the canonical package-manager field names.
+/// Records new diagnostics in both application and plugin logs before exposing them to the UI.
 #[allow(non_snake_case)]
 fn newToolPkgLoadIssue(
     sourcePath: String,
@@ -5833,7 +5628,7 @@ fn newToolPkgLoadIssue(
     message: String,
     packageKind: &str,
 ) -> ToolPkgLoadIssue {
-    ToolPkgLoadIssue {
+    let issue = ToolPkgLoadIssue {
         sourcePath,
         packageName,
         displayName: if displayName.trim().is_empty() {
@@ -5844,7 +5639,15 @@ fn newToolPkgLoadIssue(
         code: code.to_string(),
         message,
         packageKind: packageKind.to_string(),
+    };
+    let message = format!("event=plugin.package.load_issue {}",
+        serde_json::to_string(&issue).expect("ToolPkg load issue must serialize"));
+    if matches!(code, "duplicate_scope" | "duplicate_package") {
+        AppLogger::w("ToolPkg", &message);
+    } else {
+        AppLogger::e("ToolPkg", &message);
     }
+    issue
 }
 
 /// Appends only issues that are not already present in a package-manager list.
@@ -6012,9 +5815,162 @@ mod public_api_selection_tests {
     }
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "tests/LocalToolPkgUpdateTests.rs"]
+mod local_toolpkg_update_tests;
+
 #[cfg(test)]
 mod package_registration_tests {
     use super::*;
+
+    /// Keeps disabled catalog reads independent of entry scripts and unrelated archive payloads.
+    #[test]
+    fn installed_catalog_preserves_metadata_without_retaining_executable_scripts() {
+        use std::io::Write;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, content) in [
+            ("nested/manifest.json", r#"{
+                "toolpkg_id":"catalog.disabled", "version":"1.2.3", "main":"main.js",
+                "display_name":"Disabled catalog", "enabled_by_default":true,
+                "installation_scope":"space", "subpackages":[{"id":"child","entry":"child.js"}]
+            }"#),
+            ("nested/main.js", "throw new Error('catalog reads must not evaluate this');"),
+            ("nested/child.js", r#"/* METADATA {"name":"legacy_child", "enabledByDefault":false,
+                "tools":[{"name":"read","description":"Read","parameters":[]}]} */
+                throw new Error('catalog reads must not evaluate subpackages');"#),
+        ] {
+            archive.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            archive.write_all(content.as_bytes()).unwrap();
+        }
+        archive.start_file("large-unused.bin", zip::write::SimpleFileOptions::default()).unwrap();
+        archive.write_all(&vec![0xff; 1_000_000]).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let catalog = ToolPkgArchiveParser::readToolPkgCatalog(
+            &bytes, ToolPkgSourceType::EXTERNAL, "disabled.toolpkg", false,
+        ).unwrap();
+        assert_eq!(catalog.containerRuntime.version, "1.2.3");
+        assert_eq!(catalog.containerRuntime.mainEntry, "nested/main.js");
+        assert_eq!(catalog.containerRuntime.displayName.resolve(false), "Disabled catalog");
+        assert_eq!(catalog.containerRuntime.manifestExtensions["installation_scope"], "space");
+        assert!(catalog.containerRuntime.publicApis.is_empty());
+        assert_eq!(catalog.subpackagePackages[0].name, "child");
+        assert!(!catalog.containerRuntime.subpackages[0].enabledByDefault);
+        assert_eq!(catalog.containerRuntime.subpackages[0].toolCount, 1);
+        assert!(catalog.subpackagePackages[0].tools[0].script.is_empty());
+    }
+
+    /// Distinguishes explicit activation from built-in defaults before registry initialization.
+    #[test]
+    fn scan_activation_uses_the_exact_container_owner() {
+        let activation = PackageScanActivation {
+            states: BTreeMap::from([
+                ("disabled".into(), (false, true)), ("external".into(), (true, false)),
+            ]),
+            ..Default::default()
+        };
+        for (name, builtin, default, expected) in [
+            ("disabled", true, true, false), ("external", false, false, true),
+            ("new_builtin", true, true, true), ("optional", true, false, false),
+            ("new_external", false, true, false),
+        ] {
+            let package = ToolPackage {
+                name: name.into(), is_built_in: builtin, enabled_by_default: default, ..Default::default()
+            };
+            assert_eq!(activation.isEnabled(&package), expected, "{name}");
+        }
+        let script = r#"/* METADATA {"name":"disabled", "enabledByDefault":true,
+            "tools":[{"name":"read","parameters":[]}]} */ exports.read = function() {};"#;
+        assert!(scanStandalonePackageScript(script, true, &activation).unwrap().tools[0].script.is_empty());
+        assert!(!scanStandalonePackageScript(script, true, &PackageScanActivation::default()).unwrap().tools[0].script.is_empty());
+    }
+
+    /// Lists metadata even when main.js cannot execute and a large unused resource is present.
+    #[test]
+    fn bundled_catalog_reads_manifest_without_loading_plugin_code() {
+        use std::io::Write;
+        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        archive.start_file("manifest.json", options).unwrap();
+        archive.write_all(br#"{
+            "schema_version": 1, "toolpkg_id": "catalog.test", "version": "1.2.3",
+            "display_name": {"zh": "Catalog test"}, "description": "Description",
+            "author": ["Tester"], "main": "main.js", "installation_scope": "space",
+            "subpackages": [{"id": "tools", "entry": "tools.js"}]
+        }"#).unwrap();
+        archive.start_file("main.js", options).unwrap();
+        archive.write_all(b"throw new Error('must not run for a catalog read');").unwrap();
+        archive.start_file("unused.bin", options).unwrap();
+        archive.write_all(&vec![0; 1_000_000]).unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let candidate = bundledToolPkgCatalogCandidate("plugins/catalog.toolpkg", &bytes).unwrap();
+        assert_eq!(candidate.packageName, "catalog.test");
+        assert_eq!(candidate.displayName.resolve(false), "Catalog test");
+        assert_eq!(candidate.version, "1.2.3");
+        assert_eq!(candidate.subpackageCount, 1);
+        assert_eq!(candidate.requiredInstallationScope.as_deref(), Some("space"));
+        assert_eq!(candidate.sourceFileName, "catalog.toolpkg");
+    }
+
+    /// Reports a broken archive instead of attempting a runtime load for catalog metadata.
+    #[test]
+    fn bundled_catalog_rejects_invalid_archives() {
+        assert!(bundledToolPkgCatalogCandidate("broken.toolpkg", b"broken").is_err());
+    }
+
+    fn market_package(version: &str) -> ToolPkgLoadResult {
+        let origin = ToolPkgMarketOrigin {
+            market: "https://market.example".into(), toolpkgId: "dev.test.plugin".into(),
+            version: version.into(), author: vec!["publisher".into()],
+        };
+        ToolPkgLoadResult {
+            containerPackage: ToolPackage { name: "dev.test.plugin".into(), ..Default::default() },
+            containerRuntime: ToolPkgContainerRuntime {
+                packageName: "dev.test.plugin".into(), sourceType: ToolPkgSourceType::MARKET,
+                sourcePath: "/packages/market-old.toolpkg".into(), version: version.into(),
+                marketOrigin: Some(origin.clone()), ..Default::default()
+            },
+            marketOrigin: Some(origin), ..Default::default()
+        }
+    }
+
+    #[test]
+    fn market_update_replaces_its_own_registration_but_cannot_take_other_names() {
+        let old = market_package("1");
+        let mut_update = market_package("2");
+        assert!(isSameMarketToolPkg(&old.containerRuntime, &mut_update));
+        let mut packages = BTreeMap::new();
+        let mut containers = BTreeMap::new();
+        let mut children = BTreeMap::new();
+        assert!(RuntimePackageManager::registerToolPkgInto(old, &mut packages, &mut containers, &mut children));
+        assert!(!RuntimePackageManager::registerToolPkgInto(mut_update.clone(), &mut packages, &mut containers, &mut children));
+        assert!(ToolPkgManager::canRegisterToolPkgInRegistry(
+            &mut_update, &packages, &containers, &children, Some("dev.test.plugin"),
+        ));
+        packages.insert("other".into(), ToolPackage { name: "other".into(), ..Default::default() });
+        let mut collision = mut_update;
+        collision.subpackagePackages.push(ToolPackage { name: "other".into(), ..Default::default() });
+        assert!(!ToolPkgManager::canRegisterToolPkgInRegistry(
+            &collision, &packages, &containers, &children, Some("dev.test.plugin"),
+        ));
+        assert_eq!(containers["dev.test.plugin"].version, "1");
+        assert!(packages.contains_key("other"));
+    }
+
+    #[test]
+    fn market_update_requires_the_same_market_id_and_publishers() {
+        let old = market_package("1");
+        for change in 0..5 {
+            let mut incoming = market_package("2");
+            match change {
+                0 => incoming.containerRuntime.sourceType = ToolPkgSourceType::EXTERNAL,
+                1 => incoming.containerRuntime.marketOrigin = None,
+                2 => incoming.containerRuntime.marketOrigin.as_mut().unwrap().market = "other".into(),
+                3 => incoming.containerRuntime.marketOrigin.as_mut().unwrap().author = vec!["other".into()],
+                _ => incoming.containerRuntime.marketOrigin.as_mut().unwrap().toolpkgId = "other".into(),
+            }
+            assert!(!isSameMarketToolPkg(&old.containerRuntime, &incoming));
+        }
+    }
 
     /// Verifies duplicate diagnostics identify the actual conflicting member and preserve the original registry.
     #[test]
@@ -6054,6 +6010,32 @@ mod package_registration_tests {
         assert!(containers.is_empty());
         assert!(subpackages.is_empty());
     }
+}
+
+/// Compares market identities; callers also authenticate legacy external archives.
+#[allow(non_snake_case)]
+fn isSameMarketToolPkg(existing: &ToolPkgContainerRuntime, incoming: &ToolPkgLoadResult) -> bool {
+    if !matches!(existing.sourceType, ToolPkgSourceType::MARKET | ToolPkgSourceType::EXTERNAL)
+        || incoming.containerRuntime.sourceType != ToolPkgSourceType::MARKET
+        || existing.packageName != incoming.containerPackage.name
+    {
+        return false;
+    }
+    let (Some(old), Some(new)) = (&existing.marketOrigin, &incoming.containerRuntime.marketOrigin) else {
+        return false;
+    };
+    sameMarketOrigin(old, new, &existing.packageName)
+}
+
+fn sameMarketOrigin(old: &ToolPkgMarketOrigin, new: &ToolPkgMarketOrigin, packageName: &str) -> bool {
+    let mut oldAuthors = old.author.clone();
+    let mut newAuthors = new.author.clone();
+    oldAuthors.sort(); oldAuthors.dedup();
+    newAuthors.sort(); newAuthors.dedup();
+    !old.market.trim().is_empty() && old.market == new.market
+        && old.toolpkgId == packageName && old.toolpkgId == new.toolpkgId
+        && !oldAuthors.is_empty() && oldAuthors.iter().all(|author| !author.trim().is_empty())
+        && oldAuthors == newAuthors
 }
 
 /// Applies the package manager's context cache policy independently of transport attachment.
@@ -6132,54 +6114,5 @@ mod hook_timeout_notification_tests {
             notifyToolPkgHookTimeout(&context, "bridge.wechat", "before-send", "submit_requested");
         assert!(error.starts_with("TOOLPKG_BEFORE_HOOK_TIMEOUT: "));
         assert!(error.ends_with("超时提示显示失败：toast channel closed"));
-    }
-}
-
-/// Owns native staging only while a non-native VFS package is being imported.
-struct NativePackageImportFile {
-    path: PathBuf,
-    staging: Option<(crate::files::VisualFileSystem::VisualFileSystem, String)>,
-}
-
-impl NativePackageImportFile {
-    fn stage(vfs: crate::files::VisualFileSystem::VisualFileSystem, name: &str, bytes: &[u8]) -> Result<Self, String> {
-        let directory = format!("/operitapp/data/temp/package_imports/{}", uuid::Uuid::new_v4());
-        let staged = crate::files::PathMapper::PathMapper::joinVfsPath(&directory, name)?;
-        let native = vfs.resolvePath(&staged)?.nativePath()?;
-        vfs.makeDirectory(&directory, true)?;
-        let file = Self { path: native.into(), staging: Some((vfs.clone(), directory)) };
-        vfs.writeFileBytes(&staged, bytes)?;
-        Ok(file)
-    }
-}
-
-impl Drop for NativePackageImportFile {
-    fn drop(&mut self) {
-        if let Some((vfs, directory)) = &self.staging {
-            let _ = vfs.deleteFile(directory, true);
-        }
-    }
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod native_import_staging_tests {
-    use super::*;
-    use crate::files::{PathMapper::PathMapper, VisualFileSystem::VisualFileSystem};
-    use operit_host_native_filesystem::PosixFileSystemHost;
-
-    #[test]
-    fn package_staging_preserves_bytes_and_cleans_up_on_drop() {
-        let root = std::env::temp_dir().join(format!("operit-import-test-{}", uuid::Uuid::new_v4()));
-        let vfs = VisualFileSystem::new(
-            Arc::new(PosixFileSystemHost::new()),
-            PathMapper::builtinOnly(root.clone(), root.join("workspaces")),
-        );
-        let file = NativePackageImportFile::stage(vfs, "中文 package.toolpkg", &[0, 255, 1]).unwrap();
-        let path = file.path.clone();
-        assert_eq!(std::fs::read(&path).unwrap(), [0, 255, 1]);
-        assert_eq!(path.file_name().unwrap(), "中文 package.toolpkg");
-        drop(file);
-        assert!(!path.parent().unwrap().exists());
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

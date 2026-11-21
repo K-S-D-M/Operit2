@@ -23,6 +23,7 @@ fn streamingState() -> StreamingState {
         isInReasoningMode: false,
         hasEmittedThinkStart: false,
         hasEmittedRegularContent: false,
+        hasModelOutput: false,
         reasoningObserved: false,
         isFirstResponse: true,
         streamCompletionConfirmed: false,
@@ -47,7 +48,7 @@ fn streamingState() -> StreamingState {
 fn testProvider() -> OpenAIProvider {
     OpenAIProvider::new(
         "http://localhost".to_string(),
-        String::new(),
+        String::new().into(),
         "test-model".to_string(),
         "OPENAI_GENERIC".to_string(),
         Vec::new(),
@@ -59,7 +60,7 @@ fn testProvider() -> OpenAIProvider {
 fn visionTestProvider() -> OpenAIProvider {
     OpenAIProvider::new_with_capabilities(
         "http://localhost".to_string(),
-        String::new(),
+        String::new().into(),
         "test-model".to_string(),
         "OPENAI_GENERIC".to_string(),
         Vec::new(),
@@ -89,7 +90,7 @@ fn sendRequest(chat_history: Vec<PromptTurn>) -> SendMessageRequest {
 #[test]
 fn imageLinksBecomeOpenAiContentParts() {
     let image_id = ImagePoolManager::add_image_bytes(
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01",
+        include_bytes!("fixtures/pixel.png"),
         Some("image/png"),
         None,
     );

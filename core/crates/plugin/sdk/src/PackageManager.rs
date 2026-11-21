@@ -8,7 +8,7 @@ use crate::toolpkg::ToolPkgManager::{
 use crate::toolpkg::ToolPkgParser::{
     ToolPkgContainerRuntime, ToolPkgLoadResult, ToolPkgSubpackageRuntime,
 };
-use operit_host_api::FileSystemHost;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 
 /// Resolves the active conditional state for one package.
 pub trait PackageStateResolver: Send + Sync {
@@ -34,7 +34,7 @@ impl PluginPackageManager {
     pub fn new(
         executionEngineFactory: Arc<dyn ToolPkgExecutionEngineFactory>,
         assetSource: Arc<dyn ToolPkgAssetSource>,
-        fileSystemHost: Arc<dyn FileSystemHost>,
+        filesystem: Arc<VisualFileSystem>,
         packageStateResolver: Arc<dyn PackageStateResolver>,
     ) -> Self {
         Self {
@@ -45,7 +45,7 @@ impl PluginPackageManager {
             toolPkgManager: ToolPkgManager::new(
                 executionEngineFactory,
                 assetSource,
-                fileSystemHost,
+                filesystem,
             ),
             packageStateResolver,
         }
@@ -140,15 +140,13 @@ impl PluginPackageManager {
         Arc::make_mut(&mut self.activePackageStateIds).retain(|name, _| self.availablePackages.contains_key(name));
     }
 
-    /// Replaces ToolPkg runtime maps after an external source scan.
+    /// Publishes precomputed runtime declarations without reading sources or destroying workers.
     #[allow(non_snake_case)]
-    pub fn replaceToolPkgRuntimes(
+    pub fn publishToolPkgRuntimes(
         &mut self,
-        containers: BTreeMap<String, ToolPkgContainerRuntime>,
-        subpackages: BTreeMap<String, ToolPkgSubpackageRuntime>,
-    ) {
-        self.toolPkgManager
-            .replaceRuntimeMaps(containers, subpackages);
+        prepared: crate::toolpkg::ToolPkgManager::PreparedToolPkgRuntimeMaps,
+    ) -> Vec<Arc<dyn crate::javascript::JsExecutionEngine>> {
+        self.toolPkgManager.publishRuntimeMaps(prepared)
     }
 
     /// Removes one package or an entire ToolPkg container.
@@ -298,6 +296,7 @@ fn applyPackageState(package: &ToolPackage, stateId: Option<&str>) -> ToolPackag
     ToolPackage {
         tools,
         name: package.name.clone(), description: package.description.clone(),
+        api_version: package.api_version.clone(),
         states: package.states.clone(), env: package.env.clone(),
         is_built_in: package.is_built_in, enabled_by_default: package.enabled_by_default,
         display_name: package.display_name.clone(), category: package.category.clone(),
@@ -644,7 +643,7 @@ mod tests {
         PluginPackageManager::new(
             Arc::new(TestExecutionEngineFactory),
             Arc::new(TestAssetSource),
-            Arc::new(RejectingFileSystemHost),
+            Arc::new(operit_vfs::VisualFileSystem::VisualFileSystem::builtinOnly(Arc::new(RejectingFileSystemHost), "/".into(), "/workspaces".into())),
             Arc::new(TestPackageStateResolver),
         )
     }
@@ -681,6 +680,7 @@ mod tests {
         let mut manager = packageManager();
         manager.registerPackage(ToolPackage {
             name: "demo".into(), tools: vec![tool("run", "base"), tool("hidden", "hidden")],
+            api_version: "2.0.0".into(),
             states: vec![ToolPackageState {
                 id: "state".into(), inherit_tools: true, exclude_tools: vec!["hidden".into()],
                 tools: vec![tool("run", "override"), tool("added", "added")], ..Default::default()
@@ -689,6 +689,7 @@ mod tests {
         assert_eq!(manager.effectiveTool("demo", "run").unwrap().script, "override");
         assert_eq!(manager.effectiveTool("demo", "added").unwrap().script, "added");
         assert!(manager.effectiveTool("demo", "hidden").is_err());
+        assert_eq!(manager.effectivePackage("demo").unwrap().api_version, "2.0.0");
         for tool in manager.effectivePackage("demo").unwrap().tools {
             assert_eq!(manager.effectiveTool("demo", &tool.name).unwrap().script, tool.script);
         }

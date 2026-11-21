@@ -230,16 +230,13 @@ async function readPreparation(event: PromptEvent, consume: boolean) {
   }
 }
 
+/** Renders entry variables before adding injection wrappers. */
 function renderEntries(
   entries: WorldBookEntry[],
-  variableContext: WorldBookVariableRenderContext | null
+  variableContext: WorldBookVariableRenderContext | null,
 ): WorldBookEntry[] {
-  if (!variableContext) {
-    return entries;
-  }
-  return entries.map((entry) => ({
-    ...entry,
-    content: renderWorldBookContent(String(entry.content || ""), variableContext)
+  return entries.map(entry => ({ ...entry,
+    content: renderWorldBookContent(entry.content, variableContext),
   }));
 }
 
@@ -404,6 +401,7 @@ export async function onServiceInitialize(_event: ToolPkg.AppLifecycleHookEvent)
   await initializeWorldBookStorage();
 }
 
+/** Registers lifecycle, management UI, and matching send and estimate prompt handlers. */
 export function registerToolPkg() {
   ToolPkg.registerAppLifecycleHook({
     id: "service-initialize",
@@ -442,6 +440,11 @@ export function registerToolPkg() {
 
   ToolPkg.registerPromptFinalizeHook({
     id: "worldbook_keyword_inject",
+    function: finalizeHook
+  });
+
+  ToolPkg.registerPromptEstimateFinalizeHook({
+    id: "worldbook_keyword_estimate",
     function: finalizeHook
   });
 

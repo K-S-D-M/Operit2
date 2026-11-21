@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
+import { installTestJavaScriptCompiler } from "../../../../../tools/tests/fixtures/production_bootstrap.mjs";
+import { runtimeConsole } from "./runtime.mjs";
 
 /** Reads an actual Rust-owned SDK script; the Node harness does not execute Rust or native hosts. */
 export function sdkScript(file) { return readSdkScript(file); }
@@ -23,12 +25,12 @@ function engineModuleHelpers() {
 
 /** Loads package JS through the SDK source compiler with real engine metadata tagging. */
 export function packageRuntime(modules, globals = {}, registrationOnly = false) {
-  const context = vm.createContext({ console, TextEncoder, TextDecoder, setTimeout, clearTimeout, ...globals });
+  const context = vm.createContext({ console: runtimeConsole, TextEncoder, TextDecoder, setTimeout, clearTimeout, ...globals });
   vm.runInContext(engineModuleHelpers(), context);
   // Built screen functions close over their defining realm, just like the real
   // engine. Supply the production runtime in that realm, not a second VM.
   vm.runInContext(sdkScript("ToolPkgComposeDslBridge.rs"), context);
-  vm.runInContext("globalThis.__operitNativeCompileModuleFactory = body => new Function('module','exports','require','__operit_call_runtime',body);", context);
+  installTestJavaScriptCompiler(context);
   const cache = new Map();
   /** Prepares UI source modules with the production compiler before evaluating their exports. */
   function load(modulePath) {
@@ -42,7 +44,7 @@ export function packageRuntime(modules, globals = {}, registrationOnly = false) 
     const prepared = context.__operitIsLocalUiModulePath(normalized)
       ? context.OperitComposeCompiler.prepare(source, "com.operit.character_cards:" + normalized)
       : source;
-    const factory = vm.runInContext("(function(module, exports, require) {\n" + prepared + "\n})", context, { filename: normalized });
+    const factory = context.__operitNativeCompileModuleFactory(context.__operitNativePrepareJavaScript(prepared));
     factory(module, module.exports, request => {
       assert.ok(request.startsWith("."), "Only declared relative modules may be loaded: " + request);
       return load(path.posix.join(path.posix.dirname(normalized), request));

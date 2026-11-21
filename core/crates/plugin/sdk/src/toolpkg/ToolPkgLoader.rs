@@ -6,7 +6,7 @@ use crate::toolpkg::ToolPkgParser::{
     ToolPkgArchiveParser, ToolPkgLoadResult, ToolPkgMainRegistrationParseResult, ToolPkgSourceType,
 };
 use crate::JsPackageLoader::JsPackageLoader;
-use operit_host_api::FileSystemHost;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 
 /// Loads ToolPkg archives and executes their main registration scripts.
 pub struct ToolPkgLoader;
@@ -15,7 +15,7 @@ impl ToolPkgLoader {
     /// Loads a ToolPkg archive through the supplied file-system host.
     #[allow(non_snake_case)]
     pub fn loadToolPkgFromExternalFile<FReportPackageLoadError>(
-        fileSystemHost: &dyn FileSystemHost,
+        filesystem: &VisualFileSystem,
         sourcePath: &str,
         configScope: ToolPkgConfigScope,
         jsEngine: &dyn JsExecutionEngine,
@@ -24,7 +24,7 @@ impl ToolPkgLoader {
     where
         FReportPackageLoadError: Fn(&str, &str),
     {
-        let archiveBytes = fileSystemHost
+        let archiveBytes = filesystem
             .readFileBytes(sourcePath)
             .map_err(|error| error.to_string())?;
         Self::loadToolPkgFromArchiveBytes(
@@ -89,7 +89,7 @@ impl ToolPkgLoader {
     /// Loads a raw protected ToolPkg ZIP after its local market installation seal has verified.
     #[allow(non_snake_case)]
     pub fn loadToolPkgFromMarketFile<FReportPackageLoadError>(
-        fileSystemHost: &dyn FileSystemHost,
+        filesystem: &VisualFileSystem,
         sourcePath: &str,
         configScope: ToolPkgConfigScope,
         jsEngine: &dyn JsExecutionEngine,
@@ -98,7 +98,7 @@ impl ToolPkgLoader {
     where
         FReportPackageLoadError: Fn(&str, &str),
     {
-        let archiveBytes = fileSystemHost
+        let archiveBytes = filesystem
             .readFileBytes(sourcePath)
             .map_err(|error| error.to_string())?;
         Self::loadToolPkgFromArchiveBytes(
@@ -114,7 +114,7 @@ impl ToolPkgLoader {
 
     /// Parses one already-unwrapped ToolPkg ZIP using its trusted source classification.
     #[allow(non_snake_case)]
-    fn loadToolPkgFromArchiveBytes<FReportPackageLoadError>(
+    pub fn loadToolPkgFromArchiveBytes<FReportPackageLoadError>(
         archiveBytes: &[u8],
         sourceType: ToolPkgSourceType,
         sourcePath: &str,
@@ -153,7 +153,7 @@ impl ToolPkgLoader {
             sourceType,
             sourcePath,
             isBuiltIn,
-            |jsContent, reportPackageLoadError| match JsPackageLoader::parse(jsContent) {
+            |jsContent, apiVersion, reportPackageLoadError| match JsPackageLoader::parse_with_default_api_version(jsContent, apiVersion) {
                 Ok(package) => Some(package),
                 Err(error) => {
                     reportPackageLoadError(String::new(), error);

@@ -1,6 +1,6 @@
 [package]
 name = "operit-runtime"
-version = "2.0.0-preview.30"
+version = "2.0.0-preview.42"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -10,6 +10,7 @@ default = ["javascript"]
 javascript = ["dep:operit-js-bridge", "operit-tools/javascript"]
 
 [dependencies]
+operit-vfs = { version = "0.1.0", path = "../../foundation/vfs" }
 operit-edge-contract = { path = "../../../../edge/sdk/contract" }
 async-trait.workspace = true
 aes = "0.8"
@@ -18,6 +19,7 @@ chrono.workspace = true
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures-util.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+heic-rs = { version = "0.1.4", default-features = false }
 json5.workspace = true
 md-5 = "0.10"
 operit-host-api = { path = "../../foundation/host-api" }
@@ -30,11 +32,14 @@ operit-model = { path = "../../foundation/model" }
 operit-plugin-sdk = { path = "../../plugin/sdk" }
 operit-providers = { path = "../../provider/services" }
 operit-store = { path = "../../persistence/store" }
+operit-data-rescue = { path = "../../persistence/rescue" }
 operit-plugin-theme = { path = "../../plugin/theme" }
 operit-tools = { path = "../../tool/services", default-features = false }
 operit-util = { path = "../../foundation/util" }
 reqwest.workspace = true
 regex.workspace = true
+regex-automata.workspace = true
+regex-syntax.workspace = true
 roxmltree = "0.21"
 rmp-serde = "1"
 serde.workspace = true
@@ -50,6 +55,7 @@ zip.workspace = true
 [dev-dependencies]
 rusqlite.workspace = true
 operit-host-native-storage = { path = "../../../../hosts/common/operit-host-native-storage" }
+operit-host-native-scheduler = { path = "../../../../hosts/common/operit-host-native-scheduler" }
 operit-host-native-filesystem = { path = "../../../../hosts/common/operit-host-native-filesystem" }
 
 [build-dependencies]

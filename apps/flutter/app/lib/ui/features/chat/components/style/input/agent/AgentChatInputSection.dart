@@ -7,6 +7,9 @@ import 'package:flutter/material.dart';
 import 'package:operit_ui/operit_ui.dart';
 
 import '../../../../../../../core/logging/ClientLogger.dart';
+import '../../../../../../../core/application/PluginHotReload.dart';
+import '../../../../../../common/contributions/ToolPkgChatUiCatalog.dart';
+import '../../../../../../main/navigation/ToolPkgCatalogChangeBus.dart';
 import '../../../../../../../core/proxy/generated/CoreProxyModels.g.dart'
     as core_proxy;
 import '../../../../../../../l10n/generated/app_localizations.dart';
@@ -21,6 +24,7 @@ import '../common/ChatAttachmentMenuPopup.dart';
 import '../common/ChatComposerSendActionMenu.dart';
 import '../common/ChatComposerSlotHost.dart';
 import '../common/ChatInputEnterShortcuts.dart';
+import '../common/ChatMentionSuggestionPopup.dart';
 import '../common/ChatPendingMessageQueuePanel.dart';
 import '../common/ChatPastedImageHandler.dart';
 import '../common/InputProcessingStatusLane.dart';
@@ -58,7 +62,7 @@ class AgentChatInputSection extends StatefulWidget {
     this.onGuidePendingQueueMessage,
     this.attachments = const <AttachmentInfo>[],
     this.onRemoveAttachment,
-    this.onInsertAttachment,
+    this.onPreviewAttachment,
     this.onAttachImage,
     this.onTakePhoto,
     this.onPluginAttachment,
@@ -99,7 +103,7 @@ class AgentChatInputSection extends StatefulWidget {
   final ValueChanged<int>? onGuidePendingQueueMessage;
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
   final VoidCallback? onAttachImage;
   final VoidCallback? onTakePhoto;
   final ChatAttachmentCompletion? onPluginAttachment;
@@ -123,12 +127,10 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
   final LayerLink _inputMenuPopupLink = LayerLink();
   final GlobalKey _modelPopupTargetKey = GlobalKey();
   final GlobalKey _inputMenuPopupTargetKey = GlobalKey();
-  final GlobalKey _mentionPopupTargetKey = GlobalKey();
   final GlobalKey _attachmentPopupTargetKey = GlobalKey();
   OverlayEntry? _modelPopupEntry;
   OverlayEntry? _inputMenuPopupEntry;
   int _inputMenuContextGeneration = 0;
-  OverlayEntry? _mentionPopupEntry;
   OverlayEntry? _attachmentPopupEntry;
   final GlobalKey _modelPopupWidgetKey = GlobalKey();
   StreamSubscription<
@@ -137,7 +139,8 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
   _modelBindingSubscription;
   StreamSubscription<List<core_proxy.ProviderProfile>>?
   _modelProfilesSubscription;
-  core_proxy.FunctionModelBinding? _currentModelBinding;
+  StreamSubscription<void>? _modelCatalogSubscription;
+  int _modelLabelGeneration = 0;
   List<core_proxy.ProviderProfile> _modelProfiles = const [];
   bool _draggingFiles = false;
   bool _inputExpanded = false;
@@ -152,9 +155,7 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
     WidgetsBinding.instance.addObserver(this);
     widget.controller.addListener(_handleInputChanged);
     _watchCurrentModelLabel();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _syncMentionSuggestionPopup();
-    });
+    PluginHotReload.revision.addListener(_requestModelRefresh);
   }
 
   /// Expires input menu requests when the actual chat or runtime owner changes.
@@ -165,14 +166,19 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
         oldWidget.viewModel != widget.viewModel) {
       _inputMenuContextGeneration++;
       _dismissInputMenuPopup();
+      _dismissModelSettingsPopup();
+      if (oldWidget.viewModel != widget.viewModel) {
+        _modelBindingSubscription?.cancel();
+        _modelProfilesSubscription?.cancel();
+        _modelCatalogSubscription?.cancel();
+        _watchCurrentModelLabel();
+      }
+      _requestModelRefresh();
     }
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeListener(_handleInputChanged);
       widget.controller.addListener(_handleInputChanged);
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _syncMentionSuggestionPopup();
-    });
   }
 
   void _handleInputChanged() {
@@ -193,64 +199,7 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
   void _markOpenPopupsForBuild() {
     _modelPopupEntry?.markNeedsBuild();
     _inputMenuPopupEntry?.markNeedsBuild();
-    _mentionPopupEntry?.markNeedsBuild();
     _attachmentPopupEntry?.markNeedsBuild();
-  }
-
-  /// Synchronizes the mention suggestion overlay with the active input token.
-  void _syncMentionSuggestionPopup() {
-    if (!mounted) {
-      return;
-    }
-    if (widget.mentionSuggestionPanel == null) {
-      _dismissMentionSuggestionPopup();
-      return;
-    }
-    if (_mentionPopupEntry == null) {
-      _showMentionSuggestionPopup();
-    } else {
-      _mentionPopupEntry!.markNeedsBuild();
-    }
-  }
-
-  /// Shows the mention suggestion panel above the rendered input surface.
-  void _showMentionSuggestionPopup() {
-    final overlay = Overlay.of(context);
-    _mentionPopupEntry = OverlayEntry(
-      builder: (context) {
-        final placement = _popupPlacement(
-          context,
-          targetKey: _mentionPopupTargetKey,
-          alignEnd: false,
-          maxWidth: 700,
-        );
-        return Stack(
-          children: <Widget>[
-            Positioned.fill(
-              child: Listener(
-                behavior: HitTestBehavior.translucent,
-                onPointerDown: (_) => _dismissMentionSuggestionPopup(),
-                child: const SizedBox.expand(),
-              ),
-            ),
-            Positioned(
-              left: placement.left,
-              bottom: placement.bottom,
-              width: placement.width,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () {},
-                child: ConstrainedBox(
-                  constraints: BoxConstraints(maxHeight: placement.maxHeight),
-                  child: widget.mentionSuggestionPanel!,
-                ),
-              ),
-            ),
-          ],
-        );
-      },
-    );
-    overlay.insert(_mentionPopupEntry!);
   }
 
   /// Toggles the input height while preserving the active draft and focus.
@@ -325,6 +274,7 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
                   child: AgentModelSelectorPopup(
                     key: _modelPopupWidgetKey,
                     viewModel: widget.viewModel,
+                    currentChatId: widget.currentChatId,
                     onDismiss: _dismissModelSettingsPopup,
                     onModelChanged: _handleModelChanged,
                   ),
@@ -466,18 +416,27 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
       _modelBindingSubscription = clients.preferencesFunctionalConfigManager
           .functionModelBindingFlow()
           .listen((bindings) {
-            _currentModelBinding = bindings[core_proxy.FunctionType.chat];
-            _refreshCurrentModelLabel();
+            _requestModelRefresh();
           }, onError: _logModelLabelError);
       _modelProfilesSubscription = clients.preferencesModelConfigManager
           .getProviderProfilesFlow()
           .listen((profiles) {
             _modelProfiles = profiles;
-            _refreshCurrentModelLabel();
+            _requestModelRefresh();
           }, onError: _logModelLabelError);
+      _modelCatalogSubscription = ToolPkgCatalogChangeBus.listen(
+        _requestModelRefresh,
+      );
+      _requestModelRefresh();
     } catch (error, stackTrace) {
       _logModelLabelError(error, stackTrace);
     }
+  }
+
+  /// Invalidates open model controls and reloads the actual chat binding.
+  void _requestModelRefresh() {
+    _dismissModelSettingsPopup();
+    unawaited(_refreshCurrentModelLabel());
   }
 
   void _logModelLabelError(Object error, StackTrace stackTrace) {
@@ -489,49 +448,52 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
     );
   }
 
-  /// Derives cosmetic metadata from snapshots rather than resolving a runtime
-  /// config. A binding may temporarily precede its provider during sync.
-  void _refreshCurrentModelLabel() {
-    if (!mounted) {
-      return;
-    }
-    final binding = _currentModelBinding;
-    core_proxy.ProviderProfile? boundProvider;
-    if (binding != null) {
+  /// Resolves display metadata from the same owner and model rule as execution.
+  Future<void> _refreshCurrentModelLabel() async {
+    final generation = ++_modelLabelGeneration;
+    if (!mounted) return;
+    setState(() {
+      _modelLabel = '加载中...';
+      _modelProviderTypeId = '';
+      _modelProviderName = '';
+    });
+    try {
+      final selection = await ToolPkgChatUiCatalog(
+        clients: widget.viewModel.clients,
+      ).loadModelSelection(chatId: widget.currentChatId);
+      if (!mounted || generation != _modelLabelGeneration) return;
+      final binding = selection.singleBinding;
+      core_proxy.ProviderProfile? boundProvider;
       for (final provider in _modelProfiles) {
-        if (provider.id == binding.providerId &&
-            provider.models.any((model) => model.id == binding.modelId)) {
+        if (provider.id == binding?.providerId &&
+            provider.models.any((model) => model.id == binding?.modelId)) {
           boundProvider = provider;
           break;
         }
       }
+      setState(() {
+        _modelLabel = selection.label;
+        _modelProviderTypeId = boundProvider?.providerTypeId ?? '';
+        _modelProviderName = boundProvider?.name ?? '';
+      });
+    } catch (error, stackTrace) {
+      if (!mounted || generation != _modelLabelGeneration) return;
+      setState(() {
+        _modelLabel = '模型配置不可用';
+        _modelProviderTypeId = '';
+        _modelProviderName = '';
+      });
+      _logModelLabelError(error, stackTrace);
     }
-    setState(() {
-      // Keep the original model ID visible; never silently choose a fallback.
-      _modelLabel = _formatModelLabel(binding?.modelId ?? '');
-      _modelProviderTypeId = boundProvider?.providerTypeId ?? '';
-      _modelProviderName = boundProvider?.name ?? '';
-    });
   }
 
+  /// Reloads authoritative selection after the global model changes.
   void _handleModelChanged(
     String modelId, {
     String? providerTypeId,
     String? providerName,
   }) {
-    setState(() {
-      _modelLabel = _formatModelLabel(modelId);
-      if (providerTypeId != null) {
-        _modelProviderTypeId = providerTypeId;
-      }
-      if (providerName != null) {
-        _modelProviderName = providerName;
-      }
-    });
-  }
-
-  String _formatModelLabel(String modelId) {
-    return modelId.length > 26 ? '${modelId.substring(0, 26)}...' : modelId;
+    _requestModelRefresh();
   }
 
   VoidCallback? _runAttachmentAction(VoidCallback? action) {
@@ -615,12 +577,6 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
     _inputMenuPopupEntry = null;
   }
 
-  /// Removes the mention suggestion popup.
-  void _dismissMentionSuggestionPopup() {
-    _mentionPopupEntry?.remove();
-    _mentionPopupEntry = null;
-  }
-
   void _dismissAttachmentPopup() {
     _attachmentPopupEntry?.remove();
     _attachmentPopupEntry = null;
@@ -634,9 +590,11 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
     widget.controller.removeListener(_handleInputChanged);
     _modelBindingSubscription?.cancel();
     _modelProfilesSubscription?.cancel();
+    _modelCatalogSubscription?.cancel();
+    PluginHotReload.revision.removeListener(_requestModelRefresh);
+    _modelLabelGeneration++;
     _dismissModelSettingsPopup();
     _dismissInputMenuPopup();
-    _dismissMentionSuggestionPopup();
     _dismissAttachmentPopup();
     super.dispose();
   }
@@ -683,8 +641,9 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
                   onGuideMessage: widget.onGuidePendingQueueMessage,
                   canGuide: processing,
                 ),
-              KeyedSubtree(
-                key: _mentionPopupTargetKey,
+              ChatMentionSuggestionPopup(
+                panel: widget.mentionSuggestionPanel,
+                dismissBehavior: HitTestBehavior.translucent,
                 child: ThemeComposerCard(
                   inputStyle: ThemePreferenceDefaults.INPUT_STYLE_AGENT,
                   floating: themePreferenceSnapshot.chatInputFloating,
@@ -731,7 +690,7 @@ class _AgentChatInputSectionState extends State<AgentChatInputSection>
                     onToggleInputExpansion: _toggleInputExpansion,
                     attachments: widget.attachments,
                     onRemoveAttachment: widget.onRemoveAttachment,
-                    onInsertAttachment: widget.onInsertAttachment,
+                    onPreviewAttachment: widget.onPreviewAttachment,
                     onAttachFiles: widget.onAttachFiles,
                     onPasteImages: widget.onPasteImages,
                     draggingFiles: _draggingFiles,
@@ -818,7 +777,7 @@ class _InputBody extends StatelessWidget {
     required this.onToggleInputExpansion,
     required this.attachments,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
     required this.onAttachFiles,
     required this.onPasteImages,
     required this.draggingFiles,
@@ -860,7 +819,7 @@ class _InputBody extends StatelessWidget {
   final VoidCallback onToggleInputExpansion;
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
   final ValueChanged<List<String>>? onAttachFiles;
   final ValueChanged<List<PastedImageAttachmentPayload>>? onPasteImages;
   final bool draggingFiles;
@@ -899,7 +858,7 @@ class _InputBody extends StatelessWidget {
           _AttachmentStrip(
             attachments: attachments,
             onRemoveAttachment: onRemoveAttachment,
-            onInsertAttachment: onInsertAttachment,
+            onPreviewAttachment: onPreviewAttachment,
           ),
       ],
       editor: ChatInputEnterShortcuts(
@@ -1437,12 +1396,12 @@ class _AttachmentStrip extends StatelessWidget {
   const _AttachmentStrip({
     required this.attachments,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
   });
 
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
 
   @override
   Widget build(BuildContext context) {
@@ -1463,7 +1422,7 @@ class _AttachmentStrip extends StatelessWidget {
             attachment: attachment,
             colorScheme: colorScheme,
             onRemoveAttachment: onRemoveAttachment,
-            onInsertAttachment: onInsertAttachment,
+            onPreviewAttachment: onPreviewAttachment,
           );
         },
       ),
@@ -1476,13 +1435,13 @@ class _AttachmentChip extends StatelessWidget {
     required this.attachment,
     required this.colorScheme,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
   });
 
   final AttachmentInfo attachment;
   final ColorScheme colorScheme;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
 
   @override
   Widget build(BuildContext context) {
@@ -1502,9 +1461,9 @@ class _AttachmentChip extends StatelessWidget {
                   borderRadius: BorderRadius.circular(12),
                   clipBehavior: Clip.antiAlias,
                   child: InkWell(
-                    onTap: onInsertAttachment == null
+                    onTap: onPreviewAttachment == null
                         ? null
-                        : () => onInsertAttachment!(attachment),
+                        : () => onPreviewAttachment!(attachment),
                     child: ChatAttachmentImagePreview(
                       attachmentPath: attachment.filePath,
                       fileName: attachment.fileName,
@@ -1538,9 +1497,9 @@ class _AttachmentChip extends StatelessWidget {
         ),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: onInsertAttachment == null
+          onTap: onPreviewAttachment == null
               ? null
-              : () => onInsertAttachment!(attachment),
+              : () => onPreviewAttachment!(attachment),
           child: SizedBox(
             height: 26,
             child: Row(

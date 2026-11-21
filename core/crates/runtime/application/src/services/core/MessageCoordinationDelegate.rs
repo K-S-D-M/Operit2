@@ -29,6 +29,7 @@ use operit_model::MessagePartCodec::MessagePartCodec;
 use operit_model::ModelConfigData::ModelSummarySettings;
 use operit_model::PromptFunctionType::PromptFunctionType;
 use operit_providers::chat::EnhancedAIService::{EnhancedAIService, SendMessageOptions};
+use operit_providers::chat::enhance::ConversationService::{SummaryTriggerContext, SummaryTriggerPoint};
 use operit_providers::runtime_support::ChatConfigurationResult;
 use operit_util::AppLogger::AppLogger;
 use operit_util::ChainLogger::{self, SEND_CHAIN};
@@ -55,6 +56,7 @@ struct ConversationSummaryRequest {
     chatModelIdOverride: Option<String>,
     autoContinue: bool,
     requireCurrentChat: bool,
+    trigger: Option<SummaryTriggerContext>,
 }
 
 /// Separates optional history scheduling from the token guard needed during every persisted tool loop.
@@ -348,7 +350,7 @@ impl MessageCoordinationDelegate {
         chatId: String,
         messageTimestamp: i64,
     ) -> Result<(), String> {
-        if self.messageProcessingDelegate.isChatLoading(chatId.clone()) {
+        if self.messageProcessingDelegate.isChatProcessing(&chatId) {
             return Err("Chat is busy".to_string());
         }
         let targetMessage = self
@@ -606,9 +608,8 @@ impl MessageCoordinationDelegate {
             if source.sender != "user" {
                 return Err("Continuation requires a real committed user-message timestamp".to_string());
             }
-            let messages = self.chatHistoryDelegate.chatHistoryManager.loadChatMessages(&chatId)
-                .map_err(|error| error.to_string())?;
-            if messages.iter().any(|message| message.sender == "user" && message.timestamp > source.timestamp) {
+            if self.chatHistoryDelegate.chatHistoryManager.hasUserMessageAfter(&chatId, source.timestamp)
+                .map_err(|error| error.to_string())? {
                 return Err("Continuation source was superseded by another committed user turn".to_string());
             }
         }
@@ -768,38 +769,12 @@ impl MessageCoordinationDelegate {
                 return Err(error.to_string());
             }
         };
-        self.tokenStatisticsDelegate
-            .updateCumulativeStatistics(Some(chatId.clone()), Some(enhancedAiService));
-        let (inputTokens, outputTokens) = self
-            .tokenStatisticsDelegate
-            .getCumulativeTokenCounts(Some(chatId.clone()));
-        let windowSize = result.nextWindowSize.unwrap_or_else(|| {
-            self.tokenStatisticsDelegate
-                .getLastCurrentWindowSize(Some(chatId.clone()))
-        });
-        self.tokenStatisticsDelegate.setTokenCounts(
-            Some(chatId.clone()),
-            inputTokens,
-            outputTokens,
-            windowSize,
-        );
-        if turnOptions.persistTurn {
-            self.chatHistoryDelegate.saveCurrentChat(
-                inputTokens,
-                outputTokens,
-                windowSize,
-                Some(chatId.clone()),
-            );
-        }
+        // Usage is committed with the terminal assistant segment. Dispatch returns before
+        // streaming settles and must not overwrite persisted totals from a previous turn.
         ChainLogger::verbose_with_level(
             SEND_CHAIN,
             "send.dispatch.accepted",
-            &[
-                ("chatId", chatId.clone()),
-                ("inputTokens", inputTokens.to_string()),
-                ("outputTokens", outputTokens.to_string()),
-                ("windowSize", windowSize.to_string()),
-            ],
+            &[("chatId", chatId.clone())],
             operit_util::AppLogger::VERBOSE_LEVEL_2,
         );
         Ok(result.completion)
@@ -846,13 +821,10 @@ impl MessageCoordinationDelegate {
                 .ok_or_else(|| format!("Chat does not exist: {chatId}"))?;
             if !messages.is_empty()
                 && AIMessageManager::shouldGenerateSummary(
-                    messages.clone(),
                     chat.currentWindowSize,
                     maxTokens,
                     policy.tokenUsageThreshold,
                     true,
-                    settings.summary.enableSummaryByMessageCount,
-                    settings.summary.summaryMessageCountThreshold,
                 )
             {
                 let _summaryCompletion = self.launchSummary(
@@ -867,6 +839,12 @@ impl MessageCoordinationDelegate {
                         chatModelIdOverride: Some(modelId),
                         autoContinue: false,
                         requireCurrentChat: true,
+                        trigger: Some(SummaryTriggerContext {
+                            current_tokens: chat.currentWindowSize,
+                            max_tokens: maxTokens,
+                            token_usage_threshold: policy.tokenUsageThreshold,
+                            trigger_point: SummaryTriggerPoint::BeforeSend,
+                        }),
                     },
                 )?;
             }
@@ -894,19 +872,33 @@ impl MessageCoordinationDelegate {
                 &participant.modelBinding.providerId, &participant.modelBinding.modelId,
             ).map_err(|error| error.to_string())?;
             if AIMessageManager::shouldGenerateSummary(
-                messages.clone(), window, settings.context.maxContextTokens(),
+                window, settings.context.maxContextTokens(),
                 settings.summary.tokenThresholdRatio(), settings.summary.enableSummary,
-                settings.summary.enableSummaryByMessageCount, settings.summary.summaryMessageCountThreshold,
             ) {
                 return self.launchSummary(service, messages, ConversationSummaryRequest {
                     chatId, participantId: Some(configuration.profile.id.clone()),
                     configuration: configuration.clone(), promptFunctionType: PromptFunctionType::CHAT,
                     chatProviderIdOverride: None, chatModelIdOverride: None,
                     autoContinue: false, requireCurrentChat: false,
+                    trigger: Some(SummaryTriggerContext {
+                        current_tokens: window,
+                        max_tokens: settings.context.maxContextTokens(),
+                        token_usage_threshold: settings.summary.tokenThresholdRatio(),
+                        trigger_point: SummaryTriggerPoint::AfterReply,
+                    }),
                 })?.await;
             }
         }
         Ok(())
+    }
+
+    /// Reports a summary failure directly to the consumable UI toast flow.
+    fn reportSummaryFailure(processing: &mut MessageProcessingDelegate, error: &str) {
+        AppLogger::e(
+            "MessageCoordinationDelegate",
+            &format!("Conversation summary failed: {error}"),
+        );
+        processing.showToast(format!("上下文压缩失败：{error}"));
     }
 
     /// Schedules one cancellable summary through the host and shares its actual completion.
@@ -967,22 +959,29 @@ impl MessageCoordinationDelegate {
                                 InputProcessingState::Summarizing { message: stage.to_string() });
                         }
                     });
+                    let errorDelegate = std::sync::Mutex::new(worker.messageProcessingDelegate.clone_for_core());
+                    let errorChatId = workerChatId.clone();
+                    let errorTaskId = workerTaskId.clone();
+                    let onNonFatalError = Arc::new(move |error: String| {
+                        let delegate = errorDelegate.lock().expect("summary error mutex poisoned");
+                        let ownsTask = delegate.summaryTaskForChat(&errorChatId)
+                            .is_some_and(|task| Arc::ptr_eq(&task.taskId, &errorTaskId));
+                        if ownsTask {
+                            delegate.toastEventFlow.set_value(Some(format!("上下文压缩：{error}")));
+                        }
+                    });
                     let outcome = Abortable::new(
-                        worker.generateAndStoreSummary(&mut service, messages, request, Some(progress)),
+                        worker.generateAndStoreSummary(&mut service, messages, request, Some(progress), onNonFatalError),
                         registration,
                     )
                     .await;
                     let result = match outcome {
                         Ok(result) => {
                             if let Err(error) = &result {
-                                AppLogger::e(
-                                    "MessageCoordinationDelegate",
-                                    &format!("Conversation summary failed: {error}"),
+                                Self::reportSummaryFailure(
+                                    &mut worker.messageProcessingDelegate,
+                                    error,
                                 );
-                                worker
-                                    .messageProcessingDelegate
-                                    .nonFatalErrorEventFlow
-                                    .set_value(Some(error.clone()));
                             }
                             result
                         }
@@ -1019,7 +1018,9 @@ impl MessageCoordinationDelegate {
         );
         if let Err(error) = scheduled {
             cleanup.finishSummaryTask(&chatId, &taskId);
-            return Err(error.to_string());
+            let error = error.to_string();
+            Self::reportSummaryFailure(&mut cleanup, &error);
+            return Err(error);
         }
         Ok(completion)
     }
@@ -1031,6 +1032,7 @@ impl MessageCoordinationDelegate {
         messages: Vec<ChatMessage>,
         request: ConversationSummaryRequest,
         progress: Option<operit_providers::chat::enhance::ConversationService::SummaryProgressCallback>,
+        onNonFatalError: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<(), String> {
         let insertPosition = self
             .chatHistoryDelegate
@@ -1044,7 +1046,7 @@ impl MessageCoordinationDelegate {
             .map(|message| message.timestamp);
         let summary =
             AIMessageManager::summarizeMemory(
-                enhancedAiService, messages, request.autoContinue, request.chatId.clone(), &request.configuration, progress,
+                enhancedAiService, messages, request.autoContinue, request.chatId.clone(), &request.configuration, progress, request.trigger, onNonFatalError,
             )
                 .await
                 .map_err(|error| error.to_string())?
@@ -1096,7 +1098,7 @@ impl MessageCoordinationDelegate {
         }).await {
             Ok(configuration) => configuration,
             Err(error) => {
-                self.messageProcessingDelegate.nonFatalErrorEventFlow.set_value(Some(error.to_string()));
+                Self::reportSummaryFailure(&mut self.messageProcessingDelegate, &error.to_string());
                 return false;
             }
         };
@@ -1115,20 +1117,13 @@ impl MessageCoordinationDelegate {
                 chatModelIdOverride: self.currentChatModelIdOverride.clone(),
                 autoContinue: false,
                 requireCurrentChat: false,
+                trigger: None,
             },
         ) {
             Ok(completion) => completion.await,
             Err(error) => Err(error),
         };
-        match result {
-            Ok(()) => true,
-            Err(error) => {
-                self.messageProcessingDelegate
-                    .nonFatalErrorEventFlow
-                    .set_value(Some(error));
-                false
-            }
-        }
+        result.is_ok()
     }
 
     /// Starts a user-requested summary and waits for its host-owned task to finish.
@@ -1184,6 +1179,7 @@ impl MessageCoordinationDelegate {
                 chatModelIdOverride: request.chatModelIdOverride.clone(),
                 autoContinue: true,
                 requireCurrentChat: false,
+                trigger: None,
             },
         )?
         .await?;
@@ -1238,9 +1234,6 @@ impl MessageCoordinationDelegate {
     ) {
         self.cancelSummaryForChat(enhancedAiService, chatId);
     }
-
-    /// Installs UI bridge callbacks used by platform integrations.
-    pub fn setUiBridge(&mut self) {}
 }
 
 #[cfg(test)]
@@ -1266,13 +1259,10 @@ mod summary_send_policy_tests {
                 let policy = SummarySendPolicy::new(&settings, &options, false, background);
                 assert!(!policy.checkBeforeSend);
                 assert!(AIMessageManager::shouldGenerateSummary(
-                    Vec::new(),
                     i64::from(maxTokens) * 98 / 100,
                     maxTokens,
                     policy.tokenUsageThreshold,
                     true,
-                    false,
-                    16,
                 ));
             }
         }
@@ -1313,13 +1303,10 @@ mod summary_send_policy_tests {
             let policy = SummarySendPolicy::new(&settings, &options, true, false);
             assert!(!policy.checkBeforeSend);
             assert!(!AIMessageManager::shouldGenerateSummary(
-                Vec::new(),
                 196_000,
                 200_000,
                 policy.tokenUsageThreshold,
                 true,
-                false,
-                16,
             ));
         }
     }

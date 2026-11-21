@@ -467,10 +467,9 @@ packages:
   fvp:
     dependency: "direct main"
     description:
-      name: fvp
-      sha256: "1ee9df424ace41988c2e10ed01f35b170d9ef00c62330acd1b97f007ca56ec99"
-      url: "https://pub.dev"
-    source: hosted
+      path: "../thirdparty/fvp"
+      relative: true
+    source: path
     version: "0.40.0"
   geoclue:
     dependency: transitive
@@ -789,6 +788,13 @@ packages:
       relative: true
     source: path
     version: "0.1.0"
+  operit_system_fonts:
+    dependency: "direct main"
+    description:
+      path: "../thirdparty/operit_system_fonts"
+      relative: true
+    source: path
+    version: "0.1.0"
   operit_ui:
     dependency: "direct main"
     description:
@@ -1076,6 +1082,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.7"
+  share_plus:
+    dependency: "direct main"
+    description:
+      name: share_plus
+      sha256: db40767f130189d53f3ae8a6393c217ff4a492da1baff718a9873679c0c00224
+      url: "https://pub.dev"
+    source: hosted
+    version: "13.3.1"
+  share_plus_platform_interface:
+    dependency: "direct dev"
+    description:
+      name: share_plus_platform_interface
+      sha256: "365ef7379fc22507256adda3385152942ffce08935452bc972c2e52a0bebae41"
+      url: "https://pub.dev"
+    source: hosted
+    version: "7.2.0"
   sky_engine:
     dependency: transitive
     description: flutter
@@ -1315,7 +1337,7 @@ packages:
     source: hosted
     version: "2.12.1"
   video_player_platform_interface:
-    dependency: transitive
+    dependency: "direct dev"
     description:
       name: video_player_platform_interface
       sha256: "92c0fbabe20c788e71fd10d26cea998d0d253282e65d145aed0818731cf593ce"

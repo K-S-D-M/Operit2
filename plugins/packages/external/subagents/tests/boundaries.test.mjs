@@ -130,7 +130,7 @@ test("main evaluation registers IPC and the composer slot without opening a busi
   const handlers = [];
   const slots = [], routes = [], entries = [];
   const runtime = modules({
-    ToolPkg: { ipc: { on(channel, handler) { handlers.push({ channel, handler }); } }, registerChatComposerSlot(slot) { slots.push(slot); }, registerUiRoute(route) { routes.push(route); }, registerNavigationEntry(entry) { entries.push(entry); } },
+    ToolPkg: { ipc: { on(channel, handler) { handlers.push({ channel, handler }); } }, registerChatComposerSlot(slot) { slots.push(slot); }, registerUiRoute(route) { routes.push(route); }, registerNavigationEntry(entry) { entries.push(entry); }, registerApi() {} },
     Tools: new Proxy({}, { get() { throw new Error("registration must not call host tools"); } }),
   });
   const main = runtime.load("./main");
@@ -159,6 +159,8 @@ test("service validates discriminated operations and authored parameter types", 
     assert.throws(() => decodeRequest(value));
   }
   assert.equal(decodeRequest({ action: "list", parentChatId: "parent" }).parentChatId, "parent");
+  assert.equal(decodeRequest({action:"close_if_completed", parentChatId:"parent", agentId:"child"}).action,"close_if_completed");
+  assert.throws(() => decodeRequest({action:"close_if_completed", parentChatId:"parent", agentId:""}));
 });
 
 /** Proves that corrupt native or persisted outcomes cannot become apparently successful agent state. */
@@ -274,7 +276,7 @@ test("workspace embeds the native child chat and disposes observers without canc
   assert.equal(execution.props.showInput, false);
   ui.state.set("subagents.message", "Follow up");
   tree = ui.render();
-  assert.equal(ui.find(tree, "subagents.send").props.enabled, false);
+  assert.equal(ui.find(tree, "subagents.send"), null);
   assert.equal(ui.find(tree, "subagents.interrupt").props.enabled, true);
   assert.equal(ui.find(tree, "subagents.wait").props.enabled, true);
   await ui.find(tree, "subagents.interrupt").props.onClick();
@@ -284,14 +286,14 @@ test("workspace embeds the native child chat and disposes observers without canc
   ui.state.set("subagents.message", "Next turn"); tree = ui.render();
   assert.equal(ui.find(tree, "subagents.execution").props.chatId, child.chatId);
   assert.equal(ui.find(tree, "subagents.send").props.enabled, true);
-  assert.equal(ui.find(tree, "subagents.interrupt").props.enabled, false);
+  assert.equal(ui.find(tree, "subagents.interrupt"), null);
   await ui.find(tree, "subagents.send").props.onClick();
   assert.deepEqual(requests.at(-1), { action: "send", parentChatId: "parent", agentId: child.id, message: "Next turn", interrupt: false });
   const closed = { ...completed, status: "closed" };
   await repository.save(closed); await flush();
   ui.state.set("subagents.message", "Cannot send"); tree = ui.render();
   assert.equal(ui.find(tree, "subagents.send").props.enabled, false);
-  assert.equal(ui.find(tree, "subagents.interrupt").props.enabled, false);
+  assert.equal(ui.find(tree, "subagents.interrupt"), null);
   const writesBeforeDispose = storage.commits.length;
   ui.dispose(); await flush();
   assert.equal(h.chat.cancellations.length, 0);

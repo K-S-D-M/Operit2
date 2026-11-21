@@ -81,6 +81,8 @@ pub struct SdkPackageToolParameter {
 pub struct SdkToolPackage {
     #[serde(rename = "name")]
     pub name: String,
+    #[serde(rename = "api_version")]
+    pub api_version: String,
     #[serde(rename = "description")]
     pub description: SdkLocalizedText,
     #[serde(rename = "tools")]
@@ -336,6 +338,8 @@ pub struct SdkToolPkgContainerRuntime {
     pub publicApis: Vec<SdkToolPkgRegisteredFunctionHook>,
     #[serde(rename = "requires")]
     pub requires: Vec<SdkToolPkgManifestRequirement>,
+    #[serde(rename = "optional_requires")]
+    pub optionalRequires: Vec<SdkToolPkgManifestRequirement>,
     #[serde(rename = "dependencyIssues")]
     pub dependencyIssues: Vec<SdkToolPkgDependencyIssue>,
     #[serde(rename = "manifestExtensions")]
@@ -386,6 +390,10 @@ pub struct SdkToolPkgContainerRuntime {
     pub chatViewHooks: Vec<SdkToolPkgFunctionHookRuntime>,
     #[serde(rename = "chatMessageHooks")]
     pub chatMessageHooks: Vec<SdkToolPkgFunctionHookRuntime>,
+    #[serde(rename = "messageTransformHooks")]
+    pub messageTransformHooks: Vec<SdkToolPkgFunctionHookRuntime>,
+    #[serde(rename = "messageStreamTransforms")]
+    pub messageStreamTransforms: Vec<SdkToolPkgFunctionHookRuntime>,
     #[serde(rename = "chatLifecycleHooks")]
     pub chatLifecycleHooks: Vec<SdkToolPkgFunctionHookRuntime>,
     #[serde(rename = "chatMessageMenuItems")]

@@ -110,9 +110,18 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
         .pluginLoadingProgressFlow()
         .listen((progress) {
           if (!_isCurrentSubscription(generation)) return;
+          if (_packages?.phase != progress.phase ||
+              _packages?.visible != progress.visible) {
+            ClientLogger.v(
+              'event=plugin_loading_snapshot visible=${progress.visible} '
+              'phase=${progress.phase} started=${progress.pluginsStarted} '
+              'total=${progress.pluginsTotal}',
+              tag: 'RuntimeActivity',
+              verboseLevel: VerboseLevel.level4,
+            );
+          }
           setState(() {
             _packages = progress;
-            if (_loadingPackages && progress.forceExpanded) _expanded = true;
             if (!_loadingPackages && _visibleSync.isEmpty) _expanded = false;
           });
         }, onError: _reportSubscriptionError);
@@ -120,10 +129,6 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
     _syncSubscription = service.spaceSyncProgressFlow().listen((progress) {
       if (!_isCurrentSubscription(generation)) return;
       setState(() {
-        if (progress.any((item) => item.error != null) &&
-            !_sync.any((item) => item.error != null)) {
-          _expanded = true;
-        }
         _sync = progress;
         _scheduleCompletion();
       });
@@ -210,14 +215,11 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
           : waiting
           ? l10n.runtimeActivityWaiting
           : l10n.runtimeActivitySyncing,
-      compactDetail: item.totalRecords == null && file && !completed
-          ? '${_bytes(item.fileBytes)} / ${_bytes(item.fileSize)}'
-          : _recordProgress(
-              item.completedRecords,
-              item.totalRecords,
-              item.pendingRecords,
-              l10n,
-            ),
+      compactDetail: file && !completed
+          ? '${_bytes(item.fileBytes)}/${_bytes(item.fileSize)}'
+          : item.totalRecords != null
+          ? '${item.completedRecords}/${item.totalRecords}'
+          : null,
       detail: _recordProgress(
         item.completedRecords,
         item.totalRecords,
@@ -226,10 +228,12 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
       ),
       value: completed
           ? 1
-          : item.totalRecords != null && item.totalRecords! > 0
-          ? (item.completedRecords / item.totalRecords!).clamp(0.0, 1.0)
           : file && !waiting
           ? (item.fileBytes / item.fileSize).clamp(0.0, 1.0)
+          : item.stage == core.SpaceSyncStage.checking
+          ? null
+          : item.totalRecords != null && item.totalRecords! > 0
+          ? (item.completedRecords / item.totalRecords!).clamp(0.0, 1.0)
           : null,
       paused: waiting || completed,
     );
@@ -283,6 +287,7 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
           ? l10n.runtimeActivityWaiting
           : l10n.runtimeActivitySyncing,
       detail: _recordProgress(processed, total, pending, l10n),
+      compactDetail: total == null ? null : '$processed/$total',
       value: completed
           ? 1
           : total != null && total > 0
@@ -318,6 +323,7 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
         : _Activity(
             icon: Icons.inventory_2_outlined,
             title: l10n.runtimeActivityLoadingPackages,
+            compactDetail: '${packages.pluginsStarted}/${packages.pluginsTotal}',
             detail:
                 '${packages.pluginsStarted}/${packages.pluginsTotal} · ${packages.currentTask.isEmpty ? l10n.pluginLoadingWaiting : packages.currentTask}',
             value: packages.progress.clamp(0.0, 1.0),
@@ -331,12 +337,12 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
         child: LayoutBuilder(
           builder: (context, constraints) {
             final width = math.min(
-              _expanded ? 360.0 : 232.0,
+              _expanded ? 360.0 : 156.0,
               math.max(0.0, constraints.maxWidth - 24),
             );
             final height = _expanded
                 ? math.min(440.0, constraints.maxHeight)
-                : 64.0;
+                : 36.0;
             final maxRight = math.max(0.0, constraints.maxWidth - width);
             final maxTop = math.max(0.0, constraints.maxHeight - height);
             void drag(DragUpdateDetails details) => setState(() {
@@ -351,8 +357,8 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
                   right: _dockTopRight.dx.clamp(0.0, maxRight),
                   top: _dockTopRight.dy.clamp(0.0, maxTop),
                   child: _ActivitySurface(
-                    child: SizedBox(
-                      width: width,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(maxWidth: width),
                       child: _expanded
                           ? ConstrainedBox(
                               constraints: BoxConstraints(maxHeight: height),
@@ -410,6 +416,7 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
                                                 item,
                                                 l10n,
                                               ),
+                                              identity: '${item.peerNodeId}:${item.startedAt}:${item.stage}',
                                               title:
                                                   '${_peerName(item, l10n)} · ${_syncActivity(item, l10n).title}',
                                             ),
@@ -433,7 +440,8 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
                                                       ).colorScheme.error,
                                                     ),
                                               ),
-                                            if (item.fileSize > 0)
+                                            if (item.fileSize > 0 &&
+                                                item.status != core.SpaceSyncStatus.completed)
                                               Text(
                                                 l10n.deviceSpaceSyncCurrentFile(
                                                   _bytes(item.fileBytes),
@@ -470,117 +478,90 @@ class _RuntimeActivityOverlayState extends State<RuntimeActivityOverlay> {
                                 ],
                               ),
                             )
-                          : Tooltip(
-                              message: l10n.runtimeActivityExpand,
-                              child: GestureDetector(
-                                onPanUpdate: drag,
-                                onTap: () => setState(() => _expanded = true),
-                                child: Semantics(
-                                  button: true,
-                                  label: l10n.runtimeActivityExpand,
-                                  child: SizedBox(
-                                    height: 64,
-                                    child: Column(
-                                      children: [
-                                        Expanded(
-                                          child: Padding(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 12,
-                                            ),
-                                            child: Row(
-                                              children: [
-                                                Container(
-                                                  width: 32,
-                                                  height: 32,
-                                                  decoration: BoxDecoration(
-                                                    color: Theme.of(context)
-                                                        .colorScheme
-                                                        .primary
-                                                        .withValues(
-                                                          alpha: 0.10,
-                                                        ),
-                                                    borderRadius:
-                                                        BorderRadius.circular(
-                                                          10,
-                                                        ),
-                                                  ),
-                                                  child: Icon(
+                          : IntrinsicWidth(
+                              child: Tooltip(
+                                message: l10n.runtimeActivityExpand,
+                                child: GestureDetector(
+                                  onPanUpdate: drag,
+                                  onTap: () => setState(() => _expanded = true),
+                                  child: Semantics(
+                                    button: true,
+                                    label: l10n.runtimeActivityExpand,
+                                    child: SizedBox(
+                                      height: height,
+                                      child: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                                        children: [
+                                          Expanded(
+                                            child: Padding(
+                                              padding: const EdgeInsets.symmetric(
+                                                horizontal: 8,
+                                              ),
+                                              child: Row(
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Icon(
                                                     primary.icon,
-                                                    size: 19,
-                                                    color: Theme.of(
-                                                      context,
-                                                    ).colorScheme.primary,
+                                                    size: 14,
+                                                    color: Theme.of(context)
+                                                        .colorScheme.primary,
                                                   ),
-                                                ),
-                                                const SizedBox(width: 10),
-                                                Expanded(
-                                                  child: Column(
-                                                    mainAxisAlignment:
-                                                        MainAxisAlignment
-                                                            .center,
-                                                    crossAxisAlignment:
-                                                        CrossAxisAlignment
-                                                            .start,
-                                                    children: [
-                                                      Text(
-                                                        primary.title,
+                                                  const SizedBox(width: 4),
+                                                  Flexible(
+                                                    child: Text(
+                                                      primary.title,
+                                                      maxLines: 1,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                      style: Theme.of(context)
+                                                          .textTheme.labelMedium,
+                                                    ),
+                                                  ),
+                                                  if (primary.compactDetail != null)
+                                                    Flexible(
+                                                      child: Text(
+                                                        ' ${primary.compactDetail!}',
                                                         maxLines: 1,
-                                                        overflow: TextOverflow
-                                                            .ellipsis,
+                                                        overflow:
+                                                            TextOverflow.ellipsis,
                                                         style: Theme.of(context)
-                                                            .textTheme
-                                                            .labelLarge
-                                                            ?.copyWith(
-                                                              fontWeight:
-                                                                  FontWeight
-                                                                      .w600,
-                                                            ),
-                                                      ),
-                                                      const SizedBox(height: 2),
-                                                      Text(
-                                                        primary.compactDetail ??
-                                                            primary.detail,
-                                                        maxLines: 1,
-                                                        overflow: TextOverflow
-                                                            .ellipsis,
-                                                        style: Theme.of(context)
-                                                            .textTheme
-                                                            .labelSmall
+                                                            .textTheme.labelSmall
                                                             ?.copyWith(
                                                               color: Theme.of(context)
-                                                                  .colorScheme
-                                                                  .onSurfaceVariant,
+                                                                  .colorScheme.onSurfaceVariant,
                                                             ),
                                                       ),
-                                                    ],
+                                                    ),
+                                                  if (count > 1)
+                                                    Text(
+                                                      ' +${count - 1}',
+                                                      style: Theme.of(
+                                                        context,
+                                                      ).textTheme.labelSmall,
+                                                    ),
+                                                  const SizedBox(width: 4),
+                                                  Icon(
+                                                    Icons
+                                                        .keyboard_arrow_down_rounded,
+                                                    size: 14,
+                                                    color: Theme.of(context)
+                                                        .colorScheme
+                                                        .onSurfaceVariant,
                                                   ),
-                                                ),
-                                                if (count > 1)
-                                                  Text(
-                                                    '+${count - 1}',
-                                                    style: Theme.of(
-                                                      context,
-                                                    ).textTheme.labelSmall,
-                                                  ),
-                                                const SizedBox(width: 4),
-                                                Icon(
-                                                  Icons
-                                                      .keyboard_arrow_down_rounded,
-                                                  size: 18,
-                                                  color: Theme.of(context)
-                                                      .colorScheme
-                                                      .onSurfaceVariant,
-                                                ),
-                                              ],
+                                                ],
+                                              ),
                                             ),
                                           ),
-                                        ),
-                                        if (!primary.paused)
-                                          LinearProgressIndicator(
-                                            value: primary.value,
-                                            minHeight: 2.5,
-                                          ),
-                                      ],
+                                          if (!primary.paused)
+                                            _SmoothProgress(
+                                              value: primary.value,
+                                              minHeight: 2,
+                                              identity: sync.length == 1
+                                                  ? '${sync.single.peerNodeId}:${sync.single.startedAt}:${sync.single.stage}'
+                                                  : 'summary',
+                                            ),
+                                        ],
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -620,11 +601,11 @@ class _ActivitySurface extends StatelessWidget {
   final Widget child;
   @override
   Widget build(BuildContext context) => Material(
-    elevation: 6,
+    elevation: 3,
     shadowColor: Theme.of(context).colorScheme.shadow.withValues(alpha: 0.18),
     color: Theme.of(context).colorScheme.surfaceContainerHigh,
     shape: RoundedRectangleBorder(
-      borderRadius: BorderRadius.circular(18),
+      borderRadius: BorderRadius.circular(12),
       side: BorderSide(
         color: Theme.of(
           context,
@@ -637,7 +618,8 @@ class _ActivitySurface extends StatelessWidget {
 }
 
 class _ActivityProgress extends StatelessWidget {
-  const _ActivityProgress({required this.activity, this.title, this.trailing});
+  const _ActivityProgress({required this.activity, this.title, this.trailing, this.identity});
+  final String? identity;
   final _Activity activity;
   final String? title;
   final Widget? trailing;
@@ -662,11 +644,36 @@ class _ActivityProgress extends StatelessWidget {
         Text(activity.detail, style: Theme.of(context).textTheme.bodySmall),
         if (!activity.paused) ...[
           const SizedBox(height: 8),
-          LinearProgressIndicator(value: activity.value, minHeight: 3),
+          _SmoothProgress(value: activity.value, minHeight: 3, identity: identity),
         ],
       ],
     ),
   );
+}
+
+/// Animate only confirmed progress; a new phase starts from its own real value.
+class _SmoothProgress extends StatelessWidget {
+  const _SmoothProgress({required this.value, required this.minHeight, this.identity});
+  final double? value;
+  final double minHeight;
+  final String? identity;
+
+  @override
+  Widget build(BuildContext context) {
+    if (value == null) return LinearProgressIndicator(minHeight: minHeight);
+    return TweenAnimationBuilder<double>(
+      key: ValueKey(identity),
+      tween: Tween(begin: value, end: value),
+      duration: MediaQuery.disableAnimationsOf(context)
+          ? Duration.zero
+          : const Duration(milliseconds: 300),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) => LinearProgressIndicator(
+        value: value,
+        minHeight: minHeight,
+      ),
+    );
+  }
 }
 
 String _bytes(int bytes) {

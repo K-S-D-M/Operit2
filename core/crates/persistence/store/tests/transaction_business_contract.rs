@@ -809,6 +809,27 @@ fn apply_failure_disposition_is_explicit_and_independent_of_diagnostics() {
         assert_eq!(target.journal().pendingOperations().unwrap(), operations);
         assert!(target.journal().skippedOperations().unwrap().is_empty());
     }
+    let (manifests,pending,errors) = registry.manifests().unwrap();
+    assert!(errors.is_empty());
+    assert!(pending.contains(CURRENT));
+    assert!(manifests.iter().any(|m|m.owner.path==CURRENT), "pending replay must not hide materialized contents from correction");
+    let before = target.store().syncSnapshot().unwrap();
+    let mut corrected = registry.snapshot(&before.data.owner).unwrap();
+    assert!(registry.repair(&before.data.owner, &before.token().unwrap(), &corrected).is_err(), "pending originals require explicit coverage");
+    corrected.covered.extend(operations.iter().map(|op|op.opId.clone()));
+    assert!(registry.repair(&before.data.owner, &before.token().unwrap(), &corrected).unwrap());
+    assert!(target.journal().pendingOperations().unwrap().is_empty());
+    assert!(registry.receive(&operations).unwrap().pending.is_empty(), "covered originals must never re-enter pending");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn capability_failure_retires_originals_until_correction() {
+    let target = Fixture::new();
+    let declarations = schema();
+    let operations = authored(CURRENT, 2, 10, |state|state.set(&stringPreferencesKey("x"), 1));
+    let mut registry = PreferenceMerge::registry(target.host.clone(), &declarations, &[], |_,_|true).unwrap();
+    registry.journal.receiveOperations(&operations).unwrap();
     registry.owners.get_mut(CURRENT).unwrap().apply = Box::new(|_,_| Err(Transaction::kernel::ApplyError::Capability("database is locked; invalid format".into())));
     assert_eq!(registry.apply_pending().unwrap().skipped, operations.len());
     assert!(target.journal().pendingOperations().unwrap().is_empty());
@@ -1489,4 +1510,65 @@ fn unfinished_legacy_import_conflict_is_sealed_without_relaxing_identity_checks(
     assert_eq!(history.len(), 1);
     assert!(Transaction::compaction::Initialization::decode(&history[0]).unwrap().is_some());
     assert!(target.journal().appendOperations(&[conflicting]).is_err());
+}
+
+/// Local commits use the same hierarchical whole-transaction proof as remote
+/// replay, and compacted originals remain acknowledged on repeated delivery.
+#[test]
+fn local_nested_updates_and_increments_retire_only_after_all_atomic_effects_are_covered() {
+    let source = Fixture::with_store(plain_store);
+    source.apply(&[]);
+    source
+        .store()
+        .edit(|p| {
+            p.set(
+                &stringPreferencesKey("settings"),
+                json!({"theme":0,"keep":"initial"}),
+            );
+            p.set(&stringPreferencesKey("counter"), 0);
+        })
+        .unwrap();
+    for n in 1..=24 {
+        source
+            .store()
+            .try_edit_result(|p| {
+                p.setObjectField(&stringPreferencesKey("settings"), "theme", json!(n))?;
+                p.incrementInteger(&stringPreferencesKey("counter"), 1)
+            })
+            .unwrap();
+    }
+    let originals = source.journal().preferenceHistory().unwrap();
+    assert_eq!(
+        originals.len(),
+        25,
+        "every increment is still a live atomic effect"
+    );
+    source
+        .store()
+        .edit(|p| {
+            p.set(&stringPreferencesKey("settings"), json!({"theme":"final"}));
+            p.set(&stringPreferencesKey("counter"), 100);
+        })
+        .unwrap();
+    let compacted = source.journal().preferenceHistory().unwrap();
+    assert_eq!(
+        compacted.len(),
+        1,
+        "the final parent assignments cover every previous effect"
+    );
+    let empty = Fixture::with_store(plain_store);
+    empty.apply(&compacted);
+    assert_eq!(empty.value("settings"), Some(json!({"theme":"final"})));
+    assert_eq!(empty.value("counter"), Some(json!(100)));
+    source.apply(&originals);
+    empty.apply(&originals);
+    assert_eq!(
+        source.store().syncSnapshot().unwrap().data,
+        empty.store().syncSnapshot().unwrap().data
+    );
+    assert_eq!(source.journal().preferenceHistory().unwrap(), compacted);
+    let receipt = source.journal().receipt().unwrap();
+    for original in originals {
+        assert!(receipt.containsSequence(&original.originDeviceId, original.sequence));
+    }
 }

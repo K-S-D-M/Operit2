@@ -46,6 +46,9 @@ abstract class StageOperitAndroidAssets : DefaultTask() {
     @get:Input
     abstract val externalRuntime: Property<Boolean>
 
+    @get:Input
+    abstract val applicationId: Property<String>
+
     @get:OutputDirectory
     abstract val outputDirectory: DirectoryProperty
 
@@ -68,7 +71,7 @@ abstract class StageOperitAndroidAssets : DefaultTask() {
         }
         if (externalRuntime.get()) {
             outputDirectory.file("operit-android-module.json").get().asFile
-                .writeText("{\"runtime\":\"external\",\"protocol\":1,\"app\":\"android-module\",\"bootstrap\":\"app_process\"}\n")
+                .writeText("{\"runtime\":\"external\",\"protocol\":1,\"app\":\"android-module\",\"bootstrap\":\"app_process\",\"applicationId\":\"${applicationId.get()}\"}\n")
         }
     }
 }
@@ -79,14 +82,24 @@ abstract class StageOperitAndroidJniLibraries : Sync() {
     abstract val outputDirectory: DirectoryProperty
 }
 
+/** Embeds Android APK payloads produced by the matching build variant. */
+abstract class StageOperitAndroidPayload : Sync() {
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val apkDirectory: DirectoryProperty
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+}
+
 val localProperties = Properties()
 val localPropertiesFile = rootProject.file("local.properties")
 localProperties.load(FileInputStream(localPropertiesFile))
-
-// Reads a required signing property from local.properties.
-fun requiredLocalProperty(name: String): String =
-    localProperties.getProperty(name)
-        ?: throw GradleException("Missing Android release signing property: $name")
+val accessibilityProviderVersion = Properties().apply {
+    layout.projectDirectory.file("../../../../../tools/android-accessibility/version.properties")
+        .asFile.inputStream().use { load(it) }
+}
 
 data class OperitRustTarget(
     val flutterPlatform: String,
@@ -136,17 +149,20 @@ android {
     namespace = "app.operit"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
-    buildFeatures { buildConfig = true }
+    buildFeatures { buildConfig = true; aidl = true }
+    sourceSets.getByName("main").aidl.srcDir("../../../../../tools/android-accessibility/contract/src/main/aidl")
+    sourceSets.getByName("main").aidl.srcDir("../../../../../tools/android-ui-server/contract/src/main/aidl")
 
     signingConfigs {
         create("release") {
-            storeFile = file(requiredLocalProperty("RELEASE_STORE_FILE"))
-            storePassword = requiredLocalProperty("RELEASE_STORE_PASSWORD")
-            keyAlias = requiredLocalProperty("RELEASE_KEY_ALIAS")
-            keyPassword = requiredLocalProperty("RELEASE_KEY_PASSWORD")
-            // MIUI/HyperOS 安装器的安全扫描按 v1 (JAR) 方式校验签名，v2/v3-only 包会被判为
-            // 签名异常并报“解析失败 (33) packageInfo is null”。AGP 在 minSdk>=24 时默认关闭
-            // v1，这里显式全开 v1+v2+v3 以兼容小米等 OEM 安装器。
+            // Debug builds do not require release credentials during project configuration.
+            storeFile = localProperties.getProperty("RELEASE_STORE_FILE")?.let { file(it) }
+            storePassword = localProperties.getProperty("RELEASE_STORE_PASSWORD")
+            keyAlias = localProperties.getProperty("RELEASE_KEY_ALIAS")
+            keyPassword = localProperties.getProperty("RELEASE_KEY_PASSWORD")
+            // MIUI/HyperOS 安装器按 v1 (JAR) 方式校验签名，v2/v3-only 包会被判为签名异常
+            // 并报“解析失败 (33) packageInfo is null”。AGP 在 minSdk>=24 时默认关闭 v1，
+            // 这里显式全开 v1+v2+v3 以兼容小米等 OEM 安装器。
             enableV1Signing = true
             enableV2Signing = true
             enableV3Signing = true
@@ -163,9 +179,11 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "app.operit"
+        applicationId = if (operitExternalRuntime) "app.operit.module" else "app.operit"
+        manifestPlaceholders["operitAppLabel"] = if (operitExternalRuntime) "Operit2 (Module)" else "Operit2"
+        manifestPlaceholders["operitShortcuts"] = if (operitExternalRuntime) "@xml/module_shortcuts" else "@xml/shortcuts"
         buildConfigField("boolean", "OPERIT_EXTERNAL_RUNTIME", operitExternalRuntime.toString())
+        buildConfigField("int", "OPERIT_ACCESSIBILITY_VERSION_CODE", accessibilityProviderVersion.getProperty("versionCode"))
         manifestPlaceholders["operitAppCoreEnabled"] = (!operitExternalRuntime).toString()
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
@@ -173,6 +191,7 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // Empty keeps Impeller's automatic backend selection (including its
         // driver blacklist); set the operitImpellerBackend Gradle property to
         // "vulkan" or "opengles" to force one.
@@ -184,6 +203,7 @@ android {
     sourceSets.getByName("main").jniLibs.setSrcDirs(emptyList<String>())
     if (operitExternalRuntime) {
         sourceSets.getByName("main").java.srcDir(operitModuleAndroid.dir("src/main/kotlin"))
+        sourceSets.getByName("main").res.srcDir(operitModuleAndroid.dir("src/main/res"))
     }
 
     buildTypes {
@@ -220,10 +240,55 @@ androidComponents {
             sourceDirectory.set(layout.projectDirectory.dir("src/main/assets"))
             selectedAbis.set(selectedOperitRustTargets.map { it.abi })
             externalRuntime.set(operitExternalRuntime)
+            applicationId.set(variant.applicationId)
         }
         val assets = variant.sources.assets
             ?: throw GradleException("Android variant ${variant.name} has no asset sources")
         assets.addGeneratedSourceDirectory(stagedAssets) { it.outputDirectory }
+        val companionBuildType = mapOf<String?, String>("debug" to "debug", "profile" to "debug", "release" to "release")
+            .getValue(variant.buildType)
+        val companionApk = configurations.create("${variant.name}AccessibilityApk") {
+            isCanBeConsumed = false
+            isCanBeResolved = true
+        }
+        dependencies.add(companionApk.name, dependencies.project(mapOf(
+            "path" to ":accessibilityCompanion",
+            "configuration" to "${companionBuildType}Apk",
+        )))
+        val stagedCompanion = tasks.register<StageOperitAndroidPayload>(
+            "stageOperitAccessibilityApk" + variant.name.replaceFirstChar { it.uppercase() },
+        ) {
+            dependsOn(companionApk)
+            apkDirectory.set(layout.dir(provider { companionApk.singleFile }))
+            from(apkDirectory) {
+                include("*.apk")
+                into("companions")
+                rename { "operit-accessibility.apk" }
+            }
+            into(outputDirectory)
+        }
+        assets.addGeneratedSourceDirectory(stagedCompanion) { it.outputDirectory }
+        val uiServerApk = configurations.create("${variant.name}UiServerApk") {
+            isCanBeConsumed = false
+            isCanBeResolved = true
+        }
+        dependencies.add(uiServerApk.name, dependencies.project(mapOf(
+            "path" to ":windowServer",
+            "configuration" to "${companionBuildType}Apk",
+        )))
+        val stagedUiServer = tasks.register<StageOperitAndroidPayload>(
+            "stageOperitUiServer" + variant.name.replaceFirstChar { it.uppercase() },
+        ) {
+            dependsOn(uiServerApk)
+            apkDirectory.set(layout.dir(provider { uiServerApk.singleFile }))
+            from(apkDirectory) {
+                include("*.apk")
+                into("companions")
+                rename { "operit-ui-server.jar" }
+            }
+            into(outputDirectory)
+        }
+        assets.addGeneratedSourceDirectory(stagedUiServer) { it.outputDirectory }
     }
 }
 
@@ -232,8 +297,6 @@ flutter {
 }
 
 dependencies {
-    // Match image_picker_android; the metadata-only attachment picker uses these contracts directly.
-    implementation("androidx.activity:activity:1.12.4")
     implementation("com.google.mlkit:text-recognition:16.0.0")
     implementation("com.google.mlkit:text-recognition-chinese:16.0.0")
     implementation("com.google.mlkit:text-recognition-japanese:16.0.0")
@@ -247,6 +310,8 @@ dependencies {
     testImplementation("org.mockito:mockito-core:5.23.0")
     // Real org.json for JVM unit tests; shadows the "not mocked" android.jar stubs.
     testImplementation("org.json:json:20240303")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }
 
 val operitBridgeCrate = project.layout.projectDirectory

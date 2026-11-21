@@ -10,7 +10,7 @@ use serde_json::Value;
 pub type JsonObject = serde_json::Map<String, Value>;
 
 use operit_model::FunctionType::FunctionType;
-use operit_model::ModelConfigData::{ProviderProfile, ResolvedModelConfig};
+use operit_model::ModelConfigData::{ModelCapabilities, ProviderProfile, ResolvedModelConfig};
 use operit_model::PromptFunctionType::PromptFunctionType;
 
 /// Future returned by provider runtime continuation boundaries.
@@ -285,8 +285,7 @@ pub trait ProviderRuntimeSupport: Send + Sync {
         Box::pin(async { Err("Local LLM runtime support is unavailable".to_string()) })
     }
 
-    /// Returns the root directory used by provider runtime data.
-    fn dataDir(&self) -> Result<PathBuf, String>;
+
 
     /// Records provider/model token usage.
     fn updateTokensForProviderModel(
@@ -315,17 +314,21 @@ pub trait ProviderRuntimeSupport: Send + Sync {
     /// Returns the model binding for a function.
     fn modelBindingForFunction(
         &self,
-        rootDir: PathBuf,
         functionType: FunctionType,
     ) -> Result<ProviderFunctionModelBinding, String>;
 
     /// Returns the resolved model config for a provider/model pair.
     fn resolvedModelConfig(
         &self,
-        rootDir: PathBuf,
         providerId: &str,
         modelId: &str,
     ) -> Result<ResolvedModelConfig, String>;
+
+    /// Reports optional function capabilities without requiring that auxiliary model for a chat request.
+    fn modelCapabilitiesForFunction(
+        &self,
+        functionType: FunctionType,
+    ) -> Result<Option<ModelCapabilities>, String>;
 
     /// Returns the saved ChatGPT Codex session.
     fn loadCodexTokens(
@@ -345,9 +348,15 @@ pub trait ProviderRuntimeSupport: Send + Sync {
     /// Returns the provider profile for a provider id.
     fn providerProfile(
         &self,
-        rootDir: PathBuf,
         providerId: &str,
     ) -> Result<ProviderProfile, String>;
+
+    /// Atomically acquires the provider's preferred usable credential at request time.
+    fn reserveProviderApiKey(&self, providerId: &str) -> Result<String, String>;
+
+    /// Records a structured outcome for the credential used by an actual HTTP attempt.
+    fn reportProviderApiKey(&self, providerId: &str, key: &str, startedAt: i64,
+        outcome: crate::chat::llmprovider::ApiKeyProvider::ApiKeyOutcome) -> Result<(), String>;
 
     /// Returns whether a tool package AI provider is registered.
     fn hasToolPkgAiProvider(&self, providerId: &str) -> bool;

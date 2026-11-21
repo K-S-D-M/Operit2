@@ -3,11 +3,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use operit_host_api::FileSystemHost;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 use operit_providers::market::MarketStatsApiService::{MarketEntrySummary, MarketStatsApiService};
 use operit_store::ExtensionStore::ExtensionStore;
 use operit_store::RuntimeStorePaths::RuntimeStorePaths;
 use operit_tools::tools::mcp_runtime::MCPLocalServer::MCPLocalServer;
+use operit_plugin_sdk::toolpkg::ToolPkgParser::ToolPkgSourceType;
 use operit_util::AppLogger::AppLogger;
 use operit_util::RuntimeStorageLayout::EXTENSIONS_PLUGIN_CONFIGS_DIR_PATH;
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ fn marker_path(root: &Path) -> PathBuf {
     root.join(".operit").join("market.json")
 }
 
-fn read_marker(fs: &dyn FileSystemHost, root: &Path) -> Option<MarketInstallMarker> {
+fn read_marker(fs: &VisualFileSystem, root: &Path) -> Option<MarketInstallMarker> {
     let path = marker_path(root).to_string_lossy().into_owned();
     // Missing, corrupt, or inaccessible markers must not break the entire market.
     let text = fs.readFile(&path).ok()?;
@@ -38,7 +39,7 @@ fn read_marker(fs: &dyn FileSystemHost, root: &Path) -> Option<MarketInstallMark
 }
 
 fn write_marker(
-    fs: &dyn FileSystemHost,
+    fs: &VisualFileSystem,
     root: &Path,
     entry_id: &str,
     version_id: &str,
@@ -77,35 +78,40 @@ fn mcp_config_marker_root(server_id: &str) -> PathBuf {
         ))
 }
 
+/// Enumerates loaded installations without checking whether each source can be exported.
 fn installed_marker_installations(
-    app: &OperitApplication,
+    tools: &operit_tools::tools::AIToolHandler::AIToolHandler,
 ) -> Result<Vec<(&'static str, String, PathBuf)>, String> {
-    let fs = app
-        .hostManager
-        .fileSystemHost
-        .as_ref()
-        .ok_or("FileSystemHost is missing")?;
+    let fs = tools.getContext().vfs()?;
     let mut installations = Vec::new();
-    let packages = app.packageManager();
-    for source in packages
-        .lock()
-        .map_err(|error| error.to_string())?
-        .getPublishablePackageSources()
-    {
+    let packages = tools.getOrCreatePackageManager();
+    let package_names = {
+        let manager = packages.lock().map_err(|error| error.to_string())?;
+        let containers = manager.getToolPkgContainerRuntimes().into_iter()
+            .map(|runtime| (runtime.packageName.clone(), runtime.sourceType))
+            .collect::<BTreeMap<_, _>>();
+        manager.getTopLevelAvailablePackages().into_values()
+            .filter(|package| match containers.get(&package.name) {
+                Some(source_type) => *source_type == ToolPkgSourceType::EXTERNAL,
+                None => !package.is_built_in && !operit_tools::tools::a2a::A2ARepository::is_a2a_package(package),
+            })
+            .map(|package| package.name)
+            .collect::<Vec<_>>()
+    };
+    for package_name in package_names {
         installations.push((
             "package",
-            source.packageName.clone(),
-            artifact_marker_root(&source.packageName)?,
+            package_name.clone(),
+            artifact_marker_root(&package_name)?,
         ));
     }
-    for skill in app
-        .skillRepository()
+    for skill in operit_tools::tools::skill_runtime::SkillRepository::SkillRepository::getInstance(&tools.getContext(), tools.runtimeSupport())
         .getAvailableSkillPackages()
         .into_values()
     {
         installations.push(("skill", skill.name.clone(), skill.directory));
     }
-    let mcp = MCPLocalServer::getInstance(&app.hostManager);
+    let mcp = MCPLocalServer::getInstance(&tools.getContext());
     for id in mcp.getAllMCPServersChecked()?.keys() {
         installations.push(("mcp", id.clone(), mcp_config_marker_root(id)));
     }
@@ -125,17 +131,13 @@ fn installed_marker_installations(
 pub(super) fn installed_versions(
     app: &OperitApplication,
 ) -> Result<BTreeMap<String, String>, String> {
-    let fs = app
-        .hostManager
-        .fileSystemHost
-        .as_ref()
-        .ok_or("FileSystemHost is missing")?;
-    let mut versions: BTreeMap<_, _> = installed_marker_installations(app)?
+    let fs = app.hostManager.vfs()?;
+    let mut versions: BTreeMap<_, _> = installed_marker_installations(&app.toolHandler)?
         .into_iter()
-        .filter_map(|(_, _, root)| read_marker(fs.as_ref(), &root))
+        .filter_map(|(_, _, root)| read_marker(&fs, &root))
         .map(|marker| (marker.entry_id, marker.version_id))
         .collect();
-    for marker in a2a_marker_origins(app)?.into_values() {
+    for marker in a2a_marker_origins(&app.toolHandler)?.into_values() {
         versions.insert(marker.entry_id, marker.version_id);
     }
     Ok(versions)
@@ -143,25 +145,21 @@ pub(super) fn installed_versions(
 
 /// Returns market ownership markers keyed by the extension kind and local id.
 pub(super) fn installed_marker_origins(
-    app: &OperitApplication,
+    tools: &operit_tools::tools::AIToolHandler::AIToolHandler,
 ) -> Result<BTreeMap<(String, String), MarketInstallMarker>, String> {
-    let fs = app
-        .hostManager
-        .fileSystemHost
-        .as_ref()
-        .ok_or("FileSystemHost is missing")?;
-    let mut origins: BTreeMap<_,_> = installed_marker_installations(app)?
+    let fs = tools.getContext().vfs()?;
+    let mut origins: BTreeMap<_,_> = installed_marker_installations(tools)?
         .into_iter()
         .filter_map(|(kind, id, root)| {
-            read_marker(fs.as_ref(), &root).map(|marker| ((kind.to_string(), id), marker))
+            read_marker(&fs, &root).map(|marker| ((kind.to_string(), id), marker))
         })
         .collect();
-    origins.extend(a2a_marker_origins(app)?);
+    origins.extend(a2a_marker_origins(tools)?);
     Ok(origins)
 }
 
-fn a2a_marker_origins(app: &OperitApplication) -> Result<BTreeMap<(String, String), MarketInstallMarker>, String> {
-    let repository = operit_tools::tools::a2a::A2ARepository::A2ARepository::new(app.hostManager.clone())?;
+fn a2a_marker_origins(tools: &operit_tools::tools::AIToolHandler::AIToolHandler) -> Result<BTreeMap<(String, String), MarketInstallMarker>, String> {
+    let repository = operit_tools::tools::a2a::A2ARepository::A2ARepository::new(tools.getContext().clone())?;
     Ok(repository.records()?.into_iter().filter_map(|record| {
         let entry_id = record.settings["marketEntryId"].as_str()?.to_string();
         let version_id = record.settings["installedMarketVersionId"].as_str()?.to_string();
@@ -187,11 +185,7 @@ pub(super) fn install_entry(
         })
         .filter(|id| !id.is_empty())
         .ok_or("Marketplace entry has no installable version")?;
-    let fs = app
-        .hostManager
-        .fileSystemHost
-        .as_ref()
-        .ok_or("FileSystemHost is missing")?;
+    let fs = app.hostManager.vfs()?;
     match entry.r#type.as_str() {
         "script" | "package" => {
             let asset = entry
@@ -221,7 +215,7 @@ pub(super) fn install_entry(
                 .filter(|id| !id.is_empty())
                 .ok_or("Installed artifact package id is missing")?;
             write_marker(
-                fs.as_ref(),
+                &fs,
                 &artifact_marker_root(runtime_id)?,
                 &entry.id,
                 version_id,
@@ -268,7 +262,7 @@ pub(super) fn install_entry(
                 }
                 for id in servers.keys() {
                     write_marker(
-                        fs.as_ref(),
+                        &fs,
                         &mcp_config_marker_root(id),
                         &entry.id,
                         version_id,
@@ -279,7 +273,7 @@ pub(super) fn install_entry(
                 let root = RuntimeStorePaths::default()
                     .mcp_plugins_dir()
                     .join(&plugin_id);
-                let backup = stage_existing_directory(fs.as_ref(), &root)?;
+                let backup = stage_existing_directory(&fs, &root)?;
                 let result = (|| {
                     app.mcpRepository().installMCPServerWithObjectForFlutter(
                         plugin_id.clone(),
@@ -288,9 +282,9 @@ pub(super) fn install_entry(
                         entry.description.clone(),
                         config.into(),
                     )?;
-                    write_marker(fs.as_ref(), &root, &entry.id, version_id)
+                    write_marker(&fs, &root, &entry.id, version_id)
                 })();
-                finish_directory_update(fs.as_ref(), &root, backup.as_deref(), result)?;
+                finish_directory_update(&fs, &root, backup.as_deref(), result)?;
             }
         }
         other => return Err(format!("Unsupported marketplace entry type: {other}")),
@@ -309,24 +303,20 @@ fn install_skill(
         .map(|source| source.url.trim())
         .filter(|url| !url.is_empty())
         .ok_or("Skill repository URL is missing")?;
-    let fs = app
-        .hostManager
-        .fileSystemHost
-        .as_ref()
-        .ok_or("FileSystemHost is missing")?;
+    let fs = app.hostManager.vfs()?;
     let repo = app.skillRepository();
     let old_root = repo
         .getAvailableSkillPackages()
         .into_values()
         .find_map(|skill| {
-            read_marker(fs.as_ref(), &skill.directory)
+            read_marker(&fs, &skill.directory)
                 .filter(|marker| marker.entry_id == entry.id)
                 .map(|_| skill.directory)
         });
     // Skill imports reject existing directories. Stage a market-owned installation
     // outside the scanned skills tree, restoring it if downloading/importing fails.
     let backup = match old_root.as_ref() {
-        Some(root) => stage_existing_directory(fs.as_ref(), root)?,
+        Some(root) => stage_existing_directory(&fs, root)?,
         None => None,
     };
     let result = repo.importSkillFromGitHubRepo(repo_url);
@@ -335,12 +325,12 @@ fn install_skill(
         .map(|value| value.split(" - ").next().unwrap_or(value).trim());
     if let Some(name) = imported {
         let root = RuntimeStorePaths::default().skills_dir().join(name);
-        let result = write_marker(fs.as_ref(), &root, &entry.id, version_id);
+        let result = write_marker(&fs, &root, &entry.id, version_id);
         if result.is_err() {
             let _ = fs.deleteFile(&root.to_string_lossy(), true);
         }
         finish_directory_update(
-            fs.as_ref(),
+            &fs,
             old_root.as_deref().unwrap_or(&root),
             backup.as_deref(),
             result,
@@ -348,7 +338,7 @@ fn install_skill(
     } else {
         match old_root.as_deref() {
             Some(root) => {
-                finish_directory_update(fs.as_ref(), root, backup.as_deref(), Err(result))
+                finish_directory_update(&fs, root, backup.as_deref(), Err(result))
             }
             None => Err(result),
         }
@@ -357,7 +347,7 @@ fn install_skill(
 
 /// Preserve the old plugin and marker until the replacement is fully installed.
 fn stage_existing_directory(
-    fs: &dyn FileSystemHost,
+    fs: &VisualFileSystem,
     root: &Path,
 ) -> Result<Option<PathBuf>, String> {
     if !fs
@@ -378,7 +368,7 @@ fn stage_existing_directory(
 }
 
 fn finish_directory_update(
-    fs: &dyn FileSystemHost,
+    fs: &VisualFileSystem,
     root: &Path,
     backup: Option<&Path>,
     result: Result<(), String>,
@@ -441,12 +431,7 @@ mod tests {
     fn config_marker_names_do_not_trust_server_ids_as_paths() {
         let testRoot =
             std::env::temp_dir().join(format!("operit-market-marker-{}", uuid::Uuid::new_v4()));
-        operit_util::RuntimeStoreRoot::setDefaultRuntimeStoreRootConfig(
-            operit_util::RuntimeStoreRoot::RuntimeStoreRootConfig::new(
-                testRoot.join("runtime"),
-                testRoot.join("workspaces"),
-            ),
-        );
+
         let root = mcp_config_marker_root("../../outside");
         assert_eq!(
             root.parent().unwrap(),

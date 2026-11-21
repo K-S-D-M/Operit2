@@ -9,6 +9,7 @@ import 'package:file_selector_platform_interface/file_selector_platform_interfac
     show FileSelectorPlatform;
 
 part 'src/selected_file_input.dart';
+part 'src/incoming_file_input.dart';
 
 /// A platform-selected mount source, not an assumed physical file path.
 class FolderMountSource {
@@ -89,6 +90,12 @@ abstract final class OperitFolderAccess {
 abstract class OperitFolderAccessPlatform {
   static OperitFolderAccessPlatform instance = _FileSelectorFolderAccess();
 
+  /// Registers external file delivery; platforms without an inbox have no events.
+  Future<void> receiveIncomingFiles({
+    required void Function(List<SelectedFileInput>) onFiles,
+    required void Function(Object, StackTrace) onError,
+  }) async {}
+
   /// Metadata and bounded input ownership use the same registered adapter as
   /// folder selection. App code does not choose a platform or interpret paths.
   Future<List<SelectedFileInput>> pickFileInputs({
@@ -107,8 +114,11 @@ abstract class OperitFolderAccessPlatform {
                   'bmp',
                   'gif',
                   'heic',
+                  'heif',
                 ],
                 mimeTypes: ['image/*'],
+                uniformTypeIdentifiers: ['public.image'],
+                webWildCards: ['image/*'],
               ),
             ]
           : const [],
@@ -267,7 +277,8 @@ class OperitFolderAccessMacOS extends _FileSelectorFolderAccess {
 }
 
 /// Android-only registration; ordinary storage roots still use file_selector.
-class OperitFolderAccessAndroid extends _FileSelectorFolderAccess {
+class OperitFolderAccessAndroid extends _FileSelectorFolderAccess
+    with _IncomingFileAccess {
   static const MethodChannel _channel = MethodChannel('operit/folder_access');
 
   static void registerWith() {
@@ -380,5 +391,14 @@ class OperitFolderAccessAndroid extends _FileSelectorFolderAccess {
       <String, Object?>{'initialDirectory': initialDirectory},
     );
     return selection == null ? null : FolderMountSource.fromMap(selection);
+  }
+}
+
+/// Registers iOS file delivery while retaining the system file-selector adapter.
+class OperitFolderAccessIOS extends _FileSelectorFolderAccess
+    with _IncomingFileAccess {
+  /// Installs the adapter selected by Flutter's generated plugin registrant.
+  static void registerWith() {
+    OperitFolderAccessPlatform.instance = OperitFolderAccessIOS();
   }
 }

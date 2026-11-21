@@ -286,7 +286,9 @@ impl SystemOperationHost for OhosSystemOperationHost {
     }
 
     /// Installs an app through the OpenHarmony owner app.
-    fn installApp(&self, path: &str) -> HostResult<AppOperationData> {
+    fn installApp(&self, source: &dyn operit_host_api::FileSource, timing: operit_host_api::AppInstallTiming) -> HostResult<AppOperationData> {
+        timing.requireImmediate()?;
+        let path = source.nativePath()?;
         Self::appOperation(self.execute("install_app", json!({ "path": path }))?)
     }
 
@@ -363,6 +365,15 @@ impl SystemOperationHost for OhosSystemOperationHost {
     }
 
     /// Captures an OpenHarmony screenshot through the owner app.
+    /// Writes image bytes through the selected VFS capability and removes native staging.
+    fn captureScreenshotTo(&self, target: &dyn operit_host_api::FileTarget) -> HostResult<()> {
+        let path = self.captureScreenshot()?;
+        let bytes = std::fs::read(&path).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        let written = target.writeBytes(&bytes);
+        std::fs::remove_file(&path).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        written
+    }
+
     fn captureScreenshot(&self) -> HostResult<String> {
         (self.screenshotCapturer)()
     }
@@ -370,10 +381,10 @@ impl SystemOperationHost for OhosSystemOperationHost {
     /// Recognizes text through the OCR callback fixed by the OHOS host assembly.
     fn recognizeText(
         &self,
-        imagePath: &str,
+        imagePath: &dyn operit_host_api::FileSource,
         language: OCRLanguage,
         quality: OCRQuality,
     ) -> HostResult<String> {
-        (self.textRecognizer)(imagePath, language, quality)
+        (self.textRecognizer)(&imagePath.nativePath()?, language, quality)
     }
 }

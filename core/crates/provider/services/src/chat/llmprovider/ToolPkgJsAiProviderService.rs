@@ -28,6 +28,7 @@ pub struct ToolPkgJsAiProviderService {
     executionChatId: String,
     providerRuntimeContextKey: String,
     runtimeContext: ProviderRuntimeContext,
+    keyGetter: super::ApiKeyProvider::KeyGetter,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -43,6 +44,7 @@ impl ToolPkgJsAiProviderService {
         config: ResolvedModelConfig,
         provider: ProviderToolPkgAiProviderRegistration,
         runtimeContext: ProviderRuntimeContext,
+        keyGetter: super::ApiKeyProvider::KeyGetter,
     ) -> Self {
         let normalizedProviderId = provider.providerId.trim().to_ascii_lowercase();
         Self {
@@ -59,6 +61,7 @@ impl ToolPkgJsAiProviderService {
             provider,
             tokenCounts: Arc::new(Mutex::new(ToolPkgProviderTokenCounts::default())),
             runtimeContext,
+            keyGetter,
         }
     }
 
@@ -72,6 +75,9 @@ impl ToolPkgJsAiProviderService {
         onIntermediateResult: Option<Arc<dyn Fn(String) + Send + Sync>>,
     ) -> Result<Value, AiServiceError> {
         let mut payload = eventPayload;
+        payload["config"]["apiKey"] = Value::String(
+            self.keyGetter.acquire().map_err(AiServiceError::RequestFailed)?,
+        );
         if let Value::Object(object) = &mut payload {
             object.insert(
                 "chatId".to_string(),
@@ -122,7 +128,6 @@ impl ToolPkgJsAiProviderService {
             "modelId": self.config.modelId,
             "apiProviderType": self.config.apiProviderTypeId,
             "apiProviderTypeId": self.config.apiProviderTypeId,
-            "apiKey": self.config.apiKey,
             "apiEndpoint": self.config.apiEndpoint,
             "modelId": self.config.modelId,
             "customHeaders": decodeJsonObjectString(&self.config.customHeaders),
@@ -139,17 +144,9 @@ impl ToolPkgJsAiProviderService {
     }
 
     #[allow(non_snake_case)]
+    /// Applies provider usage while holding the counters once.
     fn applyUsage(&self, decoded: &Value) {
-        let Some(usage) = extractUsage(
-            decoded,
-            &self.tokenCounts.lock().expect("token mutex poisoned"),
-        ) else {
-            return;
-        };
-        let mut counts = self.tokenCounts.lock().expect("token mutex poisoned");
-        counts.input = usage.input;
-        counts.cachedInput = usage.cachedInput;
-        counts.output = usage.output;
+        applyTokenUsage(&self.tokenCounts, decoded);
     }
 
     #[allow(non_snake_case)]
@@ -280,15 +277,7 @@ impl AIService for ToolPkgJsAiProviderService {
                     let Some(decoded) = runtime_support.decodeToolPkgHookResult(Some(raw)) else {
                         return;
                     };
-                    if let Some(usage) = extractUsage(
-                        &decoded,
-                        &token_counts.lock().expect("token mutex poisoned"),
-                    ) {
-                        let mut counts = token_counts.lock().expect("token mutex poisoned");
-                        counts.input = usage.input;
-                        counts.cachedInput = usage.cachedInput;
-                        counts.output = usage.output;
-                    }
+                    applyTokenUsage(&token_counts, &decoded);
                     if let Some(error) = extractNonFatalError(&decoded) {
                         if let Some(callback) = &on_non_fatal_error {
                             callback(error);
@@ -507,6 +496,17 @@ struct TokenUsage {
     output: i64,
 }
 
+/// Updates partial usage atomically without reacquiring the same non-reentrant mutex.
+#[allow(non_snake_case)]
+fn applyTokenUsage(counts: &Mutex<ToolPkgProviderTokenCounts>, decoded: &Value) {
+    let mut counts = counts.lock().expect("token mutex poisoned");
+    if let Some(usage) = extractUsage(decoded, &counts) {
+        counts.input = usage.input;
+        counts.cachedInput = usage.cachedInput;
+        counts.output = usage.output;
+    }
+}
+
 #[allow(non_snake_case)]
 fn extractUsage(decoded: &Value, current: &ToolPkgProviderTokenCounts) -> Option<TokenUsage> {
     let Value::Object(object) = decoded else {
@@ -602,5 +602,22 @@ fn nonBlankOr(value: &str, text: &str) -> String {
         text.to_string()
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    /// Streaming usage updates preserve omitted counters and release the mutex before text delivery.
+    #[test]
+    fn partial_usage_updates_release_counters_for_the_next_callback() {
+        let counts = Mutex::new(ToolPkgProviderTokenCounts::default());
+        applyTokenUsage(&counts, &serde_json::json!({"usage": {"input": 12, "cachedInput": 4}}));
+        assert_eq!(counts.try_lock().unwrap().input, 12);
+        applyTokenUsage(&counts, &serde_json::json!({"usage": {"output": 3}, "chunk": "hello"}));
+        applyTokenUsage(&counts, &serde_json::json!({"chunk": "world"}));
+        let counts = counts.try_lock().unwrap();
+        assert_eq!((counts.input, counts.cachedInput, counts.output), (12, 4, 3));
     }
 }

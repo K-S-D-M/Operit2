@@ -573,7 +573,7 @@ mod tests {
     use operit_runtime::core::application::OperitApplication::OperitApplication;
     use operit_util::MarkdownRenderStream::MarkdownStreamEvent;
     use operit_util::RuntimeStorageLayout::{RUNTIME_ROOT_DIR_PATH, WORKSPACE_DIR_PATH};
-    use operit_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
+
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -662,6 +662,7 @@ mod tests {
             currentChatId: "handoff-chat".to_string(),
             currentChatTitle: "stable chat title ".repeat(100),
             currentWorkspacePath: Some("/workspace/b".to_string()),
+            currentFileDirectory: None,
             isLoading: true,
             inputProcessingState: InputProcessingState::Connecting {
                 message: "connecting".to_string(),
@@ -726,6 +727,7 @@ mod tests {
             currentChatId: "handoff-chat".to_string(),
             currentChatTitle: "title".to_string(),
             currentWorkspacePath: None,
+            currentFileDirectory: None,
             isLoading: false,
             inputProcessingState: InputProcessingState::Completed,
             hasOlderDisplayHistory: false,
@@ -1146,10 +1148,7 @@ mod tests {
         let workspaceRoot = root.join(WORKSPACE_DIR_PATH);
         std::fs::create_dir_all(&runtimeRoot).expect("test runtime root must be created");
         std::fs::create_dir_all(&workspaceRoot).expect("test workspace root must be created");
-        setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(
-            runtimeRoot.clone(),
-            workspaceRoot.clone(),
-        ));
+
         let storageHost = Arc::new(NativeRuntimeStorageHost::new(runtimeRoot, workspaceRoot));
         hostManager.runtimeStorageHost = Some(storageHost.clone());
         hostManager.runtimeSqliteHost = Some(storageHost);

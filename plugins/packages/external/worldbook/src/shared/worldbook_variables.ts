@@ -73,6 +73,7 @@ async function readVariableStore(): Promise<WorldBookVariableStore> {
   }
 }
 
+/** Commits the complete variable store through the observed VFS boundary. */
 async function writeVariableStore(store: WorldBookVariableStore): Promise<void> {
   const storage = await initializeWorldBookStorage();
   await Tools.Files.write(storage.variablesFile, JSON.stringify(store, null, 2));

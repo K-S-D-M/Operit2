@@ -40,14 +40,18 @@ public class WebViewClientProxyApi extends PigeonApiWebViewClient {
       return api.getPigeonRegistrar().localResources.intercept(view, request);
     }
 
+    /** Injects legacy scripts before notifying Dart that navigation has started. */
     @Override
     public void onPageStarted(@NonNull WebView view, @NonNull String url, @NonNull Bitmap favicon) {
+      api.getPigeonRegistrar().userScripts.injectLegacyScripts(view);
       api.getPigeonRegistrar()
           .runOnMainThread(() -> api.onPageStarted(this, view, url, reply -> null));
     }
 
+    /** Ensures legacy injection reaches the completed document before page callbacks. */
     @Override
     public void onPageFinished(@NonNull WebView view, @NonNull String url) {
+      api.getPigeonRegistrar().userScripts.injectLegacyScripts(view);
       api.getPigeonRegistrar()
           .runOnMainThread(() -> api.onPageFinished(this, view, url, reply -> null));
     }
@@ -78,9 +82,9 @@ public class WebViewClientProxyApi extends PigeonApiWebViewClient {
       api.getPigeonRegistrar()
           .runOnMainThread(() -> api.requestLoading(this, view, request, reply -> null));
 
-      // The client is only allowed to stop navigations that target the main frame because
-      // overridden URLs are passed to `loadUrl` and `loadUrl` cannot load a subframe.
-      return request.isForMainFrame() && returnValueForShouldOverrideUrlLoading;
+      // Application links terminate here; ordinary subframe documents stay in their own frame.
+      return returnValueForShouldOverrideUrlLoading
+          && (request.isForMainFrame() || WebViewExternalNavigation.isApplicationUri(request.getUrl()));
     }
 
     @Override
@@ -118,8 +122,10 @@ public class WebViewClientProxyApi extends PigeonApiWebViewClient {
           .runOnMainThread(() -> api.onLoadResource(this, view, url, reply -> null));
     }
 
+    /** Retries legacy injection once the new document becomes visible. */
     @Override
     public void onPageCommitVisible(@NonNull android.webkit.WebView view, @NonNull String url) {
+      api.getPigeonRegistrar().userScripts.injectLegacyScripts(view);
       api.getPigeonRegistrar()
           .runOnMainThread(() -> api.onPageCommitVisible(this, view, url, reply -> null));
     }

@@ -13,7 +13,7 @@ use operit_link::LinkDeviceInfo;
 use super::{install_owner_media, BridgeStartup, StartupMetadata};
 use crate::FlutterHostAdapters::FlutterWebVisitBridge;
 use crate::FlutterOwnerCapabilities::{
-    ownerBluetooth, ownerDeviceInfo, ownerGetSystemSetting, ownerLocation,
+    ownerBluetooth, ownerDeviceInfo, ownerFileOpen, ownerFileShare, ownerGetSystemSetting, ownerLocation,
     ownerModifySystemSetting, ownerNotifications, ownerRecognizeText, ownerScreenshot,
     ownerSendNotification, ownerSystemOperation, FlutterSystemBindings,
     FlutterLocalInferenceHost, FlutterSystemOperationBridge, FlutterTtsSynthesisHost,
@@ -43,9 +43,13 @@ pub(crate) fn create_host_context(startup: &BridgeStartup) -> Result<HostManager
             )),
         )
     } else {
+        let StartupMetadata::AndroidDevice { archiveRuntimeRoot, .. } = &startup.metadata else {
+            return Err("Android startup requires its private archive storage root".to_string());
+        };
         createRuntimeHostManager(
             startup.runtimeRoot.clone(),
             startup.workspaceRoot.clone(),
+            archiveRuntimeRoot.clone(),
             Arc::new(FlutterWebVisitBridge::new()),
             Arc::new(AndroidSystemOperationHost::new(
                 Arc::new(ownerGetSystemSetting),
@@ -55,14 +59,18 @@ pub(crate) fn create_host_context(startup: &BridgeStartup) -> Result<HostManager
         )
     }
     .withTerminalHost(Arc::new(AndroidTerminalHost::new()));
+    context = context.withUiAutomationHost(Arc::new(operit_host_api::UiAutomation::OwnerUiAutomationHost {
+        invoke: Arc::new(|operation, parameters| ownerSystemOperation("ui_automation", serde_json::json!({ "operation": operation, "parameters": parameters }))),
+    }));
     context.fileSystemHost = Some(Arc::new(AndroidFileSystemHost::withPresentation(Arc::new(
-        |operation, path, title| crate::FlutterOwnerCapabilities::ownerConfirmed(
-            "android_file_presentation",
-            serde_json::json!({ "operation": operation, "path": path, "title": title }),
-        ),
+        |operation, path, title| match operation {
+            "openFile" => ownerFileOpen(path),
+            "shareFile" => ownerFileShare(path, title),
+            _ => Err(operit_host_api::HostError::new("Unsupported file presentation operation")),
+        },
     ))));
     if module.is_some() {
-        context = context.withLocalInferenceHost(Arc::new(FlutterLocalInferenceHost));
+        context = context.withLocalInferenceHost(Arc::new(operit_host_local_inference::NativeLocalInferenceHost::withSpeech(Arc::new(FlutterLocalInferenceHost))));
     }
     let system = context
         .systemOperationHost
@@ -92,7 +100,7 @@ pub(crate) fn startup_device_info(
     metadata: &StartupMetadata,
 ) -> Result<LinkDeviceInfo, String> {
     let model = match metadata {
-        StartupMetadata::AndroidDevice { model }
+        StartupMetadata::AndroidDevice { model, .. }
         | StartupMetadata::AndroidPrivileged { model, .. } => model,
         _ => return Err("Android startup requires owner-supplied device identity".to_string()),
     };
@@ -122,12 +130,13 @@ impl crate::OperitFlutterBridge {
     pub(crate) fn new_with_storage_roots(
         runtimeRoot: PathBuf,
         workspaceRoot: PathBuf,
+        archiveRuntimeRoot: PathBuf,
         model: String,
     ) -> Result<Self, String> {
         crate::PlatformRuntimeFactory::startBridge(BridgeStartup {
             runtimeRoot,
             workspaceRoot,
-            metadata: StartupMetadata::AndroidDevice { model },
+            metadata: StartupMetadata::AndroidDevice { model, archiveRuntimeRoot },
         })
     }
 }

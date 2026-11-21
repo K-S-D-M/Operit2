@@ -1,10 +1,69 @@
-/** Installs the v1 compatibility surface as an SDK-internal adapter. */
+/** Installs the v1 compatibility surface as an SDK-internal adapter. @param {Record<string, any>} runtime */
 function __operitInstallV1Runtime(runtime) {
     var api = runtime.__operitToolPkgApi;
     var canonical = runtime.__operitCanonicalTools;
     var originalToolCall = runtime.toolCall;
     var internal = runtime.__operitV1InternalRuntime;
     if (!internal) throw new Error('Internal V1 runtime implementation is unavailable');
+    var migratorOwner = 'com.operit.chathistory_migrator';
+
+    /** Identifies the migrator's v1 page and tool invocations. */
+    function isLegacyMigrator() {
+        var version = api.currentVersion();
+        return (version === '1.0.0' || version === '1.0.1') &&
+            runtime.__operitGetCallState(api.currentCallId()).params.__operit_ui_package_name === migratorOwner;
+    }
+
+    if (runtime.Java) __operitInstallV1MigratorChat(runtime.Java, isLegacyMigrator, originalToolCall,
+        /** Retains the owning call until the native import has delivered its receipt. @param {string} path */
+        function(path) {
+            return runtime.__operitInvokeHostAsync(runtime.__operitNativeImportV1MigratorArchive, [path]);
+        },
+    );
+    if (runtime.OperitComposeDslRuntime) {
+        var createComposeContext = runtime.OperitComposeDslRuntime.createContext;
+        /**
+         * Translates the migrator page's calls to the arguments its v1.20.2 tool metadata declares.
+         * @param {...any} args
+         */
+        function composeToolCall(...args) {
+            var [name, params, options] = args;
+            if (isLegacyMigrator() && typeof name === 'string') {
+                var qualifiedPrefix = migratorOwner + ':chathistory_migrator_tools:';
+                var childPrefix = 'chathistory_migrator_tools:';
+                var shortName = name.startsWith(qualifiedPrefix) ? name.slice(migratorOwner.length + 1) : name;
+                if (shortName.startsWith(childPrefix) && args.length === 3 && params &&
+                    options && typeof options.onIntermediateResult === 'function') {
+                    var operation = shortName.slice(childPrefix.length);
+                    if (operation.startsWith('convert_')) {
+                        var {progress_path, summary_mode, ...conversionParams} = params;
+                        return runtime.toolCall(shortName, conversionParams);
+                    }
+                    if (operation === 'generate_empty_summary' || operation === 'generate_real_summary') {
+                        var {summary_mode_id, ...summaryParams} = params;
+                        return runtime.toolCall(shortName, summaryParams);
+                    }
+                }
+                args[0] = shortName;
+            }
+            return runtime.toolCall.apply(runtime, args);
+        }
+        var legacyComposeToolCall = api.method()
+            .between('1.0.0', '2.0.0', composeToolCall)
+            .build('ComposeContext.toolCall');
+        /** Adds the historical UI bridge to the v1 context. @param {Record<string, any>} options */
+        runtime.OperitComposeDslRuntime.createContext = function(options) {
+            var bundle = createComposeContext(options);
+            Object.defineProperty(bundle.ctx, 'toolCall', {
+                /** Checks the active contract even when a page retains its context. */
+                get: function() {
+                    var version = api.currentVersion();
+                    return version === '1.0.0' || version === '1.0.1' ? legacyComposeToolCall : undefined;
+                },
+            });
+            return bundle;
+        };
+    }
     runtime.__operitV1CanonicalTools = canonical;
     var routes = Object.freeze({
         'super_admin:terminal': 'terminal',
@@ -13,12 +72,50 @@ function __operitInstallV1Runtime(runtime) {
         'ffmpeg:ffmpeg_info': 'ffmpeg_info',
     });
 
-    /** Calls the internal implementation without publishing a package tool identity. */
+    /** Calls the internal implementation without publishing a package tool identity.
+     * @param {string} method
+     * @param {Record<string, any>} params
+     */
     function invoke(method, params) {
         var implementation = internal[method];
         if (typeof implementation !== 'function') throw new Error('Unknown internal V1 runtime method: ' + method);
         return Promise.resolve().then(function() { return implementation(params || {}); });
     }
+
+    /** @type {typeof import('../../../../../../../plugins/types-v1/ffmpeg').FFmpeg} */
+    var ffmpeg = {
+        /** Executes legacy arguments through the VFS-aware runtime bridge. */
+        execute(command) { return invoke('ffmpeg_execute', { command: command }); },
+        /** Returns the selected runtime's installed FFmpeg version. */
+        info() { return invoke('ffmpeg_info', {}); },
+        /** Quotes file operands and translates the documented conversion options. */
+        convert(inputPath, outputPath, options) {
+            /** Quotes one shell argument without interpreting its contents. @param {string} value */
+            function quote(value) { return "'" + String(value).replace(/'/g, "'\\''") + "'"; }
+            var command = '-y -i ' + quote(inputPath);
+            var flags = { video_codec: '-c:v', audio_codec: '-c:a', resolution: '-s', bitrate: '-b:v' };
+            if (options) {
+                for (var key of Object.keys(flags)) {
+                    var value = options[/** @type {keyof typeof options} */ (key)];
+                    if (value !== undefined) command += ' ' + flags[/** @type {keyof typeof flags} */ (key)] + ' ' + quote(value);
+                }
+            }
+            return invoke('ffmpeg_execute', { command: command + ' ' + quote(outputPath) });
+        },
+    };
+    /** @type {Record<string, Function>} */
+    var legacyFfmpeg = {};
+    for (var [ffmpegMethod, implementation] of Object.entries(ffmpeg)) {
+        legacyFfmpeg[ffmpegMethod] = api.method().between('1.0.0', '2.0.0', implementation).build('Tools.FFmpeg.' + ffmpegMethod);
+    }
+    Object.defineProperty(runtime.Tools, 'FFmpeg', {
+        configurable: true,
+        /** Exposes the historical namespace only to admitted v1 calls. */
+        get: function() {
+            var version = api.currentVersion();
+            return version === '1.0.0' || version === '1.0.1' ? legacyFfmpeg : undefined;
+        },
+    });
 
     // Both legacy file calls and shell commands use this existing managed filesystem.
     var cacheImports = new Map();
@@ -144,6 +241,61 @@ function __operitInstallV1Runtime(runtime) {
 
     var terminal = canonical.System.terminal;
     var currentTerminal = runtime.Tools.System.terminal;
+    // One-shot Android commands must bypass the v1 Linux terminal and its path rewrites.
+    var shellSequence = 0;
+    var shellScope = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+    /** Executes with the host's existing Android privilege policy and returns the v1 ADB receipt.
+     * @param {string} command
+     * @returns {Promise<import('../../../../../../../plugins/types-v1/results').ADBResultData>}
+     */
+    async function androidShell(command) {
+        if (typeof command !== 'string' || !command.trim() || command.includes('\0')) {
+            throw new TypeError('Tools.System.shell requires a nonblank command without NUL');
+        }
+        var callState = runtime.__operitGetCallState(runtime.__operitCurrentCallId);
+        if (!callState || !callState.params || callState.params.__operit_package_state !== 'android') {
+            throw new Error('Tools.System.shell requires Android');
+        }
+        // Each invocation owns its session, including concurrent callers and timeout cleanup.
+        var session = await terminal.create('v1_android_shell_' + shellScope + '_' + (++shellSequence), 'shell');
+        var failed = false;
+        try {
+            var result = await terminal.exec(session.sessionId, command, 20000);
+            if (result.timedOut) throw new Error('Android shell timed out: ' + result.output);
+            if (result.exitCode !== 0) {
+                throw new Error('Android shell exited with code ' + result.exitCode + ': ' + result.output);
+            }
+            return {
+                command: result.command,
+                output: result.output,
+                exitCode: result.exitCode,
+                /** Preserves useful string conversion alongside the structured legacy fields.
+                 * @this {import('../../../../../../../plugins/types-v1/results').ADBResultData}
+                 */
+                toString: function() { return this.output; },
+            };
+        } catch (error) {
+            failed = true;
+            throw error;
+        } finally {
+            try {
+                var closed = await terminal.close(session.sessionId);
+                if (!closed.success) throw new Error('Android shell cleanup failed: ' + closed.message);
+            } catch (error) {
+                // Keep the command's failure visible if cleanup fails as well.
+                if (!failed) throw error;
+            }
+        }
+    }
+    var legacyShell = api.method().between('1.0.0', '2.0.0', androidShell).build('Tools.System.shell');
+    Object.defineProperty(runtime.Tools.System, 'shell', {
+        configurable: true,
+        /** Keeps the supplemental legacy entry point out of the v2 API. */
+        get: function() {
+            var version = api.currentVersion();
+            return version === '1.0.0' || version === '1.0.1' ? legacyShell : undefined;
+        },
+    });
     currentTerminal.create = api.method()
         .between('1.0.0', '2.0.0',
             /** Creates a legacy session using the package state selected by Rust.

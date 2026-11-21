@@ -1,6 +1,7 @@
 package app.operit
 
 import android.app.AppOpsManager
+import android.app.Activity
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
@@ -16,10 +17,17 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** Android package operations invoked through the owner interaction channel. */
-internal class AndroidPackageOperations(private val context: Context) {
+internal class AndroidPackageOperations(
+    private val context: Activity,
+    private val uiServer: AndroidUiServer,
+    private val uiAutomation: AndroidUiAutomation,
+) {
     private val pm = context.packageManager
+    private val uninstaller = AndroidAppUninstaller(context)
 
+    /** Executes one package operation and returns its verified outcome. */
     fun execute(operation: String, params: JSONObject): JSONObject = when (operation) {
+        "application_update_base" -> updateBase()
         "install_app" -> install(params.getString("path"))
         "uninstall_app" -> uninstall(packageName(params))
         "list_installed_apps" -> list(params.getBoolean("includeSystemApps"))
@@ -27,6 +35,13 @@ internal class AndroidPackageOperations(private val context: Context) {
         "stop_app" -> stop(packageName(params))
         "get_app_usage_time" -> usage(params)
         else -> throw IllegalArgumentException("Unsupported Android package operation: $operation")
+    }
+
+    /** Exposes only a monolithic APK; split installations require their complete package set. */
+    private fun updateBase(): JSONObject {
+        val info = context.applicationInfo
+        val path = if (info.splitSourceDirs.isNullOrEmpty()) info.sourceDir else JSONObject.NULL
+        return JSONObject().put("path", path)
     }
 
     private fun packageName(params: JSONObject): String {
@@ -56,12 +71,19 @@ internal class AndroidPackageOperations(private val context: Context) {
             .put("installState", "installer_opened")
     }
 
+    /** Reports success only after system confirmation and package removal verification. */
     private fun uninstall(name: String): JSONObject {
-        pm.getPackageInfo(name, 0)
-        val intent = Intent(Intent.ACTION_DELETE, Uri.parse("package:$name"))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
-        return result("uninstall_app", name, "Uninstallation requested; system confirmation is required")
+        uninstaller.uninstall(name)
+        return result("uninstall_app", name, "Application uninstalled; removal verified")
+    }
+
+    /** Routes system uninstall confirmation to its pending host call. */
+    fun onActivityResult(requestCode: Int, resultCode: Int): Boolean =
+        uninstaller.onActivityResult(requestCode, resultCode)
+
+    /** Cancels package operations whose Activity owner is being detached. */
+    fun release() {
+        uninstaller.release()
     }
 
     private fun list(includeSystem: Boolean): JSONObject {
@@ -71,12 +93,18 @@ internal class AndroidPackageOperations(private val context: Context) {
         return JSONObject().put("includesSystemApps", includeSystem).put("packages", JSONArray(packages))
     }
 
+    /** Uses native standalone windows when this Host has privileged Android authorization. */
     private fun start(name: String, activity: String?): JSONObject {
         val intent = if (activity == null) {
             pm.getLaunchIntentForPackage(name)
                 ?: throw IllegalStateException("No launchable activity found for $name")
         } else {
             Intent(Intent.ACTION_MAIN).setClassName(name, if (activity.startsWith('.')) name + activity else activity)
+        }
+        if (uiServer.isAuthorized()) {
+            val component = intent.component ?: error("Application launch intent has no component")
+            uiAutomation.launch(component.flattenToString())
+            return result("start_app", name, "Application launched in its native window; select it with list_windows and focus_window")
         }
         context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         return result("start_app", name, "Launch requested")
@@ -90,9 +118,10 @@ internal class AndroidPackageOperations(private val context: Context) {
             else -> throw SecurityException("Force stopping apps requires authorized Shizuku or Root")
         }
         val response = AndroidPrivilegedCommandExecutor.execute(
-            target, "am force-stop '$name'", rootSettings = AndroidPrivilegeAuthorization.rootExecutionSettings(context),
+            context, target, "am force-stop '$name'", rootSettings = AndroidPrivilegeAuthorization.rootExecutionSettings(context),
         )
         check(response.exitCode == 0) { "Force stop failed: ${response.stderrText()}" }
+        uiServer.closePackage(name)
         return result("stop_app", name, "Force stop completed")
     }
 

@@ -12,6 +12,7 @@ use std::sync::Mutex;
 #[path = "space_join_projection.rs"]
 mod projection;
 use projection::{ConsentProjection, JoinReply, MembershipReceipt};
+use super::space_projection::callPeerSpace;
 
 // Group consent uses its own durable schema; single-device approval records are not group approvals.
 pub(crate) const INBOUND: &str = RUNTIME_SPACE_MERGE_INBOUND_PATH;
@@ -568,7 +569,8 @@ async fn prepareRequest(service: &dyn NodeSpaceContext, deviceId: String) -> Res
         let snapshot: PeerSpaceSnapshot = Box::pin(joinSnapshot(service, &deviceId)).await?;
         if !snapshot.space.members.contains(&deviceId) { return Err("Target is not in its advertised Space".into()); }
         space_departure::observe(service, &deviceId, &snapshot.departures, &snapshot.controlOperations)?;
-        let source = peerSpaceSnapshot(service)?;
+        let mut source = peerSpaceSnapshot(service)?;
+        source.departures = space_departure::pending(service, &deviceId)?;
         let local = source.space.clone();
         let localId = service.localNodeId();
         // One shared space identity is never joinable: either both sides already
@@ -611,6 +613,15 @@ async fn prepareRequest(service: &dyn NodeSpaceContext, deviceId: String) -> Res
 
 /// Persists the immutable consent source and releases both snapshots before the network response phase.
 fn prepareSubmission(service: &dyn NodeSpaceContext, deviceId: String, source: PeerSpaceSnapshot, snapshot: PeerSpaceSnapshot) -> Result<String, String> {
+    let _lock = MUTATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    paired(service, &deviceId, crate::NodeServices::PairingDirection::Either)?;
+    let current = service.spaceStore().space()?;
+    if current.spaceId != source.space.spaceId || current.spaceRevision != source.space.spaceRevision {
+        return Err("Source Space changed while preparing the join request".into());
+    }
+    if let Some(existing) = outgoing(service)?.into_iter().find(|request| request.targetDeviceId == deviceId && active(&request.status)) {
+        return Ok(existing.requestId);
+    }
     let localId = service.localNodeId();
     let local = &source.space;
     let profile = source.deviceProfiles.iter().find(|p| p.nodeId == localId)
@@ -847,7 +858,7 @@ fn receiveSubmission(service: &dyn NodeSpaceContext, peer: &str, current: &CoreS
     if !cancellation && input.sourceSpaceId == current.spaceId {
         return Err("Join request must merge a distinct source Space, not the target itself".into());
     }
-    space_departure::observe(service, peer, &[], &input.source.controlOperations)?;
+    space_departure::observe(service, peer, &input.source.departures, &input.source.controlOperations)?;
     let mut records: Vec<_> = store(service).independentRecords::<ConsentProjection>(INBOUND)?.into_values().collect();
     pruneCompletedRequests(service, &mut records)?;
     if let Some(old) = records.iter().find(|record| record.request.requestId == input.requestId) {
@@ -1426,42 +1437,14 @@ mod device_space_state_tests {
 
 /// Collects the same versioned authority projection for every applicant and target node.
 async fn joinSnapshot(service: &dyn NodeSpaceContext, node: &str) -> Result<PeerSpaceSnapshot, String> {
-    use super::space_projection::{self, SnapshotHeader, SnapshotCollector};
+    use super::space_projection;
     let response = service.callNode(node.to_owned(), CoreCallRequest::new(
         format!("node-space-projectionProtocol-{}", currentTimeMillis()), NODE_SPACE_TARGET,
         "projectionProtocol", toCoreValue(serde_json::json!({"version": space_projection::VERSION})).map_err(|e| e.to_string())?,
     )).await;
     let protocol = space_projection::decodeProtocolResponse(node, response.result)?;
     if !protocol.snapshotPaging { return Err("SPACE_PROTOCOL_INCOMPATIBLE: Joining requires authority paging".into()); }
-    // A departure/control update may race a paged read. Restart only this
-    // read-only export; never retry admission writes or an uncertain decision.
-    // The negotiated paging protocol stays valid across snapshot revisions.
-    for attempt in 0..3 {
-        let result = async {
-            let header: SnapshotHeader = callPeerSpace(service, node, "snapshotHeader", CoreValue::Null).await?;
-            let mut collector = SnapshotCollector::new(header)?;
-            loop {
-                let page = callPeerSpace(service, node, "snapshotControlPage",
-                    toCoreValue(collector.request()).map_err(|e| e.to_string())?).await?;
-                if collector.push(page)? { break; }
-            }
-            let current = callPeerSpace(service, node, "snapshotHeader", CoreValue::Null).await?;
-            collector.finish(current)
-        }.await;
-        match result {
-            Err(error) if attempt < 2 && error.starts_with("SPACE_EXPORT_CHANGED:") => continue,
-            result => return result,
-        }
-    }
-    unreachable!()
-}
-
-/// Calls one explicit Space method on the directly paired peer.
-async fn callPeerSpace<T: serde::de::DeserializeOwned>(service: &dyn NodeSpaceContext, node: &str, method: &str, args: CoreValue) -> Result<T, String> {
-    let response = service.callNode(node.to_owned(), CoreCallRequest::new(
-        format!("node-space-{method}-{}", currentTimeMillis()), NODE_SPACE_TARGET, method, args,
-    )).await;
-    fromCoreValue(response.result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    space_projection::readSnapshot(service, node).await.map(|(_, snapshot)| snapshot)
 }
 
 #[cfg(test)]
@@ -1495,6 +1478,8 @@ mod snapshot_retry_tests {
         terminal: bool,
         reads: AtomicUsize,
         protocols: AtomicUsize,
+        pageError: Option<&'static str>,
+        pages: AtomicUsize,
     }
     #[async_trait::async_trait(?Send)]
     impl NodeSpaceContext for Export {
@@ -1519,6 +1504,13 @@ mod snapshot_retry_tests {
                         "deviceProfiles":[],"topology":[],"departures":[],"controlRevision":format!("{read:064x}"),"controlCount":0})
                 }
                 "snapshotControlPage" => {
+                    let page = self.pages.fetch_add(1, Ordering::SeqCst);
+                    if let Some(code) = self.pageError {
+                        if code != "SPACE_EXPORT_CHANGED" || page < self.changes {
+                            return CoreCallResponse::err(request.requestId,
+                                super::super::spaceCallError(format!("{code}: read failed")));
+                        }
+                    }
                     let args: serde_json::Value = fromCoreValue(request.args).unwrap();
                     serde_json::json!({"revision":args["revision"],"count":0,"operation":null})
                 }
@@ -1528,7 +1520,8 @@ mod snapshot_retry_tests {
         }
     }
     fn export(changes: usize, terminal: bool) -> Export {
-        Export { changes, terminal, reads: AtomicUsize::new(0), protocols: AtomicUsize::new(0) }
+        Export { changes, terminal, reads: AtomicUsize::new(0), protocols: AtomicUsize::new(0),
+            pageError: None, pages: AtomicUsize::new(0) }
     }
     #[tokio::test]
     async fn changed_export_restarts_from_a_fresh_header_without_writing_admission() {
@@ -1538,6 +1531,28 @@ mod snapshot_retry_tests {
         assert_eq!(source.reads.load(Ordering::SeqCst), 4);
         assert_eq!(source.protocols.load(Ordering::SeqCst), 1);
     }
+    #[tokio::test]
+    async fn shared_export_retries_changed_pages_but_not_denied_or_invalid_pages() {
+        let mut source = export(1, false);
+        source.pageError = Some("SPACE_EXPORT_CHANGED");
+        let (revision, snapshot) = super::super::space_projection::readSnapshot(&source, "peer").await.unwrap();
+        assert_eq!(revision, format!("{:064x}", 1));
+        assert_eq!(snapshot.space.spaceId, "space");
+        assert_eq!(source.reads.load(Ordering::SeqCst), 3);
+        assert_eq!(source.pages.load(Ordering::SeqCst), 2);
+        let mut source = export(usize::MAX, false);
+        source.pageError = Some("SPACE_EXPORT_CHANGED");
+        assert!(super::super::space_projection::readSnapshot(&source, "peer").await.is_err());
+        assert_eq!(source.pages.load(Ordering::SeqCst), 3);
+        for code in ["PEER_PERMISSION", "SPACE_EXPORT_INVALID"] {
+            let mut source = export(0, false);
+            source.pageError = Some(code);
+            assert!(super::super::space_projection::readSnapshot(&source, "peer").await.err().unwrap().contains(code));
+            assert_eq!(source.pages.load(Ordering::SeqCst), 1);
+            assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+        }
+    }
+
     #[tokio::test]
     async fn export_retry_is_bounded_and_permission_errors_are_not_retried() {
         let source = export(usize::MAX, false);

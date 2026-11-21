@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+operit-vfs = { version = "0.1.0", path = "../../foundation/vfs" }
 operit-edge-contract = { path = "../../../../edge/sdk/contract" }
 operit-node-runtime = { path = "../../node/runtime" }
 operit-peer-link = { path = "../../node/peer-link" }
@@ -35,6 +36,8 @@ operit-proxy-rust-codegen = { path = "../rust-codegen" }
 operit-plugin-sdk-codegen = { path = "../../plugin/codegen" }
 
 [dev-dependencies]
+base64.workspace = true
+sha2.workspace = true
 zip.workspace = true
 operit-proxy-scan = { path = "../scan" }
 operit-host-native-common = { path = "../../../../hosts/common/operit-host-native-common", default-features = false, features = ["fs", "http", "scheduler", "storage"] }

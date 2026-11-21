@@ -24,6 +24,51 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>FlutterDeepLinkingEnabled</key>
+	<false/>
+	<key>OperitIncomingAppGroup</key>
+	<string>$(OPERIT_INCOMING_APP_GROUP)</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Chat attachment</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array><string>public.data</string><string>public.content</string></array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Operit ToolPkg</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array><string>app.operit.toolpkg</string></array>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>app.operit.toolpkg</string>
+			<key>UTTypeDescription</key>
+			<string>Operit ToolPkg archive</string>
+			<key>UTTypeConformsTo</key>
+			<array><string>public.zip-archive</string></array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array><string>toolpkg</string></array>
+			</dict>
+		</dict>
+	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSAppTransportSecurity</key>
@@ -39,6 +84,8 @@
 	<string>Operit2 uses your current location to add a location attachment to a chat when you request it.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Operit uses your current location only when you request a location attachment.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Operit saves images to your photo library when you choose Save Image from the share sheet.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Operit2 uses the camera to scan device connection codes and capture photos for chat attachments.</string>
 	<key>NSBonjourServices</key>

@@ -616,7 +616,7 @@ impl CoreNodeRouter {
     /// A transport grant is usable only after both memberships have been
     /// admitted by the current Space control log; mere pairing is insufficient.
     pub(crate) fn spaceChannelScope(&self, peer: &str) -> Result<Option<String>, CoreLinkError> {
-        crate::space_policy::spaceChannelScope(&self.spaceStore, &self.networkControlStore, &self.localNodeId, peer)
+        crate::space_policy::spaceChannelScope(&self.networkControlStore, &self.localNodeId, peer)
     }
 
     /// Reports whether the active Peer Link graph currently proves one device reachable.
@@ -2569,9 +2569,8 @@ mod tests {
         FileEntry, FileExistence, FileInfo, FileSystemHost, FindFilesRequest, GrepCodeRequest,
         GrepCodeResult, HostEnvironmentDescriptor, HostError, HostResult, HostRuntimeAsyncTask,
         HostRuntimeTask, HostRuntimeTaskSchedulerHost, HostSecretStore, RuntimeSqliteConnection,
-        RuntimeSqliteHost, RuntimeSqliteTransaction, RuntimeStorageEntry, RuntimeStorageHost,
-        SqliteRow, SqliteValue,
-    };
+        RuntimeSqliteHost, RuntimeStorageEntry, RuntimeStorageHost,
+        };
     use operit_link::{
         CoreEventKind, CorePushRequest, CoreStream, CoreStreamSource, CORE_INTERNAL_TARGET,
     };
@@ -2631,7 +2630,29 @@ mod tests {
         }
     }
 
+    struct TestStorageWriteSession {
+        host: TestRuntimeStorageHost,
+        path: String,
+        bytes: Vec<u8>,
+    }
+
+    impl operit_host_api::RuntimeStorageWriteSession for TestStorageWriteSession {
+        fn writeChunk(&mut self, chunk: &[u8]) -> HostResult<()> {
+            self.bytes.extend_from_slice(chunk);
+            Ok(())
+        }
+        fn commit(self: Box<Self>) -> HostResult<()> {
+            self.host.files.lock().map_err(|e|HostError::new(e.to_string()))?
+                .insert(self.path, self.bytes);
+            Ok(())
+        }
+        fn discard(self: Box<Self>) -> HostResult<()> { Ok(()) }
+    }
+
     impl RuntimeStorageHost for TestRuntimeStorageHost {
+        fn openWriteSession(&self, path: &str) -> HostResult<Option<Box<dyn operit_host_api::RuntimeStorageWriteSession>>> {
+            Ok(Some(Box::new(TestStorageWriteSession { host: self.clone(), path: path.into(), bytes: Vec::new() })))
+        }
         fn openTransactionDatabase(&self, path: &str) -> operit_host_api::HostResult<Box<dyn operit_host_api::RuntimeSqliteConnection>> {
             operit_host_api::RuntimeSqliteHost::openSqliteDatabase(
                 &operit_host_native_storage::NativeRuntimeStorageHost::new(self.runtimeRoot.clone(),self.workspaceRoot.clone()),path)
@@ -2760,6 +2781,13 @@ mod tests {
     /// Provides a file host shell for constructing unused local chat runtime state in tests.
     #[derive(Clone, Debug, Default)]
     struct TestFileSystemHost;
+
+    /// Wraps the route fixture's nonpersistent backend in the production VFS boundary.
+    fn testFileSystem() -> Arc<operit_vfs::VisualFileSystem::VisualFileSystem> {
+        Arc::new(operit_vfs::VisualFileSystem::VisualFileSystem::builtinOnly(
+            Arc::new(TestFileSystemHost), "/runtime".into(), "/workspace".into(),
+        ))
+    }
 
     impl TestFileSystemHost {
         /// Creates the standard file host error used by unsupported test operations.
@@ -2938,236 +2966,6 @@ mod tests {
                 .map_err(|error| HostError::new(error.to_string()))?
                 .remove(key);
             Ok(())
-        }
-    }
-
-    /// Opens file-backed SQLite databases under the test runtime root.
-    struct TestSqliteHost {
-        root: std::path::PathBuf,
-    }
-
-    impl TestSqliteHost {
-        /// Creates a SQLite host rooted at one runtime directory.
-        fn new(root: std::path::PathBuf) -> Self {
-            Self { root }
-        }
-
-        /// Resolves one runtime-relative database path under the test root.
-        fn resolve(&self, path: &str) -> HostResult<std::path::PathBuf> {
-            let path = std::path::Path::new(path);
-            if path.is_absolute() {
-                return Err(HostError::new(format!(
-                    "test SQLite path must be relative: {}",
-                    path.display()
-                )));
-            }
-            let mut resolved = self.root.clone();
-            for component in path.components() {
-                match component {
-                    std::path::Component::Normal(segment) => resolved.push(segment),
-                    std::path::Component::CurDir => {}
-                    _ => {
-                        return Err(HostError::new(format!(
-                            "test SQLite path is invalid: {}",
-                            path.display()
-                        )))
-                    }
-                }
-            }
-            Ok(resolved)
-        }
-    }
-
-    impl RuntimeSqliteHost for TestSqliteHost {
-        /// Opens one SQLite database in the test runtime directory.
-        #[allow(non_snake_case)]
-        fn openSqliteDatabase(&self, path: &str) -> HostResult<Box<dyn RuntimeSqliteConnection>> {
-            let path = self.resolve(path)?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let connection = rusqlite::Connection::open(path)
-                .map_err(|error| HostError::new(error.to_string()))?;
-            connection
-                .execute_batch(
-                    r#"
-                    PRAGMA journal_mode = MEMORY;
-                    PRAGMA synchronous = OFF;
-                    PRAGMA temp_store = MEMORY;
-                    "#,
-                )
-                .map_err(|error| HostError::new(error.to_string()))?;
-            Ok(Box::new(TestSqliteConnection { connection }))
-        }
-    }
-
-    /// Wraps one rusqlite connection in the host SQLite trait.
-    struct TestSqliteConnection {
-        connection: rusqlite::Connection,
-    }
-
-    impl RuntimeSqliteConnection for TestSqliteConnection {
-        /// Executes one SQL batch on the wrapped connection.
-        #[allow(non_snake_case)]
-        fn executeBatch(&mut self, sql: &str) -> HostResult<()> {
-            self.connection
-                .execute_batch(sql)
-                .map_err(|error| HostError::new(error.to_string()))
-        }
-
-        /// Executes one parameterized SQL statement on the wrapped connection.
-        fn execute(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<usize> {
-            let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
-            self.connection
-                .execute(sql, rusqlite::params_from_iter(params))
-                .map_err(|error| HostError::new(error.to_string()))
-        }
-
-        /// Queries rows from the wrapped connection.
-        fn query(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<Vec<SqliteRow>> {
-            querySqliteRows(&self.connection, sql, params)
-        }
-
-        /// Returns the last inserted row id for the wrapped connection.
-        #[allow(non_snake_case)]
-        fn lastInsertRowId(&self) -> HostResult<i64> {
-            Ok(self.connection.last_insert_rowid())
-        }
-
-        /// Starts one SQLite transaction on the wrapped connection.
-        #[allow(non_snake_case)]
-        fn beginTransaction(&mut self) -> HostResult<Box<dyn RuntimeSqliteTransaction + '_>> {
-            let transaction = self
-                .connection
-                .transaction()
-                .map_err(|error| HostError::new(error.to_string()))?;
-            Ok(Box::new(TestSqliteTransaction { transaction }))
-        }
-    }
-
-    /// Wraps one rusqlite transaction in the host SQLite transaction trait.
-    struct TestSqliteTransaction<'a> {
-        transaction: rusqlite::Transaction<'a>,
-    }
-
-    impl RuntimeSqliteTransaction for TestSqliteTransaction<'_> {
-        /// Executes one parameterized SQL statement in the transaction.
-        fn execute(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<usize> {
-            let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
-            self.transaction
-                .execute(sql, rusqlite::params_from_iter(params))
-                .map_err(|error| HostError::new(error.to_string()))
-        }
-
-        /// Queries rows from the transaction.
-        fn query(&mut self, sql: &str, params: Vec<SqliteValue>) -> HostResult<Vec<SqliteRow>> {
-            querySqliteRows(&self.transaction, sql, params)
-        }
-
-        /// Returns the last inserted row id for the transaction.
-        #[allow(non_snake_case)]
-        fn lastInsertRowId(&self) -> HostResult<i64> {
-            Ok(self.transaction.last_insert_rowid())
-        }
-
-        /// Commits the transaction.
-        fn commit(self: Box<Self>) -> HostResult<()> {
-            self.transaction
-                .commit()
-                .map_err(|error| HostError::new(error.to_string()))
-        }
-
-        /// Aborts the test transaction explicitly using the same host contract as production.
-        fn rollback(self: Box<Self>) -> HostResult<()> {
-            self.transaction
-                .rollback()
-                .map_err(|error| HostError::new(error.to_string()))
-        }
-    }
-
-    /// Provides common statement preparation for rusqlite connections and transactions.
-    trait TestRusqliteAccess {
-        /// Prepares one SQL statement against the underlying SQLite object.
-        #[allow(non_snake_case)]
-        fn prepareStatement<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>>;
-    }
-
-    impl TestRusqliteAccess for rusqlite::Connection {
-        /// Prepares one SQL statement against a connection.
-        #[allow(non_snake_case)]
-        fn prepareStatement<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
-            self.prepare(sql)
-        }
-    }
-
-    impl TestRusqliteAccess for rusqlite::Transaction<'_> {
-        /// Prepares one SQL statement against a transaction.
-        #[allow(non_snake_case)]
-        fn prepareStatement<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
-            self.prepare(sql)
-        }
-    }
-
-    /// Queries rows from one rusqlite access object.
-    #[allow(non_snake_case)]
-    fn querySqliteRows(
-        connection: &impl TestRusqliteAccess,
-        sql: &str,
-        params: Vec<SqliteValue>,
-    ) -> HostResult<Vec<SqliteRow>> {
-        let params = params.into_iter().map(toRusqliteValue).collect::<Vec<_>>();
-        let mut statement = connection
-            .prepareStatement(sql)
-            .map_err(|error| HostError::new(error.to_string()))?;
-        let columns = statement
-            .column_names()
-            .into_iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        let mut rows = statement
-            .query(rusqlite::params_from_iter(params))
-            .map_err(|error| HostError::new(error.to_string()))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|error| HostError::new(error.to_string()))?
-        {
-            let mut values = Vec::new();
-            for index in 0..columns.len() {
-                let value = row
-                    .get::<_, rusqlite::types::Value>(index)
-                    .map_err(|error| HostError::new(error.to_string()))?;
-                values.push(fromRusqliteValue(value));
-            }
-            out.push(SqliteRow {
-                columns: columns.clone(),
-                values,
-            });
-        }
-        Ok(out)
-    }
-
-    /// Converts one host SQLite value to rusqlite's value type.
-    #[allow(non_snake_case)]
-    fn toRusqliteValue(value: SqliteValue) -> rusqlite::types::Value {
-        match value {
-            SqliteValue::Null => rusqlite::types::Value::Null,
-            SqliteValue::Integer(value) => rusqlite::types::Value::Integer(value),
-            SqliteValue::Real(value) => rusqlite::types::Value::Real(value),
-            SqliteValue::Text(value) => rusqlite::types::Value::Text(value),
-            SqliteValue::Blob(value) => rusqlite::types::Value::Blob(value),
-        }
-    }
-
-    /// Converts one rusqlite value to the host SQLite value type.
-    #[allow(non_snake_case)]
-    fn fromRusqliteValue(value: rusqlite::types::Value) -> SqliteValue {
-        match value {
-            rusqlite::types::Value::Null => SqliteValue::Null,
-            rusqlite::types::Value::Integer(value) => SqliteValue::Integer(value),
-            rusqlite::types::Value::Real(value) => SqliteValue::Real(value),
-            rusqlite::types::Value::Text(value) => SqliteValue::Text(value),
-            rusqlite::types::Value::Blob(value) => SqliteValue::Blob(value),
         }
     }
 
@@ -3367,16 +3165,14 @@ mod tests {
             .expect("test runtime storage host must expose a workspace root");
         operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost(storage.clone());
         operit_store::RuntimeStorageHost::setDefaultRuntimeSqliteHost(Arc::new(
-            TestSqliteHost::new(runtimeRoot.clone()),
+            operit_host_native_storage::NativeRuntimeStorageHost::new(runtimeRoot.clone(), workspaceRoot.clone()),
         ));
         operit_store::RuntimeStorageHost::setDefaultHostSecretStore(Arc::new(
             TestSecretStore::default(),
         ));
-        operit_util::RuntimeStoreRoot::setDefaultRuntimeStoreRootConfig(
-            operit_util::RuntimeStoreRoot::RuntimeStoreRootConfig::new(runtimeRoot, workspaceRoot),
-        );
+
         let chatRuntimeHolder = Arc::new(tokio::sync::Mutex::new(ChatRuntimeHolder::new(
-            Arc::new(TestFileSystemHost),
+            testFileSystem(),
         )));
         let spaceRuntime = Arc::new(SpaceRuntime::new(chatRuntimeHolder.clone()));
         let sharedClient: Arc<dyn CoreLinkSharedClient + Send + Sync> =
@@ -3660,6 +3456,63 @@ mod tests {
         peer.close();
     }
 
+    /// A stalled input must leave all slots and unrelated route changes available, including newly created chats.
+    #[tokio::test]
+    async fn stalled_chat_upload_keeps_navigation_and_other_chat_routes_available() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let storage = Arc::new(TestRuntimeStorageHost::default());
+        let (runtime, holder) = testLocalRuntimeWithHolder(storage);
+        let active = {
+            let mut holder = holder.lock().await;
+            let manager = &holder.getCore(ChatRuntimeSlot::MAIN).chatHistoryDelegate.chatHistoryManager;
+            for id in ["upload-active", "upload-other"] {
+                manager.saveChatHistory(operit_model::ChatEntity::ChatEntity::new(
+                    id.into(), id.into(), 0).toChatHistory(Vec::new())).unwrap();
+            }
+            manager.beginChatExecution("upload-active").unwrap()
+        };
+        let request = CorePushRequest::new("stalled-chat-upload", CORE_INTERNAL_TARGET, "sendUserMessageStream")
+            .withArgs(operit_link::toCoreValue(serde_json::json!({
+                "promptFunctionType": PromptFunctionType::CHAT, "participantId": null,
+                "chatIdOverride": "upload-active", "expectedByteLength": 3,
+                "proxySenderNameOverride": null, "chatProviderIdOverride": null,
+                "chatModelIdOverride": null, "attachments": [], "replyToMessage": null,
+                "turnOptions": ChatTurnOptions::default(),
+            })).unwrap());
+        let mut input = runtime.spaceRuntime.openPush(request).await.unwrap();
+        // Capacity is one. The second send proves that the actual generated consumer entered its upload wait.
+        for chunk in ["a", "b"] {
+            tokio::time::timeout(Duration::from_secs(2), input.send(CoreValue::String(chunk.into())))
+                .await.expect("the upload consumer must start").unwrap();
+        }
+        {
+            let mut holder = tokio::time::timeout(Duration::from_secs(2), holder.lock()).await
+                .expect("an upload must not reserve every chat runtime");
+            let core = holder.getCore(ChatRuntimeSlot::MAIN);
+            core.switchChatLocal("upload-other".into()).await.unwrap();
+            core.chatHistoryDelegate.chatHistoryManager.saveChatHistory(
+                operit_model::ChatEntity::ChatEntity::new("upload-new".into(), "New Chat".into(), 0)
+                    .toChatHistory(Vec::new())).unwrap();
+            holder.getCore(ChatRuntimeSlot::DETACHED("upload-window".into()))
+                .switchChatLocal("upload-new".into()).await.unwrap();
+        }
+        for id in ["upload-other", "upload-new", "upload-active"] {
+            let response = tokio::time::timeout(Duration::from_secs(2), runtime.callSpace(CoreCallRequest::new(
+                format!("route-{id}"), CORE_INTERNAL_TARGET, "beforeChangeRoute",
+                operit_link::toCoreValue(serde_json::json!({"chatId": id})).unwrap(),
+            ))).await.expect("another chat's route check must not wait for the upload");
+            if id == "upload-active" {
+                assert!(response.result.unwrap_err().message.contains("Conversation is executing"));
+            } else { response.result.unwrap(); }
+        }
+        assert!(input.close().await.unwrap_err().message.contains("Text upload incomplete"));
+        active.release().unwrap();
+        let holder = holder.lock().await;
+        assert!(!holder.cores[&ChatRuntimeSlot::MAIN].chatHistoryDelegate.chatHistoryManager
+            .hasUserMessage("upload-active".into()).unwrap());
+    }
+
     /// Manual selection moves the binding without resuming a turn and preserves it on rejection.
     #[tokio::test]
     async fn manual_chat_execution_device_selection_checks_idle_and_does_not_resume() {
@@ -3872,6 +3725,48 @@ mod tests {
         assert_eq!(stream.send(CoreValue::Null).await.unwrap_err().code, "SPACE_STORAGE_PERMISSION_DENIED");
         assert_eq!(stream.close().await.unwrap_err().code, "SPACE_STORAGE_PERMISSION_DENIED");
         assert_eq!(count.load(Ordering::SeqCst), 1, "no chunk or final commit reaches persistence after revocation");
+    }
+
+    #[tokio::test]
+    async fn storage_stream_checks_current_space_and_profile_after_open() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        for leave in [false, true] {
+            let router = testCoreNodeRouter("stream-local", "stream-peer", "stream-binding");
+            grantTestReplicaRole(&router.networkControlStore, "stream-peer");
+            let count = Arc::new(AtomicUsize::new(0));
+            let mut stream = router.guardPeerSyncPush("stream-peer".into(), "stream-local".into(),
+                router.spaceStore.space().unwrap().spaceId, Box::new(CountingSyncPush(count.clone())));
+            stream.send(CoreValue::Null).await.unwrap();
+            if leave {
+                router.spaceStore.leave().unwrap();
+            } else {
+                let mut profile = router.spaceStore.deviceProfile("stream-peer").unwrap().unwrap();
+                profile.coreVersion = None;
+                profile.updatedAt += 1;
+                router.spaceStore.importDeviceProfiles(vec![profile]).unwrap();
+            }
+            assert_eq!(stream.send(CoreValue::Null).await.unwrap_err().code, "SPACE_STORAGE_PERMISSION_DENIED");
+            assert_eq!(stream.close().await.unwrap_err().code, "SPACE_STORAGE_PERMISSION_DENIED");
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_control_snapshot_releases_model_lock_before_callback() {
+        let _guard = routeTestGlobalLock().lock().await;
+        installTestRuntimeScheduler();
+        let router = testCoreNodeRouter("snapshot-local", "snapshot-peer", "snapshot-binding");
+        grantTestReplicaRole(&router.networkControlStore, "snapshot-peer");
+        router.networkControlStore.withCurrentSpaceState(|space, state| {
+            assert_eq!(space.spaceId, state.spaceId);
+            assert!(state.nodeHasCapability("snapshot-peer", "storage.provide", None).unwrap());
+            router.networkControlStore.setIdentity(operit_store::NetworkControlStore::NetworkControlIdentityAssignment {
+                nodeId: "snapshot-peer".into(), roleId: "edge".into(),
+            }).unwrap();
+            assert!(state.nodeHasCapability("snapshot-peer", "storage.provide", None).unwrap());
+            assert!(!router.networkControlStore.nodeHasCapability("snapshot-peer", "storage.provide", None).unwrap());
+        }).unwrap();
     }
 
     #[tokio::test]
@@ -4381,9 +4276,7 @@ mod tests {
     impl TestRealChatSpaceEndpoint {
         /// Creates a Space endpoint that dispatches through generated ChatServiceCore routes.
         fn new() -> Arc<Self> {
-            let holder = Arc::new(tokio::sync::Mutex::new(ChatRuntimeHolder::new(Arc::new(
-                TestFileSystemHost,
-            ))));
+            let holder = Arc::new(tokio::sync::Mutex::new(ChatRuntimeHolder::new(testFileSystem())));
             let spaceRuntime = Arc::new(SpaceRuntime::new(holder.clone()));
             Arc::new(Self {
                 holder,
@@ -6004,7 +5897,7 @@ mod tests {
         installTestRuntimeScheduler();
         let router = testCoreNodeRouterWithoutBinding("core-node-local-without-binding");
         let _routeGuard = installTestCoreRouteRuntime(Arc::new(router));
-        let mut clientHolder = ChatRuntimeHolder::new(Arc::new(TestFileSystemHost));
+        let mut clientHolder = ChatRuntimeHolder::new(testFileSystem());
         let flow = clientHolder
             .getCore(ChatRuntimeSlot::MAIN)
             .chatMessagesFlow("chat-without-binding-record".to_string())

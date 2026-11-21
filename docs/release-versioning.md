@@ -51,6 +51,7 @@ current prerelease version  -> preview channel
 Stable channel accepts only stable GitHub releases.
 
 Preview channel accepts prerelease and stable GitHub releases.
+Both channels use the main repository and support [incremental updates](incremental-updates.md).
 
 ## GitHub Releases
 
@@ -101,7 +102,7 @@ operit2-cli-macos-aarch64-2.0.0-preview.16.tar.gz
 operit2-app-android-arm64-v8a-2.0.0-preview.16.apk
 operit2-module-android-arm64-v8a-2.0.0-preview.16.zip
 operit2-app-ohos-arm64-2.0.0-preview.16.hap
-operit2-app-windows-x86_64-2.0.0-preview.16.zip
+operit2-app-windows-x86_64-2.0.0-preview.16.msi
 operit2-app-linux-x86_64-2.0.0-preview.16.tar.gz
 operit2-app-macos-universal-2.0.0-preview.16.zip
 operit2-app-ios-arm64-2.0.0-preview.16.zip
@@ -109,8 +110,70 @@ operit2-app-macos-universal-2.0.0-preview.16.pkg
 operit2-firmware-esp32-2432s028-2.0.0-preview.16.zip
 ```
 
-Release packages are published without separate checksum files. CLI archives
+Release packages have authenticated `.update.json` manifests and optional
+`.patch.gz` incremental transfer assets. CLI archives
 contain the executable, installer script, uninstaller script, and README.
+
+Windows App builds produce a Chinese MSI installer from the Flutter release
+directory. Windows App ZIP distribution and ZIP patches are not supported.
+The MSI installs for the current user under
+`%LOCALAPPDATA%\Programs\Operit2`, creates desktop and Start menu shortcuts, and
+registers repair/uninstall in Windows Settings. Upgrades replace the application
+files and preserve the separate user data directory. Windows App releases and
+incremental updates use MSI exclusively. The installer includes the Visual C++ runtime DLLs from the build
+toolchain so users do not need to install a separate redistributable.
+
+MSI packaging requires the .NET 8 SDK or newer. The build restores the pinned WiX
+4.0.6 tool and the DTF custom UI dependency from NuGet. The MSI embeds a WPF
+interface with a custom title bar; Windows 10 1809 x64 or newer includes its .NET
+Framework 4.7.2 runtime. Silent MSI installs continue to use `/qn` without opening
+the interface.
+
+The MSI enables verbose Windows Installer logging through `MsiLogging` for both
+interactive and unattended runs. The embedded interface shows the exact
+`MsiLogFileLocation` and also writes a unique UTF-8 diagnostic log under
+`%LOCALAPPDATA%\Operit\InstallerLogs`, outside the application and user-data
+cleanup directories. Action names and all original errors are retained in order;
+later transaction errors do not replace earlier failures. Known MSI codes have
+Chinese explanations and actionable steps, including 2502/2503 transaction-state
+errors; these codes alone are not treated as proof of a permission problem.
+The default failure screen shows a short reason and the next useful actions;
+the original errors and full report are under a collapsed technical-details
+section. Clipboard export, log viewers, and a log directory button are available
+directly on that screen. Initialization failures explicitly report the log
+location or the reason it could not be created. If failure happens before the
+embedded UI loads, use `msiexec.exe /i "package.msi" /L*V "log-path.log"` to
+capture the system-side failure; instructions ship in `README-Windows.txt`.
+
+Before `InstallValidate`, the `OperitCloseApplications` action registers the
+selected installation's `operit2.exe` with Windows Restart Manager and shuts down
+processes using that exact executable, including hidden windows. The action runs
+for install, update, repair, and direct uninstall, including unattended sessions;
+the nested removal of an older product during upgrade is excluded. It does not
+match processes by name or close copies running from another directory. A shutdown
+failure stops the operation before files change and presents exit instructions.
+Permanent shared-data deletion still requires all copies using that data to exit;
+the frozen cleanup plan is validated after application shutdown and before removal.
+
+Run the normal Windows build to produce both formats:
+
+```powershell
+.\.venv\Scripts\python.exe tools/build_scripts/build_flutter_windows.py --enforce-lockfile
+```
+
+To package an already-built, current-version release directory without recompiling:
+
+```powershell
+.\.venv\Scripts\python.exe tools/build_scripts/build_windows_msi.py
+```
+
+Installer sources and branding live in `tools/windows-installer`; the accessible,
+vector UI is implemented in WPF under `ui/`. MSI's three-number version encodes
+`major.minor.(patch * 1000 + revision)`.
+Revisions use dev 1–199, preview 201–399, rc 401–599, and stable 999. Counters above
+199, unsupported prerelease identifiers, and MSI field overflow fail explicitly.
+The MSI's description and release filename retain the full SemVer. Major upgrades
+block downgrades; rebuilding the same release can replace its previous MSI install.
 
 The filename version matches the Git tag without its leading `v`. The updater
 builds the exact filename from each release's own tag and the requested product,
@@ -184,7 +247,8 @@ tools/release/secrets/github.env
 
 That directory is ignored by git.
 
-Default publish command on Windows:
+Publishing uses the current authenticated `gh` session. The optional
+`--github-env` explicitly loads a credentials file. Default publish command on Windows:
 
 ```powershell
 .\.venv\Scripts\python.exe tools\release\publish_dist.py
@@ -299,7 +363,7 @@ and an `EMSDK` environment variable. It writes the board-specific ZIP bundle to
 full 4 MiB initial-flash image, split flash images, `partitions.csv`, and a
 manifest with verified offsets and SHA-256 digests.
 
-The release scripts read GitHub credentials from:
+Legacy build helpers and an explicit `--github-env` can read GitHub credentials from:
 
 ```text
 tools/release/secrets/github.env
@@ -344,8 +408,9 @@ The build and publish scripts must enforce these rules:
 - Derive the GitHub prerelease flag from the release version.
 - Build only the selected `--scope` assets.
 - Increment Flutter `buildNumber` by 1 after successful App/full asset builds.
-- Publish staged files through the GitHub REST API with `GITHUB_TOKEN`.
-- Check an existing GitHub release's prerelease flag before uploading staged files.
+- Publish staged packages, manifests and deltas through authenticated `gh`.
+- Verify every uploaded GitHub asset digest before publishing the draft.
+- Reject changes to an existing public release; allow retrying its matching draft.
 
 For the first public preview:
 

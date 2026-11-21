@@ -65,18 +65,18 @@ impl AsyncToolExecutor for PackageToolExecutor {
         }
     }
 
-    /// Declares the access boundary for package tools.
+    /// Treats every outer package invocation as a write operation requiring approval in restricted modes.
     #[allow(non_snake_case)]
     fn accessSpec(&self, _tool: &AITool) -> Result<ToolAccessSpec, String> {
         Ok(ToolAccessSpec {
-            effect: ToolEffect::READ,
+            effect: ToolEffect::WRITE,
             boundary: ToolBoundary::None,
         })
     }
 
     /// Uses the same exact SDK request dispatch for streaming and ordinary calls.
     #[allow(non_snake_case)]
-    fn invokeAndStreamAsync<'a>(&'a mut self, tool: &'a AITool, context: &'a crate::ToolExecutionManager::ToolInvocationContext) -> ToolInvocationFuture<'a> {
+    fn invokeAndStreamAsync<'a>(&'a self, tool: &'a AITool, context: &'a crate::ToolExecutionManager::ToolInvocationContext) -> ToolInvocationFuture<'a> {
         let host = context.host().clone();
         let runtime = Arc::new(PackageManagerJsRuntime::new(self.packageManager.clone(), host.clone()));
         let executor = host.runtimeDependencies().js_execution_provider()

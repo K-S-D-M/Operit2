@@ -30,12 +30,15 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             chatInputHooks: [],
             chatViewHooks: [],
             chatMessageHooks: [],
+            messageTransformHooks: [],
+            messageStreamTransforms: [],
             chatLifecycleHooks: [],
             chatMessageMenuItems: [],
             chatRuntimeHooks: [],
             chatResponseHooks: [],
             hostEventHooks: [],
             toolLifecycleHooks: [],
+            toolPermissionHooks: [],
             promptInputHooks: [],
             promptHistoryHooks: [],
             promptEstimateHistoryHooks: [],
@@ -83,6 +86,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                 case 'chat_input_menu_sections':
                 case 'chat_message_after':
                 case 'workspace':
+                case 'workspace_file':
                 case 'workspace_home':
                     return;
                 default:
@@ -94,7 +98,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
         function isEmbeddedUiSurface(surface) {
             return surface === 'chat_sidebar_tabs' || surface === 'chat_input_menu' ||
                 surface === 'chat_input_menu_sections' || surface === 'chat_message_after' ||
-                surface === 'workspace' || surface === 'workspace_home';
+                surface === 'workspace' || surface === 'workspace_file' || surface === 'workspace_home';
         }
 
         /** Requires one already registered package-owned Compose DSL route for an embedded surface. */
@@ -121,33 +125,33 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             if (matches !== 1) throw new Error('registerNavigationEntry.route is duplicated for ' + definition.surface + ': ' + definition.route);
         }
 
-        /** Rejects non-JSON route input before serialization can silently drop or replace values. */
-        function validateNavigationParams(value, ancestors) {
+        /** Rejects non-JSON input before serialization can silently drop or replace values. */
+        function validateJson(value, ancestors, label) {
             if (value === null) return;
             var kind = typeof value;
             if (kind === 'string' || kind === 'boolean') return;
             if (kind === 'number') {
-                if (!Number.isFinite(value)) throw new Error('registerNavigationEntry.params requires finite JSON numbers');
+                if (!Number.isFinite(value)) throw new Error(label + ' requires finite JSON numbers');
                 return;
             }
-            if (kind !== 'object') throw new Error('registerNavigationEntry.params must be JSON');
-            if (ancestors.indexOf(value) !== -1) throw new Error('registerNavigationEntry.params must not be cyclic');
+            if (kind !== 'object') throw new Error(label + ' must be JSON');
+            if (ancestors.indexOf(value) !== -1) throw new Error(label + ' must not be cyclic');
             var prototype = Object.getPrototypeOf(value);
             if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
-                throw new Error('registerNavigationEntry.params requires plain JSON objects');
+                throw new Error(label + ' requires plain JSON objects');
             }
             if (Object.getOwnPropertySymbols(value).length !== 0) {
-                throw new Error('registerNavigationEntry.params must not have symbol properties');
+                throw new Error(label + ' must not have symbol properties');
             }
             ancestors.push(value);
             if (Array.isArray(value)) {
                 for (var index = 0; index < value.length; index += 1) {
-                    validateNavigationParams(value[index], ancestors);
+                    validateJson(value[index], ancestors, label);
                 }
             } else {
                 var keys = Object.keys(value);
                 for (var index = 0; index < keys.length; index += 1) {
-                    validateNavigationParams(value[keys[index]], ancestors);
+                    validateJson(value[keys[index]], ancestors, label);
                 }
             }
             ancestors.pop();
@@ -482,10 +486,23 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             return path;
         }
 
+        /** Validates JSON UI state and sends one lifecycle command to the owner host. */
         function windowCommand(operation, options) {
             if (registrationOnly) throw new Error('Floating windows cannot be used during registration');
             var request = Object.assign({}, options || {}, {operation:operation});
+            if (request.state !== undefined) {
+                if (request.state === null || typeof request.state !== 'object' || Array.isArray(request.state)) {
+                    throw new Error('Floating window state must be a JSON object');
+                }
+                validateJson(request.state, [], 'Floating window state');
+            }
             return root.__operitInvokeHostAsync(root.__operitNativeFloatingWindowCommand, [request]);
+        }
+        /** Sends approval presentation commands through the authenticated execution host. */
+        function permissionCommand(operation, options) {
+            if (registrationOnly) throw new Error('Tool permissions cannot be used during registration');
+            var request = Object.assign({}, options, {operation: operation});
+            return root.__operitInvokeHostAsync(root.__operitNativeToolPermissionCommand, [request]);
         }
         function requireToolPkgApiRuntime() {
             var runtime = root.__operitToolPkgApi;
@@ -513,8 +530,21 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                 capture.publicApis.push(normalizeSpec(normalized));
             },
             callDependency: toolPkgApi.callDependency,
+            toolPermissions: {
+                list: function() { return permissionCommand('list', {}); },
+                respond: function(chatId, requestId, result) {
+                    return permissionCommand('respond', {chatId: chatId, requestId: requestId, result: result});
+                }
+            },
             ui: {
               floatingWindows: {
+                /** Declares visible content or removes the window without manual handle bookkeeping. */
+                set: function(id, content) {
+                    if (content !== null && (!content || typeof content !== 'object' || Array.isArray(content))) {
+                        throw new Error('Floating window content must be an object or null');
+                    }
+                    return windowCommand('set', Object.assign({}, content, {id:id, visible:content !== null}));
+                },
                 capabilities: function() { return windowCommand('capabilities', {}); },
                 requestPermission: function() { return windowCommand('requestPermission', {}); },
                 open: function(options) { return windowCommand('open', options); },
@@ -522,7 +552,13 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                 show: function(id) { return windowCommand('show', {id:id}); },
                 hide: function(id) { return windowCommand('hide', {id:id}); },
                 close: function(id) { return windowCommand('close', {id:id}); },
-                list: function() { return windowCommand('list', {}); }
+                list: function() { return windowCommand('list', {}); },
+                record: function(id, options) {
+                    return windowCommand('record', Object.assign({}, options, {id:id}));
+                },
+                recordingLevel: function(id) { return windowCommand('recordingLevel', {id:id}); },
+                finishRecording: function(id) { return windowCommand('finishRecording', {id:id}); },
+                cancelRecording: function(id) { return windowCommand('cancelRecording', {id:id}); }
               }
             },
             registerToolboxUiModule: registerScreen('toolboxUiModules', 'ToolPkg.registerToolboxUiModule'),
@@ -534,6 +570,14 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                     throw new Error('registerNavigationEntry requires an object');
                 }
                 validateNavigationSurface(definition.surface);
+                if (definition.surface === 'workspace_file') {
+                    var extensions = definition.params && definition.params.extensions;
+                    if (!Array.isArray(extensions) || !extensions.length ||
+                        extensions.some(function(ext) { return typeof ext !== 'string' || !/^[a-z0-9]+(?:[._+-][a-z0-9]+)*$/.test(ext); }) ||
+                        new Set(extensions).size !== extensions.length) {
+                        throw new Error('workspace_file requires unique lowercase params.extensions without leading dots');
+                    }
+                }
                 if (definition.surface === 'chat_attachments' || isEmbeddedUiSurface(definition.surface)) {
                     if (definition.action !== undefined && definition.action !== null) {
                         throw new Error('registerNavigationEntry.action is unsupported for ' + definition.surface);
@@ -544,7 +588,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
                 }
                 if (isEmbeddedUiSurface(definition.surface)) validateEmbeddedRoute(definition);
                 if (Object.prototype.hasOwnProperty.call(definition, 'params')) {
-                    validateNavigationParams(definition.params, []);
+                    validateJson(definition.params, [], 'registerNavigationEntry.params');
                 }
                 var normalized = copyObject(definition, '');
                 if (definition && typeof definition.action === 'function') {
@@ -566,6 +610,8 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             registerChatInputHook: registerFunction('chatInputHooks', 'registerChatInputHook'),
             registerChatViewHook: registerFunction('chatViewHooks', 'registerChatViewHook'),
             registerChatMessageHook: registerFunction('chatMessageHooks', 'registerChatMessageHook'),
+            registerMessageTransformHook: registerFunction('messageTransformHooks', 'registerMessageTransformHook'),
+            registerMessageStreamTransform: registerFunction('messageStreamTransforms', 'registerMessageStreamTransform'),
             /** Captures exactly one exported creation handler for this authenticated package owner. */
             registerChatLifecycleHook: function(definition) {
                 var owner = resolveCurrentToolPkgTarget();
@@ -600,6 +646,7 @@ pub fn buildToolPkgRegistrationBridgeScript(restrictHostCapabilities: bool) -> S
             registerChatResponseHook: registerFunction('chatResponseHooks', 'registerChatResponseHook'),
             registerHostEventHook: registerFunction('hostEventHooks', 'registerHostEventHook'),
             registerToolLifecycleHook: registerFunction('toolLifecycleHooks', 'registerToolLifecycleHook'),
+            registerToolPermissionHook: registerFunction('toolPermissionHooks', 'registerToolPermissionHook'),
             registerPromptInputHook: registerFunction('promptInputHooks', 'registerPromptInputHook'),
             registerPromptHistoryHook: registerFunction('promptHistoryHooks', 'registerPromptHistoryHook'),
             registerPromptEstimateHistoryHook: registerFunction('promptEstimateHistoryHooks', 'registerPromptEstimateHistoryHook'),
@@ -634,6 +681,36 @@ mod tests {
     use super::buildToolPkgRegistrationBridgeScript;
     use crate::toolpkg::ToolPkgApiRuntimeScript::buildToolPkgApiRuntimeScript;
     use operit_host_api::HostJavaScriptRuntime;
+
+    /// Captures durable text handlers without exposing manual display invalidation.
+    #[test]
+    fn captures_message_transform_registration() {
+        let mut context = crate::javascript_test::runtime();
+        context.evaluateHostJavaScriptVoid("test", r#"
+            globalThis.__operitExpose = function(name, value) { globalThis[name] = value; };
+        "#).unwrap();
+        context.evaluateHostJavaScriptVoid("test", &buildToolPkgApiRuntimeScript()).unwrap();
+        context.evaluateHostJavaScriptVoid("test", &buildToolPkgRegistrationBridgeScript(false)).unwrap();
+        context.evaluateHostJavaScriptVoid("test", r#"
+            function transformText(event) { return event.eventPayload.text.replace(/secret/g, ''); }
+            globalThis.__operitGetActiveModuleExports = function() { return { transformText: transformText }; };
+            ToolPkg.registerMessageTransformHook({ id: 'redact', function: transformText });
+            ToolPkg.registerMessageStreamTransform({ id: 'native', function: transformText });
+        "#).unwrap();
+        let capture = context.evaluateHostJavaScriptString("test",
+            "JSON.stringify(globalThis.__operitToolPkgRegistrationCapture.messageTransformHooks.map(JSON.parse))").unwrap();
+        let hooks: serde_json::Value = serde_json::from_str(&capture).unwrap();
+        assert_eq!(hooks[0]["id"], "redact");
+        assert_eq!(hooks[0]["function"], "transformText");
+        let capture = context.evaluateHostJavaScriptString("test",
+            "JSON.stringify(globalThis.__operitToolPkgRegistrationCapture.messageStreamTransforms.map(JSON.parse))").unwrap();
+        let hooks: serde_json::Value = serde_json::from_str(&capture).unwrap();
+        assert_eq!(hooks[0]["id"], "native");
+        assert_eq!(hooks[0]["function"], "transformText");
+        assert_eq!(context.evaluateHostJavaScriptString("test", "typeof ToolPkg.invalidateMessageTransforms").unwrap(), "undefined");
+        assert!(context.evaluateHostJavaScriptVoid("test",
+            "ToolPkg.registerMessageTransformHook({ id: 'invalid', function: 42 })").is_err());
+    }
 
     /// Verifies runtime marketplace markers can be evaluated repeatedly without capture side effects.
     #[test]
@@ -728,5 +805,50 @@ mod tests {
             assert_eq!(command_name, "hello");
             assert_eq!(function_name, "runHello");
         }
+    }
+
+    /// Verifies the unexported-handler error names the constraint and explains the fix.
+    #[test]
+    fn unexported_core_command_handler_error_guides_export() {
+        let mut context = crate::javascript_test::runtime();
+        context
+            .evaluateHostJavaScriptVoid(
+                "test",
+                r#"
+                globalThis.__operitExpose = function(name, value) {
+                    globalThis[name] = value;
+                };
+                "#,
+            )
+            .expect("runtime expose should evaluate");
+        context
+            .evaluateHostJavaScriptVoid("test", &buildToolPkgApiRuntimeScript())
+            .expect("toolpkg api runtime should evaluate");
+        context
+            .evaluateHostJavaScriptVoid("test", &buildToolPkgRegistrationBridgeScript(false))
+            .expect("runtime bridge should evaluate");
+        let error = context
+            .evaluateHostJavaScriptVoid(
+                "test",
+                r#"
+                function localHandler(event) { return { stdout: 'hi' }; }
+                globalThis.__operitGetActiveModuleExports = function() { return {}; };
+                ToolPkg.registerCoreCommand({
+                    id: 'bad',
+                    name: 'bad',
+                    function: localHandler
+                });
+                "#,
+            )
+            .expect_err("unexported handler should fail registration");
+        let message = format!("{error}");
+        assert!(
+            message.contains("exported ToolPkg function reference"),
+            "error should name the constraint: {message}"
+        );
+        assert!(
+            message.contains("export the handler"),
+            "error should explain the fix: {message}"
+        );
     }
 }

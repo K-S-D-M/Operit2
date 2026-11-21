@@ -1,5 +1,7 @@
 // ignore_for_file: file_names
 
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../../theme/OperitTheme.dart';
@@ -32,6 +34,12 @@ class EnhancedTableBlock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) => _buildTable(context),
+    );
+  }
+
+  Widget _buildTable(BuildContext context) {
     final parsed = _parseTable(tableText);
     final rows = parsed.rows;
     final alignments = parsed.alignments;
@@ -87,7 +95,8 @@ class EnhancedTableBlock extends StatelessWidget {
                 scrollDirection: Axis.horizontal,
                 physics: const BouncingScrollPhysics(),
                 child: Table(
-                  defaultColumnWidth: const IntrinsicColumnWidth(),
+                  key: ValueKey(maxColumns),
+                  defaultColumnWidth: const _MarkdownTableColumnWidth(),
                   border: TableBorder(
                     horizontalInside: BorderSide(
                       color: grid,
@@ -113,7 +122,6 @@ class EnhancedTableBlock extends StatelessWidget {
                             ConstrainedBox(
                               constraints: const BoxConstraints(
                                 minWidth: tableMinColumnWidth,
-                                maxWidth: tableMaxColumnWidth,
                               ),
                               child: Padding(
                                 padding: const EdgeInsets.symmetric(
@@ -145,6 +153,25 @@ class EnhancedTableBlock extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+/// Keeps prose compact while allowing indivisible formulas to fit their column.
+class _MarkdownTableColumnWidth extends IntrinsicColumnWidth {
+  const _MarkdownTableColumnWidth();
+
+  /// Reserves the minimum content width even beyond the preferred text width.
+  @override
+  double maxIntrinsicWidth(Iterable<RenderBox> cells, double containerWidth) {
+    return math
+        .max(
+          super.minIntrinsicWidth(cells, containerWidth),
+          math.min(
+            tableMaxColumnWidth,
+            super.maxIntrinsicWidth(cells, containerWidth),
+          ),
+        )
+        .ceilToDouble();
   }
 }
 
@@ -235,8 +262,10 @@ class _MarkdownTableCellTextState extends State<_MarkdownTableCellText> {
     super.dispose();
   }
 
+  /// Keeps asynchronous snapshots scoped to the cell source they describe.
   @override
   Widget build(BuildContext context) => FutureBuilder<List<MarkdownNodeStable>>(
+    key: ValueKey(widget.text),
     future: _nodes,
     builder: (context, snapshot) {
       _gestures.beginFrame();
@@ -251,6 +280,9 @@ class _MarkdownTableCellTextState extends State<_MarkdownTableCellText> {
                   textColor: widget.textColor,
                   baseStyle: widget.style,
                   gestures: _gestures,
+                  // Table formulas align to the line center and need no dry
+                  // alphabetic baseline during intrinsic column measurement.
+                  inlineMathAlignment: PlaceholderAlignment.middle,
                 ),
           textAlign: widget.textAlign,
           style: widget.style,

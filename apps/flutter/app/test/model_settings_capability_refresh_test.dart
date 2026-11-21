@@ -13,12 +13,439 @@ import 'package:operit2/data/preferences/UserPreferencesManager.dart';
 import 'package:operit2/l10n/generated/app_localizations.dart';
 import 'package:operit2/ui/features/settings/model/ModelSettingsPanel.dart';
 import 'package:operit2/ui/features/chat/components/style/input/agent/AgentChatInputSection.dart';
+import 'package:operit2/ui/features/chat/components/style/input/agent/AgentModelSelectorPopup.dart';
 import 'package:operit2/ui/features/chat/viewmodel/ChatViewModel.dart';
 import 'package:operit2/ui/features/settings/model/ProviderLogo.dart';
 import 'package:operit2/ui/theme/OperitTheme.dart';
 
+/// Describes one authenticated model participant for the Core bridge fixture.
+Map<String, Object?> _participantModel({required bool followsGlobal}) => {
+  'id': 'role',
+  'name': 'Fixed role',
+  'followsGlobal': followsGlobal,
+  'binding': {'providerId': 'test-provider', 'modelId': 'test-model'},
+};
+
 void main() {
+  for (final missingProvider in [true, false]) {
+    testWidgets(
+      'model selector repairs a missing ${missingProvider ? 'provider' : 'model'} binding',
+      (tester) async {
+        final bridge = _ModelSettingsBridge()
+          ..chatBinding = core.FunctionModelBinding(
+            providerId: missingProvider ? 'removed-provider' : 'test-provider',
+            modelId: 'removed-model',
+            followsChat: false,
+          );
+        var dismissed = false;
+        String? selectedModel;
+        await tester.pumpWidget(
+          _themed(
+            Center(
+              child: AgentModelSelectorPopup(
+                viewModel: ChatViewModel(bridge: bridge),
+                onDismiss: () => dismissed = true,
+                onModelChanged: (modelId, {providerTypeId, providerName}) =>
+                    selectedModel = modelId,
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(bridge.thinkingCalls, 0);
+        expect(find.byType(AgentThinkingLevelRow), findsNothing);
+        expect(tester.takeException(), isNull);
+        await tester.tap(find.text('Test Provider').first);
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('test-model').last);
+        await tester.pumpAndSettle();
+        expect(selectedModel, 'test-model');
+        expect(bridge.chatBinding.providerId, 'test-provider');
+        expect(bridge.chatBinding.modelId, 'test-model');
+        expect(dismissed, isTrue);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
+  testWidgets(
+    'fixed conversation shows its actual model and prevents a global switch',
+    (tester) async {
+      final bridge = _ModelSettingsBridge()
+        ..chatBinding = const core.FunctionModelBinding(
+          providerId: 'other-provider',
+          modelId: 'expensive-global-model',
+          followsChat: false,
+        )
+        ..participantModels = [_participantModel(followsGlobal: false)];
+      await tester.pumpWidget(
+        _themed(
+          Center(
+            child: AgentModelSelectorPopup(
+              viewModel: ChatViewModel(bridge: bridge),
+              currentChatId: 'fixed-chat',
+              onDismiss: () {},
+              onModelChanged: (id, {providerTypeId, providerName}) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(bridge.requestedModelChatId, 'fixed-chat');
+      expect(find.text('test-model'), findsOneWidget);
+      expect(find.text('expensive-global-model'), findsNothing);
+      expect(find.textContaining('固定模型'), findsWidgets);
+      expect(bridge.thinkingCalls, 1);
+      expect(bridge.modelSelectionWrites, 0);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'model selection rechecks fixed binding before applying a stale global picker choice',
+    (tester) async {
+      final bridge = _ModelSettingsBridge()
+        ..participantModels = [_participantModel(followsGlobal: true)];
+      await tester.pumpWidget(
+        _themed(
+          Center(
+            child: AgentModelSelectorPopup(
+              viewModel: ChatViewModel(bridge: bridge),
+              currentChatId: 'changed-chat',
+              onDismiss: () {},
+              onModelChanged: (id, {providerTypeId, providerName}) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Test Provider').first);
+      await tester.pumpAndSettle();
+      bridge.participantModels = [_participantModel(followsGlobal: false)];
+      await tester.tap(find.text('test-model').last);
+      await tester.pumpAndSettle();
+      expect(bridge.modelSelectionWrites, 0);
+      expect(find.textContaining('当前会话包含固定模型'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'mixed group lists all sender models without choosing one or editing global thinking',
+    (tester) async {
+      final bridge = _ModelSettingsBridge()
+        ..participantModels = [
+          _participantModel(followsGlobal: true),
+          {
+            'id': 'second',
+            'name': 'Second role',
+            'followsGlobal': false,
+            'binding': {
+              'providerId': 'second-provider',
+              'modelId': 'second-model',
+            },
+          },
+        ];
+      await tester.pumpWidget(
+        _themed(
+          Center(
+            child: AgentModelMenuSection(
+              viewModel: ChatViewModel(bridge: bridge),
+              currentChatId: 'group-chat',
+              onDismiss: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('test-model'), findsOneWidget);
+      expect(find.text('second-model'), findsOneWidget);
+      expect(bridge.thinkingCalls, 0);
+      expect(bridge.modelSelectionWrites, 0);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'composer changes actual models when switching between fixed and global chats',
+    (tester) async {
+      final bridge = _ObservableModelSettingsBridge()
+        ..chatBinding = const core.FunctionModelBinding(
+          providerId: 'global-provider',
+          modelId: 'global-model',
+          followsChat: false,
+        )
+        ..participantModels = [_participantModel(followsGlobal: false)];
+      addTearDown(bridge.close);
+      final controller = TextEditingController();
+      final focus = FocusNode();
+      addTearDown(controller.dispose);
+      addTearDown(focus.dispose);
+      final viewModel = ChatViewModel(bridge: bridge);
+      var chatId = 'fixed-chat';
+      late StateSetter update;
+      await tester.pumpWidget(
+        _themed(
+          StatefulBuilder(
+            builder: (context, setState) {
+              update = setState;
+              return AgentChatInputSection(
+                controller: controller,
+                focusNode: focus,
+                isLoading: false,
+                inputState: core.InputProcessingState.idle(),
+                viewModel: viewModel,
+                currentChatId: chatId,
+                onSendMessage: () {},
+                onQueueMessage: () {},
+                onCancelMessage: () {},
+                isSpeechRecording: false,
+                isSpeechTranscribing: false,
+                onSpeechInput: () {},
+              );
+            },
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('固定 · test-model'), findsOneWidget);
+      expect(find.text('global-model'), findsNothing);
+      bridge.participantModels = [
+        {
+          'id': 'model:chat',
+          'name': 'Only model',
+          'followsGlobal': true,
+          'binding': {
+            'providerId': 'global-provider',
+            'modelId': 'global-model',
+          },
+        },
+      ];
+      update(() => chatId = 'global-chat');
+      await tester.pumpAndSettle();
+      expect(find.text('global-model'), findsOneWidget);
+      expect(find.text('固定 · test-model'), findsNothing);
+      expect(bridge.requestedModelChatId, 'global-chat');
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
   setUp(ClientLogger.initialize);
+  testWidgets(
+    'provider editor validates and persists the pool under advanced settings',
+    (tester) async {
+      final bridge = _ModelSettingsBridge();
+      final panelKey = GlobalKey<ModelSettingsPanelState>();
+      await _pumpModelSettings(tester, bridge, panelKey);
+      final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+      await tester.tap(find.text('Test Provider'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip(l10n.settingsModelEditProvider));
+      await tester.pumpAndSettle();
+      final advanced = find.text(l10n.settingsAdvanced);
+      final toggle = find.byKey(const ValueKey('api-key-pool-toggle'));
+      expect(toggle, findsNothing);
+      await tester.ensureVisible(advanced);
+      await tester.tap(advanced);
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(toggle);
+      await tester.tap(toggle);
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(advanced);
+      await tester.tap(advanced);
+      await tester.pumpAndSettle();
+      expect(toggle, findsNothing);
+      await tester.tap(find.text(l10n.save).last);
+      await tester.pumpAndSettle();
+      expect(bridge.savedProvider, isNull);
+      expect(find.text(l10n.settingsModelPoolNoEligible), findsOneWidget);
+      await tester.ensureVisible(find.text(l10n.settingsModelAddApiKey));
+      await tester.tap(find.text(l10n.settingsModelAddApiKey));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const ValueKey('pool-key-input')),
+        'first-key\nsecond-key',
+      );
+      await tester.tap(find.text(l10n.save).last);
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(advanced);
+      await tester.tap(advanced);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(l10n.save).last);
+      await tester.pumpAndSettle();
+      final saved = bridge.savedProvider!;
+      expect(saved.id, bridge.provider.id);
+      expect(saved.models.single.id, 'test-model');
+      expect(saved.useMultipleApiKeys, isTrue);
+      expect(saved.apiKeyPool.map((entry) => entry.key), [
+        'first-key',
+        'second-key',
+      ]);
+      expect(saved.apiKeyPool.map((entry) => entry.id).toSet(), hasLength(2));
+      expect(tester.takeException(), isNull);
+    },
+  );
+  for (final downloadedAt in <int?>[null, 1794000000000]) {
+    testWidgets(
+      'catalog update failure keeps model picker usable at $downloadedAt',
+      (tester) async {
+        final bridge = _ModelSettingsBridge()..catalogUpdatedAt = downloadedAt;
+        final panelKey = GlobalKey<ModelSettingsPanelState>();
+        await _pumpModelSettings(tester, bridge, panelKey);
+        final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byTooltip(l10n.settingsModelAddModel));
+        await tester.pumpAndSettle();
+        expect(find.text('new-model'), findsOneWidget);
+        expect(find.textContaining('fixture catalog offline'), findsNothing);
+        if (downloadedAt == null) {
+          expect(find.text(l10n.settingsModelCatalogBundled), findsOneWidget);
+        }
+        await tester.tap(find.text(l10n.settingsModelCatalogRetry));
+        await tester.pumpAndSettle();
+        expect(bridge.catalogRefreshCalls, 1);
+        expect(find.text('new-model'), findsOneWidget);
+        expect(find.textContaining('fixture catalog offline'), findsNothing);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+  for (final success in [true, false]) {
+    testWidgets(
+      'completed ${success ? 'passed' : 'failed'} connection checks restore after reopening settings',
+      (tester) async {
+        final bridge = _ModelSettingsBridge()..connectionTestSucceeds = success;
+        var panelKey = GlobalKey<ModelSettingsPanelState>();
+        await _pumpModelSettings(tester, bridge, panelKey);
+        final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+        final closeTooltip = MaterialLocalizations.of(
+          panelKey.currentContext!,
+        ).closeButtonTooltip;
+        final statusLabel = success
+            ? l10n.settingsModelConnectionTestPassed
+            : l10n.settingsModelConnectionTestFailed;
+        final status = find.byWidgetPredicate(
+          (widget) =>
+              widget is Semantics && widget.properties.label == statusLabel,
+        );
+
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        expect(status, findsNothing);
+        await tester.tap(find.text(l10n.settingsModelTestAll));
+        await tester.pumpAndSettle();
+        expect(status, findsOneWidget);
+        expect(bridge.connectionTestCalls, 1);
+        await tester.tap(find.byTooltip(closeTooltip).last);
+        await tester.pumpAndSettle();
+
+        panelKey = GlobalKey<ModelSettingsPanelState>();
+        await _pumpModelSettings(tester, bridge, panelKey);
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        expect(status, findsOneWidget);
+        expect(bridge.connectionTestCalls, 1);
+        if (!success) {
+          await tester.tap(status);
+          await tester.pumpAndSettle();
+          expect(find.text('HTTP 503'), findsOneWidget);
+          // A tooltip inside the result bubble must be able to resolve its
+          // anchor during layout, before the bubble is painted.
+          await tester.longPress(find.byTooltip(l10n.settingsModelCopyError));
+          await tester.pumpAndSettle();
+          expect(find.text(l10n.settingsModelCopyError), findsOneWidget);
+        }
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  for (final statusCode in [402, 429]) {
+    testWidgets(
+      'restricted $statusCode results persist without counting as failures',
+      (tester) async {
+        final bridge = _ModelSettingsBridge()
+          ..connectionTestSucceeds = false
+          ..connectionTestError =
+              'request failed: $statusCode: upstream restriction';
+        final panelKey = GlobalKey<ModelSettingsPanelState>();
+        await _pumpModelSettings(tester, bridge, panelKey);
+        final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+        final closeTooltip = MaterialLocalizations.of(
+          panelKey.currentContext!,
+        ).closeButtonTooltip;
+        final restricted = find.byWidgetPredicate(
+          (widget) =>
+              widget is Semantics &&
+              widget.properties.label ==
+                  l10n.settingsModelConnectionTestRestricted,
+        );
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text(l10n.settingsModelTestAll));
+        await tester.pumpAndSettle();
+        expect(restricted, findsOneWidget);
+        expect(
+          find.text(l10n.settingsModelTestSummaryWithRestricted(0, 0, 1)),
+          findsOneWidget,
+        );
+        expect(bridge.connectionTestCalls, 1);
+        await tester.tap(find.byTooltip(closeTooltip).last);
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Test Provider'));
+        await tester.pumpAndSettle();
+        expect(restricted, findsOneWidget);
+        expect(bridge.connectionTestCalls, 1);
+        await tester.tap(restricted);
+        await tester.pumpAndSettle();
+        final reason = statusCode == 402
+            ? l10n.settingsModelTestCreditRestricted
+            : l10n.settingsModelTestRateRestricted;
+        expect(
+          find.text('${l10n.settingsModelTestItemChat} · $reason'),
+          findsOneWidget,
+        );
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets('checks completed after closing the dialog restore on reopen', (
+    tester,
+  ) async {
+    final gate = Completer<void>();
+    final bridge = _ModelSettingsBridge()..connectionTestGate = gate;
+    final panelKey = GlobalKey<ModelSettingsPanelState>();
+    await _pumpModelSettings(tester, bridge, panelKey);
+    final l10n = AppLocalizations.of(panelKey.currentContext!)!;
+    final closeTooltip = MaterialLocalizations.of(
+      panelKey.currentContext!,
+    ).closeButtonTooltip;
+    await tester.tap(find.text('Test Provider'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(l10n.settingsModelTestAll));
+    await tester.pump();
+    expect(bridge.connectionTestCalls, 1);
+    await tester.tap(find.byTooltip(closeTooltip).last);
+    await tester.pumpAndSettle();
+    gate.complete();
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Test Provider'));
+    await tester.pumpAndSettle();
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is Semantics &&
+            widget.properties.label == l10n.settingsModelConnectionTestPassed,
+      ),
+      findsOneWidget,
+    );
+    expect(bridge.connectionTestCalls, 1);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets(
     'inline capability saves refresh the outer function model snapshot',
     (tester) async {
@@ -202,7 +629,8 @@ void main() {
       bridge.emitBindings(const {});
       await tester.pumpAndSettle();
       expect(find.text('deepseek-flash'), findsNothing);
-      expect(find.byType(ProviderLogo), findsNothing);
+      expect(find.text('模型配置不可用'), findsOneWidget);
+      expect(logo().providerTypeId, isEmpty);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
       await tester.pumpAndSettle();
@@ -234,10 +662,23 @@ Future<void> _pumpModelSettings(
 }
 
 class _ModelSettingsBridge extends OperitRuntimeBridge {
+  core.ProviderProfile? savedProvider;
   core.FunctionModelBinding chatBinding = binding;
   String modelId = binding.modelId;
   String? resolutionError;
   int resolutionCalls = 0;
+  int thinkingCalls = 0;
+  int modelSelectionWrites = 0;
+  bool missingChatBinding = false;
+  List<Map<String, Object?>>? participantModels;
+  String? requestedModelChatId;
+  int? catalogUpdatedAt;
+  int catalogRefreshCalls = 0;
+  bool connectionTestSucceeds = true;
+  String connectionTestError = 'HTTP 503';
+  int connectionTestCalls = 0;
+  Completer<void>? connectionTestGate;
+  List<Map<String, Object?>> savedConnectionTests = [];
   core.ModelCapabilities capabilities = const core.ModelCapabilities(
     directImage: false,
     directAudio: false,
@@ -252,8 +693,6 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
   static const summarySettings = core.ModelSummarySettings(
     enableSummary: true,
     summaryTokenThreshold: 0.7,
-    enableSummaryByMessageCount: false,
-    summaryMessageCountThreshold: 0,
   );
   static const localRuntime = core.LocalModelRuntimeSettings(
     inferenceBindingKey: '',
@@ -294,22 +733,24 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
     localRuntime: localRuntime,
   );
 
-  core.ProviderProfile get provider => core.ProviderProfile(
-    id: binding.providerId,
-    name: 'Test Provider',
-    providerTypeId: 'OPENAI',
-    providerType: core.ApiProviderType.openai,
-    endpoint: 'https://example.com/v1',
-    apiKey: '',
-    useMultipleApiKeys: false,
-    apiKeyPool: const [],
-    currentKeyIndex: 0,
-    keyRotationMode: 'ROUND_ROBIN',
-    customHeaders: '{}',
-    requestLimitPerMinute: 0,
-    maxConcurrentRequests: 1,
-    models: [model],
-  );
+  core.ProviderProfile get provider =>
+      savedProvider ??
+      core.ProviderProfile(
+        id: binding.providerId,
+        name: 'Test Provider',
+        providerTypeId: 'OPENAI',
+        providerType: core.ApiProviderType.openai,
+        endpoint: 'https://example.com/v1',
+        apiKey: '',
+        useMultipleApiKeys: false,
+        apiKeyPool: const [],
+        currentKeyIndex: 0,
+        keyRotationMode: 'ROUND_ROBIN',
+        customHeaders: '{}',
+        requestLimitPerMinute: 0,
+        maxConcurrentRequests: 1,
+        models: [model],
+      );
 
   core.ResolvedModelConfig get config => core.ResolvedModelConfig(
     providerId: binding.providerId,
@@ -349,8 +790,56 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
   Future<Uint8List> callBytes(CoreCallRequest request) async {
     final Object? result;
     switch (request.methodName) {
+      case 'getToolPkgPublicApiOwners':
+        result = participantModels == null
+            ? []
+            : [
+                core.ToolPkgPublicApiOwner(
+                  containerPackageName: 'model-owner',
+                  apiName: 'chat.configuration.resolve',
+                ).toJson(),
+              ];
+      case 'getToolPkgPublicApis':
+        result = ['chat.model.selection'];
+      case 'invokeToolPkgPublicApi':
+        final payload = (request.args as Map)['payload'] as Map;
+        requestedModelChatId = payload['chatId'] as String?;
+        result = {'participants': participantModels};
+      case 'getAvailableProviderModels':
+        result = [
+          core.AvailableProviderModel(
+            modelId: 'new-model',
+            source: core.AvailableProviderModelSource.remote,
+            catalogModelId: 'new-model',
+            pricing: null,
+            context: contextSpec,
+            capabilities: capabilities,
+            builtinTools: const [],
+            request: config.request,
+            listed: null,
+          ).toJson(),
+        ];
+      case 'refreshModelCatalog':
+      case 'getModelCatalogStatus':
+        if (request.methodName == 'refreshModelCatalog') {
+          catalogRefreshCalls++;
+        }
+        result = core.ModelCatalogStatus(
+          updatedAt: catalogUpdatedAt,
+          lastError: 'fixture catalog offline',
+        ).toJson();
       case 'getModelBindingForFunction':
+        if (missingChatBinding) throw StateError('No chat model binding');
         result = chatBinding.toJson();
+      case 'setModelForFunction':
+        modelSelectionWrites++;
+        final args = request.args as Map;
+        chatBinding = core.FunctionModelBinding(
+          providerId: args['providerId'] as String,
+          modelId: args['modelId'] as String,
+          followsChat: false,
+        );
+        result = null;
       case 'getProviderProfiles':
         result = [provider.toJson()];
       case 'getAllModelSummaries':
@@ -373,6 +862,18 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
           ).toJson(),
         ];
       case 'getThinkingSettingsForModel':
+        thinkingCalls++;
+        final args = request.args as Map;
+        if (args['providerId'] != provider.id || args['modelId'] != modelId) {
+          return encodeCoreLink([
+            1,
+            'COMMAND_ERROR',
+            'model not found',
+            null,
+            null,
+            null,
+          ]);
+        }
         result = const core.ModelThinkingSettings(
           spec: core.ModelThinkingSpec(
             supported: false,
@@ -408,14 +909,58 @@ class _ModelSettingsBridge extends OperitRuntimeBridge {
       case 'updateSummaryForModel':
       case 'updateBuiltinToolsForModel':
         result = model.toJson();
+      case 'getModelConnectionTestResults':
+        result = savedConnectionTests;
+      case 'test_model_connection':
+        connectionTestCalls++;
+        await connectionTestGate?.future;
+        final report = <String, Object?>{
+          'providerId': provider.id,
+          'modelId': modelId,
+          'providerName': provider.name,
+          'providerType': provider.providerTypeId,
+          'success': connectionTestSucceeds,
+          'items': [
+            {
+              'type': 'CHAT',
+              'success': connectionTestSucceeds,
+              'error': connectionTestSucceeds ? null : connectionTestError,
+            },
+          ],
+        };
+        savedConnectionTests = [
+          {
+            'providerId': provider.id,
+            'modelId': modelId,
+            'report': report,
+            'error': null,
+          },
+        ];
+        result = report;
       case 'getAllTtsConfigs':
       case 'getAllSttConfigs':
         result = <Object?>[];
       case 'getCurrentTtsConfigId':
       case 'getSelectedSttConfigId':
         result = '';
+      case 'updateProviderProfile':
+        savedProvider = core.ProviderProfile.fromJson(
+          (request.args as Map)['provider'] as Map<String, Object?>,
+        );
+        result = savedProvider!.toJson();
       case 'getProviderCatalogEntries':
-        result = request.target.contains('Stt')
+        result = request.target == 'core/preferences.modelConfigManager'
+            ? [
+                const core.ProviderCatalogEntry(
+                  providerTypeId: 'OPENAI',
+                  displayName: 'OpenAI',
+                  defaultEndpoint: 'https://example.com/v1',
+                  endpointOptions: [],
+                  operations: [],
+                  models: [],
+                ).toJson(),
+              ]
+            : request.target == 'core/preferences.sttConfigManager'
             ? [
                 const core.SttProviderCatalogEntry(
                   providerTypeId: 'OPENAI_STT',
@@ -495,10 +1040,15 @@ class _ObservableModelSettingsBridge extends _ModelSettingsBridge {
   bool get hasListeners => _bindings.hasListener || _profiles.hasListener;
   void emitBindings(
     Map<core.FunctionType, core.FunctionModelBinding> bindings,
-  ) => _bindings.add({
-    for (final entry in bindings.entries)
-      entry.key.toJson(): entry.value.toJson(),
-  });
+  ) {
+    missingChatBinding = !bindings.containsKey(core.FunctionType.chat);
+    if (!missingChatBinding) chatBinding = bindings[core.FunctionType.chat]!;
+    _bindings.add({
+      for (final entry in bindings.entries)
+        entry.key.toJson(): entry.value.toJson(),
+    });
+  }
+
   void emitProfiles() => _profiles.add([provider.toJson()]);
   Future<void> close() async {
     await _bindings.close();

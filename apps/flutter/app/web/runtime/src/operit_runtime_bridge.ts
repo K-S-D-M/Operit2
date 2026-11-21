@@ -2,7 +2,7 @@ import { createTerminal9p } from "./terminal_9p.js";
 import { createBrowserJavaScriptHost } from "./operit_javascript_runtime.js";
 import { createBrowserHttpStreamHost } from "./browser_http_stream.js";
 import { openBrowserFile } from "./browser_file_open.js";
-import { captureBrowserScreen, readBrowserLocation, recognizeBrowserText,
+import { captureBrowserScreen, readBrowserLocation, recognizeBrowserText, requireBrowserSharedMemory,
   type BrowserOcrEngine } from "./browser_system_capabilities.js";
 
 type JsonValue =
@@ -509,6 +509,8 @@ interface ManagedRuntimeProcess {
 }
 
 interface RuntimeGlobals {
+  __operitReportRuntimePanic?: (message: string) => void;
+  __operitShowWebError?: (source: string, details: string) => void;
   Tesseract?: BrowserOcrEngine;
   __OPERIT_MODEL_INSTALL_WORKER__?: boolean;
   __OPERIT_RUNTIME_WORKER__?: boolean;
@@ -650,6 +652,7 @@ interface RuntimeWorkerLeaderMessage {
   response?: Uint8Array;
   event?: Uint8Array;
   message?: unknown;
+  source?: string;
   module?: string;
   method?: string;
   args?: unknown[];
@@ -735,6 +738,7 @@ interface ModelInstallWorkerError {
 
 (function () {
   const runtimeGlobal = globalThis as typeof globalThis & RuntimeGlobals;
+  runtimeGlobal.__operitReportRuntimePanic = reportRuntimePanic;
   const workerHostModules = new WeakSet<object>();
   const mainHostModules = new WeakSet<object>();
   runtimeGlobal.__operitWorkerHostModules = workerHostModules;
@@ -1798,8 +1802,8 @@ interface ModelInstallWorkerError {
     return key(runtimePrefix, path);
   }
 
-  /** Persists SQLite bytes while restoring the real foreign-key setting reset by sql.js export. */
-  function saveSqliteDatabase(connection: SqliteConnection): void {
+  /** Exports SQLite pages while restoring the foreign-key setting reset by sql.js export. */
+  function exportSqliteDatabase(connection: SqliteConnection): Uint8Array {
     const rows = querySqlite(connection.db, "PRAGMA foreign_keys", []);
     if (rows.length !== 1 || rows[0].values.length !== 1) {
       throw new Error("sqlite foreign_keys query did not return one value");
@@ -1810,7 +1814,12 @@ interface ModelInstallWorkerError {
     }
     const bytes = connection.db.export();
     connection.db.run(`PRAGMA foreign_keys = ${foreignKeys.value}`);
-    storageWrite(runtimePrefix, connection.path, bytes);
+    return bytes;
+  }
+
+  /** Persists a standalone image without altering the live connection's foreign-key policy. */
+  function saveSqliteDatabase(connection: SqliteConnection): void {
+    storageWrite(runtimePrefix, connection.path, exportSqliteDatabase(connection));
   }
 
   function sqliteConnection(id: string): SqliteConnection {
@@ -2646,7 +2655,7 @@ interface ModelInstallWorkerError {
     paths: AsrBundlePaths,
     state: WebLocalInferenceState,
   ): Promise<WebAsrBundle> {
-    requireCrossOriginIsolation("ASR");
+    requireBrowserSharedMemory();
     const urls = {
       recognizerScript: runtimeJavaScriptUrl(
         paths.recognizerScript,
@@ -2699,7 +2708,7 @@ interface ModelInstallWorkerError {
     paths: TtsBundlePaths,
     state: WebLocalInferenceState,
   ): Promise<WebTtsBundle> {
-    requireCrossOriginIsolation("TTS");
+    requireBrowserSharedMemory();
     const urls = {
       ttsScript: runtimeBlobUrl(paths.ttsScript, "text/javascript", state),
       runtimeScript: runtimeBlobUrl(paths.runtimeScript, "text/javascript", state),
@@ -2930,16 +2939,6 @@ self.onmessage = (event) => {
       if (performance.now() >= deadline) {
         throw new Error("Web TTS worker command timed out");
       }
-    }
-  }
-
-  // Requires the response isolation headers needed by threaded Sherpa WASM.
-  function requireCrossOriginIsolation(capability: string): void {
-    if (globalThis.crossOriginIsolated !== true) {
-      throw new Error(
-        `Web local ${capability} requires Cross-Origin-Opener-Policy: same-origin and ` +
-          "Cross-Origin-Embedder-Policy: require-corp",
-      );
     }
   }
 
@@ -3206,7 +3205,7 @@ self.onmessage = (event) => {
 
   /** Creates one worker-backed guest process and schedules its serial deployment frames. */
   function startManagedRuntimeProcess(request: ManagedRuntimeRequest): string {
-    requireCrossOriginIsolation("managed Node/Python runtime");
+    requireBrowserSharedMemory();
     validateManagedRuntimeRequest(request);
     const runtime = guestRuntimeExecutable(request.program);
     const executablePath = request.executablePath?.trim();
@@ -4282,6 +4281,11 @@ self.onmessage = (event) => {
       },
     }),
     sqlite: registerWorkerHostModule({
+      /** Releases the database image retained by a Rust-owned connection. */
+      close(id: string): void {
+        sqliteConnection(id).db.close();
+        sqliteConnections.delete(id);
+      },
       open(path: string): string {
         if (!SQLite) {
           throw new Error("sqlite host is not initialized");
@@ -4716,7 +4720,7 @@ self.onmessage = (event) => {
           availableMemory: "",
           totalStorage: "",
           availableStorage: "",
-          batteryLevel: 0,
+          batteryLevel: -1,
           batteryCharging: false,
           cpuInfo: "",
           networkType: navigator.onLine ? "online" : "offline",
@@ -4741,6 +4745,18 @@ self.onmessage = (event) => {
       module_or_path: new URL("./operit_flutter_bridge_bg.wasm", import.meta.url),
     });
     return new module.OperitFlutterBridgeWasm();
+  }
+
+  /** Preserves Rust's panic location before an asynchronous Wasm trap loses that context. */
+  function reportRuntimePanic(message: string): void {
+    const details = `${message}\n\n${new Error("Rust runtime panic").stack}`;
+    if (isRuntimeWorker()) {
+      runtimeGlobal.postMessage({ type: "runtimeFatalError", source: "Rust panic", message: details });
+    } else if (isModelInstallWorker()) {
+      runtimeGlobal.postMessage({ type: "error", message: details });
+    } else {
+      runtimeGlobal.__operitShowWebError("Rust panic", details);
+    }
   }
 
   async function bridge() {
@@ -5210,6 +5226,7 @@ self.onmessage = (event) => {
     let runtimeWorker: Worker | null = null;
     let releaseLeadership: (() => void) | null = null;
     let closed = false;
+    let runtimeFailure: Error | null = null;
     let nextRequestId = 0;
     let nextRuntimeRequestId = 0;
     const pendingRequests = new Map<number, RuntimeWorkerPendingRequest>();
@@ -5242,6 +5259,7 @@ self.onmessage = (event) => {
       });
       runtimeWorker = worker;
       worker.addEventListener("message", handleRuntimeWorkerMessage);
+      worker.addEventListener("error", handleRuntimeWorkerError);
       worker.postMessage({ type: "configure", clientId });
       coordinator.postMessage({ type: "leaderReady" });
       forwardPendingRequests();
@@ -5285,6 +5303,10 @@ self.onmessage = (event) => {
         return;
       }
       const message = value as RuntimeWorkerLeaderMessage;
+      if (message.type === "runtimeFatalError") {
+        handleClientRuntimeMessage(message);
+        return;
+      }
       if (message.type === "clientDisconnect" && typeof message.clientId === "string") {
         if (runtimeWorker !== null) {
           disconnectLeaderClient(message.clientId);
@@ -5326,6 +5348,12 @@ self.onmessage = (event) => {
 
     /** Registers one globally routed request and dispatches it through the owner worker. */
     function forwardLeaderRequest(request: RuntimeWorkerLeaderRequest): void {
+      if (runtimeFailure !== null) {
+        deliverCoordinatorMessage(request.clientId, {
+          type: "runtimeFatalError", source: "Runtime worker error", message: runtimeFailure.message,
+        });
+        return;
+      }
       const routedRequests = leaderRequestIdsFor(request.clientId);
       if (routedRequests.has(request.clientRequestId)) {
         return;
@@ -5349,6 +5377,10 @@ self.onmessage = (event) => {
     /** Handles a result, event, or synchronous host message produced by the owner worker. */
     function handleRuntimeWorkerMessage(event: MessageEvent<unknown>): void {
       const message = event.data as RuntimeWorkerLeaderMessage;
+      if (message.type === "runtimeFatalError") {
+        publishRuntimeFailure(message);
+        return;
+      }
       if (message.type === "hostCall") {
         forwardLeaderHostCall(message);
         return;
@@ -5360,6 +5392,18 @@ self.onmessage = (event) => {
       if (message.type === "coreResult" || message.type === "coreError" || message.type === "coreWatchEvent") {
         forwardLeaderRuntimeReply(message);
       }
+    }
+
+    /** Delivers an uncaught worker exception with its source location to every runtime client. */
+    function handleRuntimeWorkerError(event: ErrorEvent): void {
+      const details = `${event.message}\n${event.filename}:${event.lineno}:${event.colno}`;
+      publishRuntimeFailure({ type: "runtimeFatalError", source: "Runtime worker error", message: details });
+    }
+
+    /** Broadcasts the owner's terminal failure without restarting the failed Wasm instance. */
+    function publishRuntimeFailure(message: RuntimeWorkerLeaderMessage): void {
+      coordinator.postMessage(message);
+      handleClientRuntimeMessage(message);
     }
 
     /** Routes one owner-worker reply to the page that issued its original Core request. */
@@ -5446,6 +5490,12 @@ self.onmessage = (event) => {
 
     /** Handles a result, Watch event, or synchronous Host phase delivered to this browser page. */
     function handleClientRuntimeMessage(message: RuntimeWorkerLeaderMessage): void {
+      if (message.type === "runtimeFatalError") {
+        runtimeFailure ??= new Error(String(message.message));
+        rejectRuntimeRequests(runtimeFailure);
+        runtimeGlobal.__operitShowWebError(message.source, String(message.message));
+        return;
+      }
       if (message.type === "coreResult" && typeof message.id === "number" && message.response instanceof Uint8Array) {
         const pending = pendingRequests.get(message.id);
         if (pending !== undefined) {
@@ -5484,6 +5534,9 @@ self.onmessage = (event) => {
       payload: Uint8Array | string,
       onWatchEvent?: (event: Uint8Array) => void,
     ): Promise<{ id: number; response: Uint8Array }> {
+      if (runtimeFailure !== null) {
+        return Promise.reject(runtimeFailure);
+      }
       if (closed) {
         return Promise.reject(new Error("runtime page coordinator is closed"));
       }

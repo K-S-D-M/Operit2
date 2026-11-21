@@ -7,6 +7,10 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../../../common/OperitLogoMark.dart';
 import '../../../theme/OperitGlassSurface.dart';
+import '../../../../core/update/AppUpdateController.dart';
+import '../../../../core/update/AppUpdateModels.dart';
+import '../../update/AppUpdateBadge.dart';
+import '../../update/AppUpdateDialog.dart';
 
 final Uri _projectUri = Uri.parse('https://github.com/AAswordman/Operit2');
 final Uri _documentationUri = Uri.parse(
@@ -35,6 +39,8 @@ class AboutOperitScreen extends StatelessWidget {
                 children: <Widget>[
                   _AboutHeader(),
                   SizedBox(height: 24),
+                  _AboutSection(title: '版本更新', child: _AboutUpdateAction()),
+                  SizedBox(height: 12),
                   _AboutSection(
                     title: 'Operit2',
                     child: Text(
@@ -134,6 +140,64 @@ class _AboutHeaderState extends State<_AboutHeader> {
           },
         ),
       ],
+    );
+  }
+}
+
+/// Presents update discovery and progress as an ordinary settings row.
+class _AboutUpdateAction extends StatelessWidget {
+  /// Creates the About-page update entry.
+  const _AboutUpdateAction();
+
+  /// Checks explicitly when needed and opens the shared update flow.
+  Future<void> _openUpdates(
+    BuildContext context,
+    AppUpdateController controller,
+  ) async {
+    if (!controller.visible) await controller.check(force: true);
+    if (!context.mounted) return;
+    if (controller.visible) {
+      await showAppUpdateDialog(context, controller: controller);
+    } else if (controller.error == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('当前已是最新版本')));
+    }
+  }
+
+  /// Uses the same controller and dialog as the sidebar logo.
+  @override
+  Widget build(BuildContext context) {
+    final controller =
+        AppUpdateScope.maybeOf(context) ?? AppUpdateController.instance;
+    return ListenableBuilder(
+      listenable: controller,
+      builder: (context, _) {
+        final colors = Theme.of(context).colorScheme;
+        final checking = controller.phase == AppUpdatePhase.checking;
+        final subtitle = checking
+            ? '正在检查更新…'
+            : controller.visible
+            ? controller.busy
+                  ? '正在更新至 ${controller.release!.version}，点击查看进度'
+                  : '发现新版本 ${controller.release!.version}'
+            : controller.error != null
+            ? '检查更新失败，点击重试'
+            : '点击检查最新版本';
+        return ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(Icons.system_update_alt, color: colors.primary),
+          title: const Text('检查更新'),
+          subtitle: Text(subtitle),
+          trailing: checking
+              ? const SizedBox.square(
+                  dimension: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Icon(Icons.chevron_right, color: colors.onSurfaceVariant),
+          onTap: checking ? null : () => _openUpdates(context, controller),
+        );
+      },
     );
   }
 }

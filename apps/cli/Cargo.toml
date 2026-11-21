@@ -1,6 +1,6 @@
 [package]
 name = "operit-cli"
-version = "2.0.0-preview.30"
+version = "2.0.0-preview.42"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -13,6 +13,8 @@ name = "operit2"
 path = "src/main.rs"
 
 [dependencies]
+operit-host-local-inference = { path = "../../hosts/common/operit-host-local-inference" }
+operit-vfs = { version = "0.1.0", path = "../../core/crates/foundation/vfs" }
 operit-host-data-rescue = { path = "../../hosts/common/operit-host-data-rescue" }
 arboard = "3"
 async-trait = "0.1"
@@ -64,3 +66,7 @@ operit-host-linux-native = { path = "../../hosts/linux", features = ["daemon"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 operit-host-macos-native = { path = "../../hosts/macos", features = ["daemon"] }
+
+# Match core and Flutter: hashing file and SQL snapshots must not use unoptimized SHA rounds.
+[profile.dev.package.sha2]
+opt-level = 2

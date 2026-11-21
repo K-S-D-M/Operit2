@@ -454,6 +454,69 @@ void main() {
     await unmount(tester, bridge);
   });
 
+  testWidgets('offline incompatible members show amber until upgraded', (
+    tester,
+  ) async {
+    final bridge = DeviceSpacePanelBridge(
+      topology: _topology(),
+      control: _control(),
+    );
+    final devices = bridge.topology['devices']! as List<Map<String, Object?>>;
+    devices[0]['protocolVersion'] = 26;
+    devices[1]['protocolVersion'] = 25;
+    devices[1]['online'] = false;
+    await mountPanel(tester, bridge);
+    expect(find.textContaining('版本不兼容 · 连接不可用'), findsWidgets);
+    expect(
+      tester.widget<Icon>(find.byIcon(Icons.link_off_outlined).first).color,
+      Colors.orange.shade800,
+    );
+    devices[1]['protocolVersion'] = 26;
+    devices[1]['online'] = true;
+    bridge.emitDeviceSpaceSnapshot();
+    await tester.pump();
+    await tester.pump();
+    expect(find.textContaining('版本不兼容 · 连接不可用'), findsNothing);
+    expect(tester.takeException(), isNull);
+    await unmount(tester, bridge);
+  });
+
+  testWidgets(
+    'negotiation rejection stays amber with stale matching profiles',
+    (tester) async {
+      final bridge = DeviceSpacePanelBridge(
+        topology: _topology(),
+        control: _control(),
+      );
+      final devices = bridge.topology['devices']! as List<Map<String, Object?>>;
+      devices[0]['protocolVersion'] = 26;
+      devices[1]['protocolVersion'] = 26;
+      devices[1]['online'] = false;
+      bridge.topology['connections'] = <Map<String, Object?>>[
+        <String, Object?>{
+          'firstDeviceId': 'self',
+          'secondDeviceId': 'tablet',
+          'status': 'VersionMismatch',
+          'reason': 'Peer protocol mismatch',
+        },
+      ];
+      await mountPanel(tester, bridge);
+      expect(find.textContaining('版本不兼容 · 连接不可用'), findsWidgets);
+      expect(
+        tester.widget<Icon>(find.byIcon(Icons.link_off_outlined).first).color,
+        Colors.orange.shade800,
+      );
+      bridge.topology['connections'] = <Object?>[];
+      devices[1]['online'] = true;
+      bridge.emitDeviceSpaceSnapshot();
+      await tester.pump();
+      await tester.pump();
+      expect(find.textContaining('版本不兼容 · 连接不可用'), findsNothing);
+      expect(tester.takeException(), isNull);
+      await unmount(tester, bridge);
+    },
+  );
+
   testWidgets(
     'member rows stay readable without device-management capabilities',
     (tester) async {
@@ -584,7 +647,7 @@ void main() {
     // The synchronized Space profile name wins over the pairing-time record.
     expect(find.text('android-tablet'), findsOneWidget);
     expect(find.text('android-elish'), findsNothing);
-    expect(find.textContaining('空间成员 · 已直连'), findsOneWidget);
+    expect(find.textContaining('空间成员 · 已配对'), findsOneWidget);
     final menus = find.byIcon(Icons.more_vert_outlined);
     expect(menus, findsWidgets);
     await tester.tap(menus.first);

@@ -16,7 +16,7 @@ const appearanceUi = readFileSync(resolve(repository, 'apps/flutter/app/lib/ui/f
 const application = readFileSync(resolve(repository, 'core/crates/runtime/application/src/core/application/OperitApplication.rs'), 'utf8');
 const modules = readFileSync(resolve(here, 'mod.rs'), 'utf8');
 const store = readFileSync(resolve(repository, 'core/crates/persistence/store/src/PreferencesDataStore.rs'), 'utf8');
-const paths = readFileSync(resolve(repository, 'core/crates/foundation/util/src/RuntimeStorageLayout.rs'), 'utf8');
+const paths = readFileSync(resolve(repository, 'core/crates/foundation/host-contract/src/RuntimeStorageLayout.rs'), 'utf8');
 const factoryScanner = readFileSync(resolve(repository, 'core/crates/proxy/scan/src/build_scanner.rs'), 'utf8');
 
 const jsonStart = dart.indexOf('Map<String, Object?> toJson()');
@@ -79,7 +79,6 @@ function assertFixtureField(field) {
     case 'Boolean': assert.equal(typeof value, 'boolean', field.name); break;
     case 'OptionalColor': assert.ok(value === null || (Number.isInteger(value) && value >= 0 && value <= 0xffffffff), field.name); break;
     case 'OptionalString': assert.ok(value === null || typeof value === 'string', field.name); break;
-    case 'OptionalEnum': assert.ok(value === null || constraint.allowed.includes(value), field.name); break;
     case 'Enum': assert.ok(constraint.allowed.includes(value), field.name); break;
     case 'Number': assert.ok(typeof value === 'number' && Number.isFinite(value) && value >= constraint.min && value <= constraint.max, field.name); break;
     default: throw new Error(`unrecognized schema rule ${constraint.kind}`);
@@ -144,7 +143,7 @@ test('every field validation rule matches the Flutter declared wire type', () =>
       case 'bool': assert.equal(constraint.kind, 'Boolean', item.name); break;
       case 'int?': assert.equal(constraint.kind, 'OptionalColor', item.name); break;
       case 'double': assert.equal(constraint.kind, 'Number', item.name); break;
-      case 'String?': assert.ok(['OptionalString', 'OptionalEnum'].includes(constraint.kind), item.name); break;
+      case 'String?': assert.equal(constraint.kind, 'OptionalString', item.name); break;
       case 'String': case 'ThemeMode': assert.equal(constraint.kind, 'Enum', item.name); break;
       default: throw new Error(`unclassified Dart type ${type}`);
     }
@@ -174,8 +173,8 @@ test('enum validators match all current ordinary Flutter choices', () => {
   for (const prefix of ['', 'bubbleUser', 'bubbleAi']) {
     const fontType = prefix === '' ? 'fontType' : `${prefix}FontType`;
     const fontName = prefix === '' ? 'systemFontName' : `${prefix}SystemFontName`;
-    assert.deepEqual(rule(field(fontType)).allowed, ['FONT_TYPE_SYSTEM', 'FONT_TYPE_FILE'].map(name => dartConstants.get(name)));
-    assert.deepEqual(rule(field(fontName)).allowed, ['SYSTEM_FONT_DEFAULT', 'SYSTEM_FONT_SERIF', 'SYSTEM_FONT_SANS_SERIF', 'SYSTEM_FONT_MONOSPACE', 'SYSTEM_FONT_CURSIVE'].map(name => dartConstants.get(name)));
+    assert.deepEqual(rule(field(fontType)).allowed, ['FONT_TYPE_SYSTEM', 'FONT_TYPE_FILE', 'FONT_TYPE_DEVICE'].map(name => dartConstants.get(name)));
+    assert.equal(rule(field(fontName)).kind, 'OptionalString');
   }
   for (const name of ['bubbleUserImageRenderMode', 'bubbleAiImageRenderMode']) {
     assert.deepEqual(rule(field(name)).allowed, ['BUBBLE_IMAGE_RENDER_MODE_TILED_NINE_SLICE', 'BUBBLE_IMAGE_RENDER_MODE_NINE_PATCH'].map(name => dartConstants.get(name)));
@@ -237,13 +236,20 @@ test('active deletion is refused and custom selection is explicit', () => {
   assert.doesNotMatch(custom, /\.create\(|\.apply\(/);
 });
 
-/// Verifies strict stored state errors and ordinary consistency without manufactured success values.
-test('corrupt catalog, dangling selection and active ordinary divergence remain errors', () => {
+/// Validates catalog integrity on read and appearance consistency only when committing state.
+test('catalog reads allow appearance divergence while writes require synchronized appearance', () => {
   const read = body(manager, 'readState');
-  assert.match(read, /Some\(value\) => serde_json::from_str::<Vec<ThemeConfig>>\(value\)\?/);
-  assert.match(read, /Some\(value\) => serde_json::from_str::<Option<String>>\(value\)\?/);
   assert.match(read, /validateState\(&state\)\?/);
-  assert.match(read, /assertThemePreferenceSnapshot\(preferences,[\s\S]*findConfig\(&state, id\)\?/);
+  assert.doesNotMatch(read, /assertThemePreferenceSnapshot/);
+  assert.match(body(manager, 'writeState'), /assertThemePreferenceSnapshot\(preferences,[\s\S]*findConfig\(state, id\)\?/);
+});
+
+/// Keeps malformed catalog entries and dangling selections as explicit errors.
+test('corrupt catalog and dangling selection remain errors', () => {
+  const read = body(manager, 'readState');
+  assert.match(read, /serde_json::from_value\(value\.clone\(\)\)\?/);
+  assert.match(read, /Some\(value\) => serde_json::from_value::<Option<String>>\(value\.clone\(\)\)\?/);
+  assert.match(read, /validateState\(&state\)\?/);
   assert.match(body(manager, 'validateState'), /Duplicate theme configuration identifier/);
   assert.match(body(manager, 'findConfigIndex'), /Theme configuration not found/);
   assert.match(body(validator, 'assertThemePreferenceSnapshot'), /active ordinary preference differs/);

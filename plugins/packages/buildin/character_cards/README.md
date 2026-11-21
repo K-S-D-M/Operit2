@@ -23,6 +23,23 @@ This is a recoverable multi-owner operation, not a transaction spanning JSON,
 SQLite and files. Concurrent edits fail explicitly. The space-owned plan declares
 its card references for normal identity remapping during space merges.
 
+## Avatar storage
+
+Selected image bytes are stored under `ToolPkg.getSpaceDataDir()/avatars`, alongside
+the shared character records. The generic Files write/copy path publishes their
+Space file snapshots. Avatar ownership is independent of whether the plugin itself
+is installed in device or Space scope; picker temporary paths are never saved.
+
+On repository startup, avatars referencing the current installation's old
+`getConfigDir()/avatars` directory are copied to shared data before their character
+references are updated. Original files remain intact. An existing target must have
+identical bytes, and concurrent avatar changes reject the migration. Interrupted
+reference publication reuses the verified shared copy on the next initialization.
+Missing originals retain their saved reference and emit an explicit diagnostic;
+their image bytes must be recovered on the device that still has them, restored
+from a backup containing the image, or selected again. A diagnostic log cannot
+recover missing image bytes.
+
 For an old interrupted installation without a plan, open character management in
 the plugin and select **检查初始化数据**. Inspection shows the actual saved card
 and does not adopt it automatically. After reviewing the preservation notice,
@@ -124,14 +141,22 @@ Read-only previews use `src/ui-entity-preview.ts` for a continuous reading layou
 portrait and identity, attached tags, opening statement and populated text sections,
 with named configuration summaries behind one expandable row. Group previews show
 ordered member portraits and descriptions. Edit mode retains the main-style tabs.
-Management's WebView list delegates via `openEntity`; its old entity dialog
-renderers and contracts have been removed. Closing the native surface emits
-`character-entity-closed` so management reloads genuine records, retaining its
-WebView instance. Memory/import dialogs remain independent. Browser tests can run with
+Management lists, shared-library controls, USER.md, memory editors, imports,
+exports, attachment selection and owner settings are ordinary Compose DSL in
+`src/ui-management.ts` and `src/ui-memory-*.ts`. The original sections, separate
+owner graph/profile/settings entries, modal forms and graph inspector are retained.
+The character and group toolbars each combine creation and import in a compact “添加”
+native menu. A shared “绑定对话” action above both sections opens the picker for either
+characters or groups. Management reuses the same native entity editor and refreshes
+canonical records when a local transaction completes.
+
+Only the memory graph canvas uses an offline WebView. Its display-only bridge has
+exactly `load` and `select`; native DSL owns search, folder selection, overflow,
+inspector, camera controls and all mutations. Opening an editor/settings form removes
+the canvas platform view from the composition. Chat identity previews remain scoped
+by `identity.avatarAction`; application/chat title text is display-only.
+Browser tests exercise this canvas with
 `CHARACTER_CARDS_UI_BROWSER=webkit node --test tests/ui.test.mjs`.
-Chat identity previews remain available from avatars through the explicitly
-scoped `identity.avatarAction`. Application/chat title text is display-only and
-never opens that preview. The independent memory page is unchanged.
 
 ## Current Chat integration review
 
@@ -151,6 +176,21 @@ The main registration does **not** yet mount `GroupExecutionController` in a cha
 input-submit hook. Installed production archives also remain different from
 current source until packaging is explicitly performed. Neither gap is described
 as completed integration.
+
+## Composer model selection
+
+The host-only `chat.model.selection` API accepts `{ chatId, defaultModelBinding }`
+and returns `{ participants: [{ id, name, binding: { providerId, modelId }, followsGlobal }] }`.
+It reads the same persisted conversation selection and character model-binding rule
+as execution. A null chat ID projects the active draft selection. Conversations
+without a role association use the existing ordinary model mode. Invalid stored
+bindings remain errors; presentation does not select another model.
+
+Flutter shows the actual bound model and marks fixed roles. Fixed or mixed groups
+list every sender's model and direct edits to character settings. The global picker
+is available when all senders follow global selection, and checks that rule again
+before saving. Thinking controls use the actual single model and are omitted for
+groups with different models. Presentation reads no voice, memory or tool catalogs.
 
 ## Plugin-owned group prompts and configuration deletion
 
@@ -253,12 +293,22 @@ copy that file into their own source tree, import it locally and declare
 `com.operit.character_cards >= 0.2.0` in `requires`, following
 `plugins/docs/PUBLIC_API.md`. Public calls use `ToolPkg.callDependency`.
 
+`characterCards.defaultAvatar()` requires `com.operit.character_cards >= 0.2.8`.
+It returns the shared VFS path of the default Operit avatar for dependency UIs.
+
 `characterCards.memory.query({ participantId, query, limit, snapshotId })`
 resolves the explicit participant's actual memory binding and reuses the
 plugin's existing query implementation. Results contain complete typed
 matches and document chunks; snapshots remain in the provider's main runtime.
 A `null` snapshot ID requests a fresh query. An explicit snapshot ID retains
-owner-scoped deduplication across calls.
+owner-scoped deduplication across calls. Calls sharing an owner and snapshot
+serialize exclusion reads, page retrieval and successful result registration,
+so concurrent callers receive disjoint pages without losing available matches.
+A failed query releases the snapshot and does not consume its memory IDs;
+other owners and snapshots remain independent. Like Operit1, snapshots are
+in memory only and each owner retains at most 32, evicting the least recently
+used. A runtime restart or snapshot eviction can allow previously returned
+memories to be recalled again in a later user turn.
 
 ## Built-in memory recall
 
@@ -267,11 +317,15 @@ The plugin owns per-turn memory recall through its `before_process` input hook
 participant, it strips host markup from the authored input and queries that
 participant's primary
 memory owner with a per-chat snapshot for owner-scoped deduplication, and
-appends the configured number of matches as a `<memory_context>` block before
-the host commits the user message. The block persists with that user message
+appends the configured number of matches as an inline `<attachment>` with
+`id="character_memory_recall"`, `filename="相关记忆"`, and `type="text/plain"`
+before the host commits the user message. Its XML-escaped text is recognized
+by the Dart UI as supplementary information. The block persists with that user message
 and is reused in later history and regeneration requests, preserving the
 previous prompt prefix for model caching. Input that already contains the
-block skips retrieval, including after a plugin restart. An empty result
+block skips retrieval, including after a plugin restart. Legacy
+`<memory_context source="character-memory">` blocks also skip retrieval to
+preserve stored prompts. An empty result
 injects nothing. Retrieval exceptions are logged and skip injection; host hook
 timeouts still follow the shared pre-hook timeout policy. Group `record_only`
 submissions and their empty-input continuations bypass this input hook; the
@@ -358,7 +412,8 @@ vectors. Source text and its vector occupy one synchronized, versioned row; quer
 vectors are ephemeral. SQL applies owner/folder/time scope, scoring, graph expansion,
 snapshot exclusions and result limits before returning records. There is no retained
 TypeScript corpus or query-time construction of historical vectors. HTTP batches
-contain at most 64 inputs and use at most four concurrent workers. Failed jobs stay
+use the owner's saved input batch size (20 by default) and at most four concurrent workers.
+The history rebuild window size is also saved per owner (32 by default, range 8–48). Failed jobs stay
 terminal without automatic retry. Merge removes source
 chunks and internal links that would become self-links under this domain's invariant.
 
@@ -369,7 +424,7 @@ requires running the updated application.
 
 ### 原生实体弹窗
 
-从头像或角色侧栏打开的角色卡/群组预览和编辑由 `src/ui-entity-native.ts` 使用普通 Compose DSL 控件生成，不加载 WebView/HTML，也不复用宿主的角色业务控件。预览、编辑、删除确认和标签草稿在同一个原生 Dialog 中切换；保存使用原有主运行时请求，完成/取消仍使用真实的 PresentationV1 接收方。全屏/还原使用通用 `Dialog.properties.fullscreen`，全屏时移除平台弹窗边距并铺满可用窗口，而非扩大 WebView 内部元素。管理页列表仍保留 WebView，但创建、编辑、预览统一通过 `openEntity` 调用这一套原生实现；旧 WebView 角色卡/群组弹窗及其绑定、标签编辑实现已删除。记忆功能仍保留原有独立入口。
+从头像或角色侧栏打开的角色卡/群组预览和编辑由 `src/ui-entity-native.ts` 使用普通 Compose DSL 控件生成，不加载 WebView/HTML，也不复用宿主的角色业务控件。预览、编辑、删除确认和标签草稿在同一个原生 Dialog 中切换；保存使用原有主运行时请求，完成/取消仍使用真实的 PresentationV1 接收方。全屏/还原使用通用 `Dialog.properties.fullscreen`，全屏时移除平台弹窗边距并铺满可用窗口，而非扩大 WebView 内部元素。管理页列表、批量绑定、导入导出、共享记忆库、USER.md、记忆编辑与设置、记忆附件全部使用 DSL；角色页顶部“添加”菜单保留新建和导入两个入口。记忆页仍按全局设置、共享库、角色库排列，每个库保留图谱、用户资料、设置独立入口。只有图谱画布使用网页，其桥仅提供加载展示数据和节点/关系选择；所有按钮、表单与数据写入由 DSL 和主运行时负责。打开编辑或设置弹窗时移除画布 WebView，避免平台视图与原生表单叠加。
 
 ### 可选角色插件与普通模型聊天
 
@@ -420,7 +475,38 @@ ANN 是近似检索，文件夹、时间和排除条件传入 WASM 过滤器；�
 ## Runtime diagnostics
 
 `[character_cards]` prints short send checks/decisions, group takeover, native
-send starts and group completion. Normal storage, role validation and UI reads
-are silent. Completed operations taking at least one second report their duration.
+send starts and group completion. Completed send operations taking at least one
+second report their duration.
 Failures include the await stage, short chat ID and task ID; the same error is
 printed once, without JSON payloads, message text or full stacks.
+
+Startup loading also records paired `load` events through the existing plugin
+console. V1 covers the retained repository opener, each preference store, memory
+database opening, metadata migration, import completion, initialization and
+handle cleanup after a failure. V3
+covers UI domain/sidebar IPC submission and main-runtime request handling. Each
+boundary records `id`, `operation`, `phase=start|complete|error` and elapsed time
+on settlement. These events contain no card, chat or storage payloads. They
+observe the original await; they do not introduce deadlines, retries or change
+the retained initializer after a failure. File logs retain verbose events even
+when the default console only shows Info and above.
+
+When a startup hangs, preserve both `/operitapp/data/logs/toolpkg.log` and
+`/operitapp/data/logs/operit.log` (current runtime VFS paths) before restarting,
+together with app/package versions,
+platform and the exact loading surface. Compare starts with settlements for the
+same operation and ID. A pending `storage.open.*` or `storage.initialize` locates
+the initialization dependency. A client `ipc.*` start with no main handler start
+points to an earlier IPC/runtime boundary. A completed main handler with a
+pending client call points to return delivery; a completed client call with a
+loading UI requires the Compose/render logs. An outstanding boundary narrows
+the wait; it does not by itself establish a deadlock. Also distinguish reopening
+only the page from restarting the process: reopening a page normally reuses the
+main-runtime repository Promise, whereas a process restart recreates it.
+
+`node --test tests/startup-loading.test.mjs` pauses every actual storage-open
+boundary while lifecycle, domain and sidebar calls overlap. It checks one opener,
+pending-phase visibility, completion after release, and propagation of the same
+failure without an implicit reopen. The file/SQLite harness does not exercise
+native Rust thread scheduling, host locks or device IPC; passing it does not
+reproduce or rule out the reported device hang.

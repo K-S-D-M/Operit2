@@ -47,7 +47,7 @@ jobs:
           node-version: 24
 
       - name: Check browser JavaScript runtime contracts
-        run: node --test tools/tests/web_javascript_runtime.test.mjs tools/tests/web_runtime_events.test.mjs
+        run: node --test tools/tests/web_javascript_runtime.test.mjs tools/tests/web_runtime_events.test.mjs tools/tests/web_runtime_errors.test.mjs
 
       - name: Prepare Web build hook dependencies
         run: |
@@ -85,6 +85,9 @@ jobs:
 
       - name: Prepare runtime plugin assets
         run: python3 plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload
+
+      - name: Prepare bundled models.dev catalog
+        run: python3 tools/build_scripts/models_dev_bundle.py
 
       - name: Generate Dart proxy artifacts
         run: |

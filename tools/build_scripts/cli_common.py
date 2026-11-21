@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cli_macos_signing import sign_cli_macos
+from windows_bash import prepare_windows_bash
+from windows_powershell import prepare_windows_powershell
 
 from common import (
     DIST_DIR,
@@ -337,6 +339,8 @@ def build_cli_target(
         sign_cli_macos(package_dir / binary_name)
 
     if target.platform == "windows":
+        prepare_windows_bash(package_dir, target.arch)
+        prepare_windows_powershell(package_dir, target.arch)
         copy_required_file(
             binary_source.with_name("operit_local_llm.dll"),
             package_dir / "operit_local_llm.dll",

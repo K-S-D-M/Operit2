@@ -82,8 +82,8 @@ pub struct Participant<'a> {
     /// Owner-specific metadata required to reconstruct a database from its snapshot.
     pub definition: Option<Box<dyn Fn() -> Result<serde_json::Value, String> + 'a>>,
     pub coverage: Box<dyn Fn() -> Result<BTreeSet<String>, String> + 'a>,
-    /// Owner-defined business equality; snapshot tokens and transfer contents remain complete.
-    pub content_digest: fn(&Snapshot) -> Result<String, String>,
+    /// Owner-defined business digest and byte count; CAS and transfer contents remain complete.
+    pub content_summary: fn(&Snapshot) -> Result<(String, u64), String>,
     pub repair: Option<Box<dyn Fn(&str, &Snapshot, Option<&str>, Option<&serde_json::Value>) -> Result<bool, String> + 'a>>,
 }
 
@@ -91,7 +91,7 @@ pub struct Participant<'a> {
 /// Transport pagination and blobs remain outside the owner lifecycle.
 pub struct Source<'a> {
     pub receipt: Box<dyn Fn() -> Result<(SyncReceipt, Vec<String>), String> + 'a>,
-    pub export: Box<dyn Fn(&SyncReceipt, &[String], usize) -> Result<(Vec<SyncOperation>, Vec<String>), String> + 'a>,
+    pub export: Box<dyn Fn(&SyncReceipt, &[String], usize, usize) -> Result<(Vec<SyncOperation>, Vec<String>), String> + 'a>,
     pub inventory: Box<dyn Fn(&SyncReceipt, &[String]) -> Result<(BTreeSet<String>, Vec<String>), String> + 'a>,
 }
 
@@ -132,8 +132,8 @@ impl<'a> Registry<'a> {
     fn discard_covered(&self, path: &str, operations: &mut Vec<SyncOperation>) -> Result<(),String> {
         if operations.is_empty() { return Ok(()); }
         let covered = match self.owners.get(path) { Some(owner) => (owner.coverage)()?, None => BTreeSet::new() };
-        let retired = operations.iter().filter(|op|covered.contains(&op.opId)).cloned().collect::<Vec<_>>();
-        if !retired.is_empty() { self.journal.retireCoveredOperations(&retired).map_err(|e|e.to_string())?; }
+        let retired = operations.iter().filter(|op|covered.contains(&op.opId)).collect::<Vec<_>>();
+        if !retired.is_empty() { self.journal.retireCoveredOperations(retired).map_err(|e|e.to_string())?; }
         operations.retain(|op| !covered.contains(&op.opId));
         Ok(())
     }
@@ -253,15 +253,19 @@ impl<'a> Registry<'a> {
                 owner.validate.as_ref()?.as_ref()(operation).err().map(|error|(index,error)));
             let count = invalid.as_ref().map_or(operations.len(), |(index,_)|*index);
             if count > 0 {
+                let timing = std::time::Instant::now();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
                     (owner.apply)(&operations[..count], &report.aliases)))
                     .unwrap_or_else(|_| Err(ApplyError::Capability(format!("Owner panicked: {path}"))));
+                let apply_ms = timing.elapsed().as_millis();
                 match result {
                     Ok(aliases) => {
-                        self.journal.completeOperations(&operations[..count]).map_err(|e|e.to_string())?;
-                        report.applied.extend_from_slice(&operations[..count]);
                         report.aliases.extend(aliases.clone());
                         report.outcomes.insert(path.clone(), Ok(aliases));
+                        if timing.elapsed().as_millis() >= 100 {
+                            operit_util::AppLogger::AppLogger::trace("CoreSyncTrace", &format!(
+                                "sync_owner.stages owner={path} operations={count} applyMs={apply_ms} totalMs={}", timing.elapsed().as_millis()));
+                        }
                     }
                     Err(error) => {
                         self.failure(&path, &operations, error, &mut report)?;
@@ -272,7 +276,11 @@ impl<'a> Registry<'a> {
             if let Some((index,error)) = invalid {
                 self.failure(&path, &operations[index..], error, &mut report)?;
             }
+            report.applied.extend(operations.into_iter().take(count));
         }
+        // Business commits are already durable. One journal commit acknowledges only
+        // successful owners; a crash before it leaves their originals safe to replay.
+        if !report.applied.is_empty() { self.journal.completeOperations(&report.applied).map_err(|e|e.to_string())?; }
         if !report.aliases.is_empty() {
             let skipped = self.skipped()?;
             for (path, owner) in &self.owners {
@@ -295,26 +303,23 @@ impl<'a> Registry<'a> {
         Ok((receipt, errors))
     }
 
-    pub fn export(&self, receipt: &SyncReceipt, domains: &[String], limit: usize) -> Result<(Vec<SyncOperation>, Vec<String>), String> {
-        let mut operations = self.journal.operationsSince(receipt, domains, limit).map_err(|e| e.to_string())?;
+    /// Plans the journal page and optional inventory together without decoding unselected payloads.
+    pub fn export(&self, receipt: &SyncReceipt, domains: &[String], limit: usize, mut inventory: Option<&mut (BTreeSet<String>, Vec<String>)>) -> Result<(Vec<SyncOperation>, Vec<String>), String> {
+        let budget = crate::SyncOperationStore::DEFAULT_SYNC_PAGE_BYTES;
+        let mut operations = self.journal.operationsSinceWithInventory(receipt, domains, limit, budget,
+            inventory.as_deref_mut().map(|(ids,_)| ids), None).map_err(|e| e.to_string())?;
         let mut errors = self.prepare();
         for source in &self.sources {
-            match (source.export)(receipt, domains, limit) { Ok((page, failures)) => { operations.extend(page); errors.extend(failures); }, Err(error) => errors.push(error) }
-        }
-        let operations = super::ordered(operations, |op| &op.opId, Revision::fromOperation)?;
-        Ok((operations.into_iter().take(limit).collect(), errors))
-    }
-
-    pub fn inventory(&self, receipt: &SyncReceipt, domains: &[String]) -> Result<(BTreeSet<String>,Vec<String>),String> {
-        let mut ids = self.journal.operationIdsSince(receipt,domains).map_err(|e|e.to_string())?;
-        let mut errors = Vec::new();
-        for source in &self.sources {
-            match (source.inventory)(receipt,domains) {
-                Ok((more,failures)) => { ids.extend(more); errors.extend(failures); },
-                Err(error) => errors.push(error),
+            match (source.export)(receipt, domains, limit, budget) { Ok((page, failures)) => { operations.extend(page); errors.extend(failures); }, Err(error) => errors.push(error) }
+            if let Some((ids,failures)) = inventory.as_deref_mut() {
+                match (source.inventory)(receipt,domains) {
+                    Ok((more,errors)) => { ids.extend(more); failures.extend(errors); },
+                    Err(error) => failures.push(error),
+                }
             }
         }
-        Ok((ids,errors))
+        let operations = super::ordered(operations, |op| &op.opId, Revision::fromOperation)?;
+        Ok((crate::SyncOperationStore::boundSyncOperationPage(operations.into_iter().take(limit).collect(), budget), errors))
     }
 
     pub fn snapshots(&self) -> Result<(Vec<Snapshot>, BTreeSet<String>, Vec<String>), String> {
@@ -322,7 +327,6 @@ impl<'a> Registry<'a> {
         let mut errors = self.prepare();
         let mut snapshots = Vec::new();
         for (path, owner) in &self.owners {
-            if pending.contains(path) { continue; }
             if let Some(snapshot) = &owner.snapshot {
                 match snapshot() { Ok(value) => snapshots.push(value), Err(error) => errors.push(format!("{path}: {error}")) }
             }
@@ -332,24 +336,31 @@ impl<'a> Registry<'a> {
 
     /// Only materialized contents decide whether a dataset needs correction.
     pub fn manifests(&self) -> Result<(Vec<super::Manifest>, BTreeSet<String>, Vec<String>), String> {
-        let (snapshots, pending, errors) = self.snapshots()?;
+        let pending = self.pending_owners()?;
+        let mut errors = self.prepare();
         let mut manifests = Vec::new();
-        for snapshot in snapshots {
-            let mut manifest = snapshot.manifest()?;
-            match (self.owners[&snapshot.data.owner.path].content_digest)(&snapshot) {
-                Ok(digest) => manifest.digest = digest,
+        // A report retains metadata only. Release each owner's contents before opening the next.
+        for (path, owner) in &self.owners {
+            let Some(capture) = &owner.snapshot else { continue; };
+            let snapshot = match capture() {
+                Ok(snapshot) => snapshot,
+                Err(error) => { errors.push(format!("{path}: {error}")); continue; }
+            };
+            let manifest = match (owner.content_summary)(&snapshot) {
+                Ok(content) => snapshot.manifest_with_content(content)?,
                 Err(error) => {
+                    let mut manifest = snapshot.manifest()?;
                     manifest.damaged = true;
                     operit_util::AppLogger::AppLogger::w("TransactionSync", &format!("sync_consistency.damaged owner={} error={error}", snapshot.data.owner.path));
+                    manifest
                 },
-            }
+            };
             manifests.push(manifest);
         }
         Ok((manifests,pending,errors))
     }
 
     pub fn snapshot(&self, owner: &Owner) -> Result<Snapshot, String> {
-        if self.pending_owners()?.contains(&owner.path) { return Err("Dataset has pending transactions".into()); }
         let participant = self.owners.get(&owner.path).ok_or("Unknown transaction owner")?;
         let snapshot = (participant.snapshot.as_ref().ok_or("Owner has no snapshot capability")?)()?;
         if &snapshot.data.owner != owner { return Err("Owner format/layout is not ready".into()); }
@@ -398,6 +409,7 @@ impl<'a> Registry<'a> {
         self.repair_file(owner, expected, source, None, None)
     }
 
+    /// Applies the shared authority rule and CAS before atomically publishing a replacement.
     pub fn repair_file(&self, owner: &Owner, expected: &str, source: &Snapshot, file: Option<&str>, definition: Option<&serde_json::Value>) -> Result<bool, String> {
         if &source.data.owner != owner { return Err("Snapshot owner differs".into()); }
         let participant = self.owners.get(&owner.path).ok_or("Unknown transaction owner")?;
@@ -411,8 +423,14 @@ impl<'a> Registry<'a> {
         if !expected.is_empty() {
             let current = capture()?;
             if current.token()? != expected { return Ok(false); }
-            if current.damage.is_none() && (participant.content_digest)(&current).is_ok() && (&current.data.revision, &current.node) > (&source.data.revision, &source.node) {
-                return Err("Snapshot source is older than the local authority".into());
+            if current.damage.is_none() {
+                if let Ok(content) = (participant.content_summary)(&current) {
+                    let local = current.manifest_with_content(content)?;
+                    let remote = source.manifest_with_content((participant.content_summary)(source)?)?;
+                    if super::compare_manifests(&local, &remote)? == super::Source::Local {
+                        return Err("Snapshot source ranks below the local authority".into());
+                    }
+                }
             }
         }
         let repair = participant.repair.as_ref().ok_or("Owner cannot replace files")?;

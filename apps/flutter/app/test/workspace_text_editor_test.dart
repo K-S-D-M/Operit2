@@ -11,6 +11,8 @@ import 'package:operit2/core/proxy/generated/CoreProxyModels.g.dart'
 import 'package:operit2/data/preferences/UserPreferencesManager.dart';
 import 'package:operit2/l10n/generated/app_localizations.dart';
 import 'package:operit2/ui/common/markdown/StreamMarkdownRenderer.dart';
+import 'package:operit2/ui/common/markdown/MarkdownLink.dart';
+import 'package:operit2/ui/common/markdown/MarkdownLatexBlock.dart';
 import 'package:operit2/ui/features/chat/components/workspace/WorkspaceFilePreviewContent.dart';
 import 'package:operit2/ui/features/chat/components/workspace/WorkspaceTabModels.dart';
 import 'package:operit2/ui/features/chat/components/workspace/WorkspaceTabStrip.dart';
@@ -18,11 +20,11 @@ import 'package:operit2/ui/features/chat/components/workspace/file_preview/Works
 import 'package:operit2/ui/features/chat/components/workspace/file_preview/WorkspaceTextCloseDialog.dart';
 import 'package:operit2/ui/features/chat/components/workspace/file_preview/WorkspaceTextDocument.dart';
 import 'package:operit2/ui/features/chat/components/workspace/file_preview/WorkspaceTextPreview.dart';
-import 'package:operit2/ui/features/chat/components/workspace/file_preview/WorkspaceVirtualTextEditor.dart';
-import 'package:operit2/ui/features/chat/components/workspace/file_preview/WorkspaceVirtualTextSurface.dart';
-import 'package:operit2/ui/features/chat/components/workspace/file_preview/WorkspaceTextLineNumbers.dart';
-import 'package:operit2/ui/features/chat/components/workspace/file_preview/WorkspaceTextZoomViewport.dart';
-import 'package:operit2/ui/features/chat/components/workspace/file_preview/syntax/WorkspaceSyntaxLanguage.dart';
+import 'package:operit2/ui/common/code_editor/CodeEditorInput.dart';
+import 'package:operit2/ui/common/code_editor/CodeEditorSurface.dart';
+import 'package:operit2/ui/common/code_editor/CodeEditorLineNumbers.dart';
+import 'package:operit2/ui/common/code_editor/CodeEditorZoomTransform.dart';
+import 'package:operit2/ui/common/code_editor/syntax/CodeSyntaxLanguage.dart';
 import 'package:operit2/ui/main/layout/SidebarDockController.dart';
 import 'package:operit2/ui/theme/OperitTheme.dart';
 
@@ -78,12 +80,12 @@ void main() {
     'workspace file paths select grammars without replacing the draft',
     (tester) async {
       final document = WorkspaceTextDocument('final value = "中文";');
-      const files = <String, WorkspaceSyntaxLanguage>{
-        'main.dart': WorkspaceSyntaxLanguage.dart,
-        'main.rs': WorkspaceSyntaxLanguage.rust,
-        'app.yaml': WorkspaceSyntaxLanguage.yaml,
-        'README.md': WorkspaceSyntaxLanguage.markdown,
-        'plain.txt': WorkspaceSyntaxLanguage.plainText,
+      const files = <String, CodeSyntaxLanguage>{
+        'main.dart': CodeSyntaxLanguage.dart,
+        'main.rs': CodeSyntaxLanguage.rust,
+        'app.yaml': CodeSyntaxLanguage.yaml,
+        'README.md': CodeSyntaxLanguage.markdown,
+        'plain.txt': CodeSyntaxLanguage.plainText,
       };
       TextEditingController? original;
       for (final file in files.entries) {
@@ -91,11 +93,11 @@ void main() {
           _app(_content(_textTab(document, path: file.key), (_, _) async {})),
         );
         await tester.pumpAndSettle();
-        final editor = tester.widget<WorkspaceVirtualTextEditor>(
-          find.byType(WorkspaceVirtualTextEditor),
+        final editor = tester.widget<CodeEditorInput>(
+          find.byType(CodeEditorInput),
         );
-        final state = tester.state<WorkspaceVirtualTextEditorState>(
-          find.byType(WorkspaceVirtualTextEditor),
+        final state = tester.state<CodeEditorInputState>(
+          find.byType(CodeEditorInput),
         );
         original ??= editor.controller;
         expect(identical(editor.controller, original), isTrue);
@@ -121,13 +123,13 @@ void main() {
     );
     await tester.pumpAndSettle();
     final scroll = tester
-        .widget<WorkspaceVirtualTextEditor>(
-          find.byType(WorkspaceVirtualTextEditor),
+        .widget<CodeEditorInput>(
+          find.byType(CodeEditorInput),
         )
         .scrollController;
     scroll.jumpTo(12000);
     await tester.pump();
-    final focal = tester.getCenter(find.byType(WorkspaceTextZoomViewport));
+    final focal = tester.getCenter(find.byType(CodeEditorZoomTransform));
     tester.binding.handlePointerEvent(
       PointerPanZoomStartEvent(pointer: 190, position: focal),
     );
@@ -140,7 +142,7 @@ void main() {
       previous?.call(element, builtOnce);
       if (element.widget is TextButton) symbolBuilds++;
       if (element.widget is IconButton) toolbarBuilds++;
-      if (element.widget is WorkspaceVirtualTextEditor) editorBuilds++;
+      if (element.widget is CodeEditorInput) editorBuilds++;
     };
     addTearDown(() => debugOnRebuildDirtyWidget = previous);
     final samples = <int>[];
@@ -167,7 +169,7 @@ void main() {
       editorBuilds,
       0,
       reason:
-          'Zoom changes layout, not WorkspaceVirtualTextEditor configuration',
+          'Zoom changes layout, not CodeEditorInput configuration',
     );
     samples.sort();
     debugPrint(
@@ -198,12 +200,12 @@ void main() {
       _app(_content(_textTab(document), (_, _) async {})),
     );
     await tester.pumpAndSettle();
-    final gutter = tester.renderObject<RenderWorkspaceTextLineNumbers>(
-      find.byType(WorkspaceTextLineNumbers),
+    final gutter = tester.renderObject<RenderCodeEditorLineNumbers>(
+      find.byType(CodeEditorLineNumbers),
     );
     final scroll = tester
-        .widget<WorkspaceVirtualTextEditor>(
-          find.byType(WorkspaceVirtualTextEditor),
+        .widget<CodeEditorInput>(
+          find.byType(CodeEditorInput),
         )
         .scrollController;
     final layouts = gutter.debugLabelLayouts;
@@ -228,8 +230,8 @@ void main() {
       await tester.pump();
     }
     expect(gutter.debugLabelLayouts, finalLayouts);
-    final widget = tester.widget<WorkspaceTextLineNumbers>(
-      find.byType(WorkspaceTextLineNumbers),
+    final widget = tester.widget<CodeEditorLineNumbers>(
+      find.byType(CodeEditorLineNumbers),
     );
     gutter.update(
       enabled: widget.enabled,
@@ -347,7 +349,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.byType(WorkspaceVirtualTextEditor), findsOneWidget);
+      expect(find.byType(CodeEditorInput), findsOneWidget);
       expect(find.byType(WorkspaceFilePreviewActionBar), findsNothing);
       expect(find.byIcon(Icons.open_in_browser), findsNothing);
       expect(
@@ -360,7 +362,7 @@ void main() {
       );
       await _enterText(
         tester,
-        find.byType(WorkspaceVirtualTextEditor),
+        find.byType(CodeEditorInput),
         '{"title": "中文修改"}',
       );
       await tester.pump();
@@ -385,7 +387,7 @@ void main() {
     await tester.pumpAndSettle();
     await _enterText(
       tester,
-      find.byType(WorkspaceVirtualTextEditor),
+      find.byType(CodeEditorInput),
       'keyboard draft',
     );
     await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
@@ -468,13 +470,13 @@ void main() {
         await tester.pumpAndSettle();
         expect(document.text, '{initial');
         final editorTop = tester
-            .getTopLeft(find.byType(WorkspaceVirtualTextEditor))
+            .getTopLeft(find.byType(CodeEditorInput))
             .dy;
         await tester.tap(find.byTooltip('保存'));
         await tester.pump();
         expect(find.byType(CircularProgressIndicator), findsOneWidget);
         expect(
-          tester.getTopLeft(find.byType(WorkspaceVirtualTextEditor)).dy,
+          tester.getTopLeft(find.byType(CodeEditorInput)).dy,
           editorTop,
           reason: 'Saving must not increase toolbar height',
         );
@@ -514,7 +516,7 @@ void main() {
     expect(find.byIcon(Icons.zoom_in), findsNothing);
     expect(find.byIcon(Icons.zoom_out), findsNothing);
     expect(find.text('100%'), findsNothing);
-    await _enterText(tester, find.byType(WorkspaceVirtualTextEditor), 'draft');
+    await _enterText(tester, find.byType(CodeEditorInput), 'draft');
     await tester.pump(const Duration(milliseconds: 600));
     await tester.pump();
     expect(
@@ -538,8 +540,8 @@ void main() {
     expect(document.text, 'draft');
     expect(
       tester
-          .state<WorkspaceVirtualTextEditorState>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .state<CodeEditorInputState>(
+            find.byType(CodeEditorInput),
           )
           .widget
           .focusNode
@@ -556,7 +558,7 @@ void main() {
     expect(document.isDirty, isTrue);
     await _enterText(
       tester,
-      find.byType(WorkspaceVirtualTextEditor),
+      find.byType(CodeEditorInput),
       'different edit',
     );
     await tester.pump(const Duration(milliseconds: 600));
@@ -578,9 +580,9 @@ void main() {
         _app(_content(_textTab(document), (_, _) async {})),
       );
       await tester.pump(const Duration(milliseconds: 600));
-      await _showKeyboard(tester, find.byType(WorkspaceVirtualTextEditor));
-      final state = tester.state<WorkspaceVirtualTextEditorState>(
-        find.byType(WorkspaceVirtualTextEditor),
+      await _showKeyboard(tester, find.byType(CodeEditorInput));
+      final state = tester.state<CodeEditorInputState>(
+        find.byType(CodeEditorInput),
       );
       state.widget.controller.selection = TextSelection(
         baseOffset: document.text.length - 1,
@@ -635,8 +637,8 @@ void main() {
       expect(document.text, '{');
       expect(
         tester
-            .state<WorkspaceVirtualTextEditorState>(
-              find.byType(WorkspaceVirtualTextEditor),
+            .state<CodeEditorInputState>(
+              find.byType(CodeEditorInput),
             )
             .widget
             .focusNode
@@ -675,7 +677,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 600));
     await _enterText(
       tester,
-      find.byType(WorkspaceVirtualTextEditor),
+      find.byType(CodeEditorInput),
       '# edited',
     );
     await tester.pump(const Duration(milliseconds: 600));
@@ -683,8 +685,8 @@ void main() {
     await tester.tap(find.byTooltip('Markdown 预览'));
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey('workspace-quick-input')), findsNothing);
-    final dormantEditor = tester.state<WorkspaceVirtualTextEditorState>(
-      find.byType(WorkspaceVirtualTextEditor, skipOffstage: false),
+    final dormantEditor = tester.state<CodeEditorInputState>(
+      find.byType(CodeEditorInput, skipOffstage: false),
     );
     expect(
       dormantEditor.renderEditable.attached,
@@ -723,7 +725,7 @@ void main() {
         _app(_content(_textTab(document), (_, _) async {})),
       );
       await tester.pumpAndSettle();
-      await _showKeyboard(tester, find.byType(WorkspaceVirtualTextEditor));
+      await _showKeyboard(tester, find.byType(CodeEditorInput));
       tester.testTextInput.updateEditingValue(
         const TextEditingValue(
           text: '中文',
@@ -734,8 +736,8 @@ void main() {
       await tester.pump();
       await tester.tap(find.byKey(const ValueKey('workspace-insert-{')));
       await tester.pumpAndSettle();
-      final state = tester.state<WorkspaceVirtualTextEditorState>(
-        find.byType(WorkspaceVirtualTextEditor),
+      final state = tester.state<CodeEditorInputState>(
+        find.byType(CodeEditorInput),
       );
       expect(document.text, '中文{');
       expect(state.widget.controller.value.composing, TextRange.empty);
@@ -754,7 +756,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 600));
     await _enterText(
       tester,
-      find.byType(WorkspaceVirtualTextEditor),
+      find.byType(CodeEditorInput),
       'first draft',
     );
     await tester.pump(const Duration(milliseconds: 600));
@@ -770,7 +772,7 @@ void main() {
     );
     await _enterText(
       tester,
-      find.byType(WorkspaceVirtualTextEditor),
+      find.byType(CodeEditorInput),
       'second draft',
     );
     await tester.pump(const Duration(milliseconds: 600));
@@ -801,7 +803,7 @@ void main() {
     await tester.pumpAndSettle();
     await _enterText(
       tester,
-      find.byType(WorkspaceVirtualTextEditor),
+      find.byType(CodeEditorInput),
       'keep this draft',
     );
     await tester.pump();
@@ -812,8 +814,8 @@ void main() {
     expect(document.isDirty, isTrue);
     expect(
       tester
-          .widget<WorkspaceVirtualTextEditor>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .widget<CodeEditorInput>(
+            find.byType(CodeEditorInput),
           )
           .controller
           .text,
@@ -832,7 +834,7 @@ void main() {
       expect(find.byIcon(Icons.zoom_in), findsNothing);
       expect(find.byIcon(Icons.zoom_out), findsNothing);
       expect(find.text('100%'), findsNothing);
-      await _showKeyboard(tester, find.byType(WorkspaceVirtualTextEditor));
+      await _showKeyboard(tester, find.byType(CodeEditorInput));
       await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
       await tester.sendKeyEvent(LogicalKeyboardKey.equal);
       await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
@@ -844,7 +846,7 @@ void main() {
       await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
       await tester.pump();
       expect(document.scale, 1);
-      final center = tester.getCenter(find.byType(WorkspaceVirtualTextEditor));
+      final center = tester.getCenter(find.byType(CodeEditorInput));
       final first = await tester.createGesture(
         pointer: 1,
         kind: PointerDeviceKind.touch,
@@ -876,7 +878,7 @@ void main() {
       );
       await tester.pumpAndSettle();
       final position = tester.getCenter(
-        find.byType(WorkspaceVirtualTextEditor),
+        find.byType(CodeEditorInput),
       );
       tester.binding.handlePointerEvent(
         PointerPanZoomStartEvent(pointer: 5, position: position),
@@ -918,19 +920,19 @@ void main() {
       );
       await tester.pumpAndSettle();
       final scroll = tester
-          .widget<WorkspaceVirtualTextEditor>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .widget<CodeEditorInput>(
+            find.byType(CodeEditorInput),
           )
           .scrollController;
       scroll.jumpTo(900);
       await tester.pump();
       render = tester
-          .state<WorkspaceVirtualTextEditorState>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .state<CodeEditorInputState>(
+            find.byType(CodeEditorInput),
           )
           .renderEditable;
       final focal =
-          tester.getTopLeft(find.byType(WorkspaceVirtualTextEditor)) +
+          tester.getTopLeft(find.byType(CodeEditorInput)) +
           const Offset(100, 220);
       anchor = render.getPositionForPoint(focal);
       lineFraction =
@@ -998,29 +1000,29 @@ void main() {
           ),
         );
         await tester.pumpAndSettle();
-        await _showKeyboard(tester, find.byType(WorkspaceVirtualTextEditor));
+        await _showKeyboard(tester, find.byType(CodeEditorInput));
         await tester.pumpAndSettle();
         scroll = tester
-            .widget<WorkspaceVirtualTextEditor>(
-              find.byType(WorkspaceVirtualTextEditor),
+            .widget<CodeEditorInput>(
+              find.byType(CodeEditorInput),
             )
             .scrollController;
         scroll.jumpTo(1600);
         await tester.pump();
         render = tester
-            .state<WorkspaceVirtualTextEditorState>(
-              find.byType(WorkspaceVirtualTextEditor),
+            .state<CodeEditorInputState>(
+              find.byType(CodeEditorInput),
             )
             .renderEditable;
-        final gutter = tester.renderObject<RenderWorkspaceTextLineNumbers>(
-          find.byType(WorkspaceTextLineNumbers),
+        final gutter = tester.renderObject<RenderCodeEditorLineNumbers>(
+          find.byType(CodeEditorLineNumbers),
         );
         final baseGutterWidth = gutter.gutterWidth;
         final baseLabelHeight = gutter.lineNumberHeight;
         final gutterLeft = gutter.localToGlobal(Offset.zero).dx;
         final anchorRowHeights = <double>[];
         final focal =
-            tester.getTopLeft(find.byType(WorkspaceVirtualTextEditor)) +
+            tester.getTopLeft(find.byType(CodeEditorInput)) +
             const Offset(160, 250);
         anchor = render.getPositionForPoint(focal);
         fraction =
@@ -1059,7 +1061,7 @@ void main() {
               reason: 'Frame $frame must be anchored before painting',
             );
           }
-          final virtualRender = render as RenderWorkspaceVirtualText;
+          final virtualRender = render as RenderCodeEditorText;
           anchorRowHeights.add(
             virtualRender
                 .textLayout
@@ -1090,10 +1092,10 @@ void main() {
                 'The editor must stay flush with the scaled gutter despite horizontal pinch movement',
           );
           final zoom = tester.renderObject<RenderBox>(
-            find.byType(WorkspaceTextZoomViewport),
+            find.byType(CodeEditorZoomTransform),
           );
           final fieldBox = tester.renderObject<RenderBox>(
-            find.byType(WorkspaceVirtualTextEditor),
+            find.byType(CodeEditorInput),
           );
           expect(
             fieldBox.localToGlobal(Offset(fieldBox.size.width, 0)).dx,
@@ -1145,14 +1147,14 @@ void main() {
       );
       await tester.pumpAndSettle();
       final scroll = tester
-          .widget<WorkspaceVirtualTextEditor>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .widget<CodeEditorInput>(
+            find.byType(CodeEditorInput),
           )
           .scrollController;
       scroll.jumpTo(650);
       await tester.pump();
       final focal =
-          tester.getTopLeft(find.byType(WorkspaceVirtualTextEditor)) +
+          tester.getTopLeft(find.byType(CodeEditorInput)) +
           const Offset(100, 180);
       tester.binding.handlePointerEvent(
         PointerPanZoomStartEvent(pointer: 51, position: focal),
@@ -1164,8 +1166,8 @@ void main() {
         PointerPanZoomEndEvent(pointer: 51, position: focal),
       );
       await tester.pump();
-      final state = tester.state<WorkspaceVirtualTextEditorState>(
-        find.byType(WorkspaceVirtualTextEditor),
+      final state = tester.state<CodeEditorInputState>(
+        find.byType(CodeEditorInput),
       );
       final expected = state.renderEditable.getPositionForPoint(focal);
       await tester.tapAt(focal);
@@ -1202,19 +1204,19 @@ void main() {
           _app(_content(_textTab(document), (_, _) async {})),
         );
         await tester.pumpAndSettle();
-        final field = tester.widget<WorkspaceVirtualTextEditor>(
-          find.byType(WorkspaceVirtualTextEditor),
+        final field = tester.widget<CodeEditorInput>(
+          find.byType(CodeEditorInput),
         );
         final scroll = field.scrollController;
         scroll.jumpTo(1800);
         await tester.pump();
         final render = tester
-            .state<WorkspaceVirtualTextEditorState>(
-              find.byType(WorkspaceVirtualTextEditor),
+            .state<CodeEditorInputState>(
+              find.byType(CodeEditorInput),
             )
             .renderEditable;
         final focal =
-            tester.getTopLeft(find.byType(WorkspaceVirtualTextEditor)) +
+            tester.getTopLeft(find.byType(CodeEditorInput)) +
             Offset(100, focalY);
         final position = render.getPositionForPoint(focal);
         final fraction =
@@ -1282,19 +1284,19 @@ void main() {
     );
     await tester.pumpAndSettle();
     final scroll = tester
-        .widget<WorkspaceVirtualTextEditor>(
-          find.byType(WorkspaceVirtualTextEditor),
+        .widget<CodeEditorInput>(
+          find.byType(CodeEditorInput),
         )
         .scrollController;
     scroll.jumpTo(650);
     await tester.pump();
     final render = tester
-        .state<WorkspaceVirtualTextEditorState>(
-          find.byType(WorkspaceVirtualTextEditor),
+        .state<CodeEditorInputState>(
+          find.byType(CodeEditorInput),
         )
         .renderEditable;
     final focal =
-        tester.getTopLeft(find.byType(WorkspaceVirtualTextEditor)) +
+        tester.getTopLeft(find.byType(CodeEditorInput)) +
         const Offset(60, 180);
     final position = render.getPositionForPoint(focal);
     final fraction =
@@ -1335,14 +1337,14 @@ void main() {
     final scrollable = tester.state<ScrollableState>(
       find
           .descendant(
-            of: find.byType(WorkspaceVirtualTextEditor),
+            of: find.byType(CodeEditorInput),
             matching: find.byType(Scrollable),
           )
           .first,
     );
     final before = scrollable.position.pixels;
     await tester.drag(
-      find.byType(WorkspaceVirtualTextEditor),
+      find.byType(CodeEditorInput),
       const Offset(0, -180),
     );
     await tester.pumpAndSettle();
@@ -1360,7 +1362,7 @@ void main() {
     await tester.pumpAndSettle();
     await _enterText(
       tester,
-      find.byType(WorkspaceVirtualTextEditor),
+      find.byType(CodeEditorInput),
       'persistent draft',
     );
     await _pinchZoom(tester, 1.1);
@@ -1370,8 +1372,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(
       tester
-          .widget<WorkspaceVirtualTextEditor>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .widget<CodeEditorInput>(
+            find.byType(CodeEditorInput),
           )
           .controller
           .text,
@@ -1398,7 +1400,7 @@ void main() {
       await tester.pumpAndSettle();
       await _enterText(
         tester,
-        find.byType(WorkspaceVirtualTextEditor),
+        find.byType(CodeEditorInput),
         '# Edited heading',
       );
       await tester.tap(find.byTooltip('Markdown 预览'));
@@ -1409,8 +1411,8 @@ void main() {
       await tester.pumpAndSettle();
       expect(
         tester
-            .widget<WorkspaceVirtualTextEditor>(
-              find.byType(WorkspaceVirtualTextEditor),
+            .widget<CodeEditorInput>(
+              find.byType(CodeEditorInput),
             )
             .controller
             .text,
@@ -1419,6 +1421,178 @@ void main() {
       expect(document.isDirty, isTrue);
     },
   );
+
+  testWidgets('Markdown preview resolves file links beside its own document', (
+    tester,
+  ) async {
+    final opened = <String>[];
+    final browser = <String?>[];
+    final document = WorkspaceTextDocument('[report](../report.txt)');
+    await tester.pumpWidget(
+      _app(
+        MarkdownLinkScope(
+          onOpenFile: (path) async {
+            opened.add(path);
+          },
+          child: WorkspaceTextPreview(
+            tab: _textTab(document, kind: WorkspaceFilePreviewKind.markdown),
+            onWriteWorkspaceFileBytes: (_, _) async {},
+            onOpenBrowser: ({url, localFilePath, workspaceHtmlPath}) {
+              browser.add(url);
+            },
+            splitMarkdownContent: (_) async => [],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Markdown 预览'));
+    await tester.pumpAndSettle();
+    final preview = tester.widget<StreamMarkdownRenderer>(
+      find.byType(StreamMarkdownRenderer),
+    );
+    preview.onLinkClick!('../中文%20报告.txt');
+    await tester.pumpAndSettle();
+    expect(opened, ['/workspace/中文 报告.txt']);
+    expect(browser, isEmpty);
+    preview.onLinkClick!('https://example.org/report.txt');
+    expect(browser, ['https://example.org/report.txt']);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('long Markdown previews only mount visible paragraphs and math', (
+    tester,
+  ) async {
+    final paragraphs = List.generate(
+      1000,
+      (i) => 'Preview paragraph $i 中文 ${'document content ' * 8}',
+    );
+    final document = WorkspaceTextDocument(paragraphs.join('\n\n'));
+    var parseCount = 0;
+    core_proxy.MarkdownStreamEvent event(
+      String type, {
+      int? blockId,
+      int? inlineId,
+      String? value,
+      String? nodeType,
+    }) => core_proxy.MarkdownStreamEvent(
+      chatId: 'workspace-lazy-preview',
+      eventType: type,
+      value: value,
+      id: null,
+      blockId: blockId,
+      inlineId: inlineId,
+      parentBlockId: null,
+      nodeType: nodeType,
+      headerLevel: null,
+      xml: null,
+    );
+    await tester.pumpWidget(
+      _app(
+        WorkspaceTextPreview(
+          tab: _textTab(document, kind: WorkspaceFilePreviewKind.markdown),
+          onWriteWorkspaceFileBytes: (_, _) async {},
+          onOpenBrowser: ({url, localFilePath, workspaceHtmlPath}) {},
+          splitMarkdownContent: (_) async {
+            parseCount++;
+            return [
+              for (var i = 0; i < paragraphs.length; i++) ...[
+                event('markdownBlockStart', blockId: i),
+                event('markdownInlineStart', blockId: i, inlineId: 0),
+                event(
+                  'markdownInlineChunk',
+                  blockId: i,
+                  inlineId: 0,
+                  value: paragraphs[i],
+                ),
+                event(
+                  'markdownInlineStart',
+                  blockId: i,
+                  inlineId: 1,
+                  nodeType: 'InlineLatex',
+                ),
+                event(
+                  'markdownInlineChunk',
+                  blockId: i,
+                  inlineId: 1,
+                  value: r'\frac{x_i^2}{1 + x_i}',
+                ),
+                event('markdownBlockEnd', blockId: i),
+              ],
+              event('completed'),
+            ];
+          },
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Markdown 预览'));
+    await tester.pumpAndSettle();
+    final preview = tester.widget<StreamMarkdownRenderer>(
+      find.byType(StreamMarkdownRenderer),
+    );
+    final scroll = preview.scrollController!;
+
+    void expectBoundedWork() {
+      final count = find.byType(CanvasMarkdownNodeRenderer).evaluate().length;
+      expect(count, inExclusiveRange(0, 40));
+      expect(find.byType(MarkdownInlineLatex), findsNWidgets(count));
+      expect(parseCount, 1);
+      expect(tester.takeException(), isNull);
+    }
+
+    expectBoundedWork();
+    final previousRebuild = debugOnRebuildDirtyWidget;
+    var mathBuildsDuringZoom = 0;
+    debugOnRebuildDirtyWidget = (element, builtOnce) {
+      previousRebuild?.call(element, builtOnce);
+      if (element.widget is MarkdownInlineLatex) mathBuildsDuringZoom++;
+    };
+    try {
+      document.updateScale(1.2);
+      await tester.pumpAndSettle();
+    } finally {
+      debugOnRebuildDirtyWidget = previousRebuild;
+    }
+    expect(
+      mathBuildsDuringZoom,
+      0,
+      reason: 'Zoom must reuse unchanged visible formulas',
+    );
+    expect(
+      find.textContaining('Preview paragraph 0 中文', findRichText: true),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('Preview paragraph 999 中文', findRichText: true),
+      findsNothing,
+    );
+    for (final scale in [0.6, 1.2, 2.5, 1.0]) {
+      document.updateScale(scale);
+      await tester.pumpAndSettle();
+      scroll.jumpTo(scroll.position.maxScrollExtent / 2);
+      await tester.pumpAndSettle();
+      expectBoundedWork();
+    }
+    scroll.jumpTo(scroll.position.maxScrollExtent);
+    await tester.pumpAndSettle();
+    expectBoundedWork();
+    expect(
+      find.textContaining('Preview paragraph 999 中文', findRichText: true),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('Preview paragraph 0 中文', findRichText: true),
+      findsNothing,
+    );
+    scroll.jumpTo(0);
+    await tester.pumpAndSettle();
+    expectBoundedWork();
+    expect(
+      find.textContaining('Preview paragraph 0 中文', findRichText: true),
+      findsOneWidget,
+    );
+  });
 
   testWidgets('Markdown zoom corrects the scroll viewport before painting', (
     tester,
@@ -1484,21 +1658,26 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Markdown 预览'));
     await tester.pumpAndSettle();
-    final scrollView = tester.widget<SingleChildScrollView>(
-      find.ancestor(
+    final scrollView = tester.widget<ListView>(
+      find.descendant(
         of: find.byType(StreamMarkdownRenderer),
-        matching: find.byType(SingleChildScrollView),
+        matching: find.byType(ListView),
       ),
     );
     final scroll = scrollView.controller!;
     expect(scroll.position.maxScrollExtent, greaterThan(1000));
     scroll.jumpTo(800);
     await tester.pump();
-    contentBox = tester.renderObject(find.byType(StreamMarkdownRenderer));
-    final extent =
-        scroll.position.maxScrollExtent + scroll.position.viewportDimension;
     final focal =
         tester.getTopLeft(find.byWidget(scrollView)) + const Offset(160, 230);
+    final anchorNode = find
+        .byType(CanvasMarkdownNodeRenderer)
+        .evaluate()
+        .singleWhere((element) {
+          final box = element.renderObject! as RenderBox;
+          return (box.localToGlobal(Offset.zero) & box.size).contains(focal);
+        });
+    contentBox = anchorNode.renderObject! as RenderBox;
     scenePoint = contentBox.globalToLocal(focal);
     tester.binding.handlePointerEvent(
       PointerPanZoomStartEvent(pointer: 60, position: focal),
@@ -1529,8 +1708,8 @@ void main() {
         );
       }
       expect(
-        scroll.position.maxScrollExtent + scroll.position.viewportDimension,
-        closeTo(extent, 0.01),
+        find.byType(CanvasMarkdownNodeRenderer).evaluate().length,
+        lessThan(40),
       );
     }
     final releasePoint = painted.last;
@@ -1547,9 +1726,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(
       tester
-          .widget<WorkspaceVirtualTextEditor>(
-            find.byType(WorkspaceVirtualTextEditor),
-          )
+          .widget<CodeEditorInput>(find.byType(CodeEditorInput))
           .controller
           .text,
       document.text,
@@ -1588,18 +1765,18 @@ void main() {
       );
       await tester.pumpAndSettle();
       scroll = tester
-          .widget<WorkspaceVirtualTextEditor>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .widget<CodeEditorInput>(
+            find.byType(CodeEditorInput),
           )
           .scrollController;
       scroll.jumpTo(800);
       await tester.pump();
       render = tester
-          .state<WorkspaceVirtualTextEditorState>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .state<CodeEditorInputState>(
+            find.byType(CodeEditorInput),
           )
           .renderEditable;
-      final viewport = tester.getRect(find.byType(WorkspaceVirtualTextEditor));
+      final viewport = tester.getRect(find.byType(CodeEditorInput));
       final focal = viewport.topLeft + const Offset(160, 250);
       anchor = render.getPositionForPoint(focal);
       fraction =
@@ -1689,19 +1866,19 @@ void main() {
     );
     await tester.pumpAndSettle();
     scroll = tester
-        .widget<WorkspaceVirtualTextEditor>(
-          find.byType(WorkspaceVirtualTextEditor),
+        .widget<CodeEditorInput>(
+          find.byType(CodeEditorInput),
         )
         .scrollController;
     scroll.jumpTo(800);
     await tester.pump();
     render = tester
-        .state<WorkspaceVirtualTextEditorState>(
-          find.byType(WorkspaceVirtualTextEditor),
+        .state<CodeEditorInputState>(
+          find.byType(CodeEditorInput),
         )
         .renderEditable;
     final focal =
-        tester.getTopLeft(find.byType(WorkspaceVirtualTextEditor)) +
+        tester.getTopLeft(find.byType(CodeEditorInput)) +
         const Offset(170, 200);
     anchor = render.getPositionForPoint(focal);
     fraction =
@@ -1754,17 +1931,17 @@ void main() {
         _app(_content(_textTab(document), (_, _) async {})),
       );
       await tester.pumpAndSettle();
-      final gutter = tester.renderObject<RenderWorkspaceTextLineNumbers>(
-        find.byType(WorkspaceTextLineNumbers),
+      final gutter = tester.renderObject<RenderCodeEditorLineNumbers>(
+        find.byType(CodeEditorLineNumbers),
       );
       final render = tester
-          .state<WorkspaceVirtualTextEditorState>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .state<CodeEditorInputState>(
+            find.byType(CodeEditorInput),
           )
           .renderEditable;
       final scroll = tester
-          .widget<WorkspaceVirtualTextEditor>(
-            find.byType(WorkspaceVirtualTextEditor),
+          .widget<CodeEditorInput>(
+            find.byType(CodeEditorInput),
           )
           .scrollController;
       final starts = <int>[
@@ -1816,13 +1993,13 @@ void main() {
       checkLabels();
       await _enterText(
         tester,
-        find.byType(WorkspaceVirtualTextEditor),
+        find.byType(CodeEditorInput),
         'one\n\nthree\n',
       );
       await tester.pumpAndSettle();
       expect(gutter.lineCount, 4);
       expect(gutter.visibleLines().map((line) => line.number), [1, 2, 3, 4]);
-      await _enterText(tester, find.byType(WorkspaceVirtualTextEditor), '');
+      await _enterText(tester, find.byType(CodeEditorInput), '');
       await tester.pumpAndSettle();
       expect(gutter.lineCount, 1);
       expect(gutter.visibleLines().single.number, 1);
@@ -1844,13 +2021,13 @@ void main() {
         );
         await tester.pumpAndSettle();
         final render = tester
-            .state<WorkspaceVirtualTextEditorState>(
-              find.byType(WorkspaceVirtualTextEditor),
+            .state<CodeEditorInputState>(
+              find.byType(CodeEditorInput),
             )
             .renderEditable;
         final scroll = tester
-            .widget<WorkspaceVirtualTextEditor>(
-              find.byType(WorkspaceVirtualTextEditor),
+            .widget<CodeEditorInput>(
+              find.byType(CodeEditorInput),
             )
             .scrollController;
         final left = _textInsetAfterGutter(tester, render);
@@ -1859,7 +2036,7 @@ void main() {
           scroll.jumpTo(bottom ? scroll.position.maxScrollExtent : 0);
           await tester.pump();
           final focal = tester.getCenter(
-            find.byType(WorkspaceTextZoomViewport),
+            find.byType(CodeEditorZoomTransform),
           );
           final startScale = document.scale;
           tester.binding.handlePointerEvent(
@@ -2149,12 +2326,12 @@ class _RenderPaintProbe extends RenderProxyBox {
 
 /// Measures the displayed font size through the same transform used for input.
 double _visualFontSize(WidgetTester tester) {
-  final field = tester.widget<WorkspaceVirtualTextEditor>(
-    find.byType(WorkspaceVirtualTextEditor),
+  final field = tester.widget<CodeEditorInput>(
+    find.byType(CodeEditorInput),
   );
   final render = tester
-      .state<WorkspaceVirtualTextEditorState>(
-        find.byType(WorkspaceVirtualTextEditor),
+      .state<CodeEditorInputState>(
+        find.byType(CodeEditorInput),
       )
       .renderEditable;
   return field.style.fontSize! *
@@ -2183,8 +2360,8 @@ Offset _lineCenter(RenderEditable render, TextPosition position) =>
 
 /// Measures text padding after the gutter in unzoomed application coordinates.
 double _textInsetAfterGutter(WidgetTester tester, RenderEditable render) {
-  final gutter = tester.renderObject<RenderWorkspaceTextLineNumbers>(
-    find.byType(WorkspaceTextLineNumbers),
+  final gutter = tester.renderObject<RenderCodeEditorLineNumbers>(
+    find.byType(CodeEditorLineNumbers),
   );
   return gutter.globalToLocal(render.localToGlobal(Offset.zero)).dx -
       gutter.gutterWidth;
@@ -2192,7 +2369,7 @@ double _textInsetAfterGutter(WidgetTester tester, RenderEditable render) {
 
 /// Exercises gesture zoom independently of toolbar actions.
 Future<void> _pinchZoom(WidgetTester tester, double factor) async {
-  final focal = tester.getCenter(find.byType(WorkspaceTextZoomViewport));
+  final focal = tester.getCenter(find.byType(CodeEditorZoomTransform));
   tester.binding.handlePointerEvent(
     PointerPanZoomStartEvent(pointer: 180, position: focal),
   );
@@ -2208,7 +2385,7 @@ Future<void> _pinchZoom(WidgetTester tester, double factor) async {
 
 /// Opens the full-document virtual editor input connection for widget tests.
 Future<void> _showKeyboard(WidgetTester tester, Finder finder) async {
-  tester.state<WorkspaceVirtualTextEditorState>(finder).requestKeyboard();
+  tester.state<CodeEditorInputState>(finder).requestKeyboard();
   await tester.pump();
 }
 

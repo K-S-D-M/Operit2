@@ -1,74 +1,64 @@
 package app.operit
 
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
-import android.webkit.MimeTypeMap
-import androidx.core.content.FileProvider
 import java.io.File
-import java.util.UUID
+import java.io.FileNotFoundException
+import java.io.IOException
 
-/** Opens a single readable file; never exposes file:// or a whole private directory. */
+/** Presents original files through Android's individual read-only URI grants. */
 internal class AndroidFileOpener(context: Context) {
     private val context = context.applicationContext
 
+    companion object {
+        /** Keeps native paths and Intent contents out of owner error responses. */
+        fun safeFailureMessage(error: Exception): String = when (error) {
+            is ActivityNotFoundException -> "No application is available to open this file"
+            is SecurityException -> "File permission is missing or was revoked"
+            is FileNotFoundException -> "Selected file is unavailable or has changed"
+            else -> "File could not be presented"
+        }
+    }
+
+    /** Opens one local or SAF file without copying its content. */
     fun open(file: File?, tree: String?, documentId: String?) {
-        val (uri, mimeType) = readableUri(file, tree, documentId)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mimeType)
-            clipData = ClipData.newRawUri("Opened file", uri)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        context.startActivity(intent)
+        present(file, tree, documentId, null)
     }
 
+    /** Shares the same read-only source capability used by file opening. */
     fun share(file: File?, tree: String?, documentId: String?, title: String) {
-        val (uri, mimeType) = readableUri(file, tree, documentId)
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = mimeType
-            putExtra(Intent.EXTRA_STREAM, uri)
-            clipData = ClipData.newRawUri("Shared file", uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        context.startActivity(Intent.createChooser(intent, title.takeIf { it.isNotBlank() }).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        })
+        present(file, tree, documentId, title)
     }
 
-    private fun readableUri(file: File?, tree: String?, documentId: String?): Pair<Uri, String> {
-        val uri: Uri
-        val mimeType: String
-        if (file != null) {
-            require(file.isFile && file.canRead()) { "File is not readable: $file" }
-            val root = File(context.cacheDir, "open_files")
-            check(root.isDirectory || root.mkdirs()) { "Cannot create open-file staging directory" }
-            // Keep recent files alive for recipient apps, but bound stale staging storage.
-            val cutoff = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
-            root.listFiles()?.filter { it.isDirectory && it.lastModified() < cutoff }
-                ?.forEach { it.deleteRecursively() }
-            val directory = File(root, UUID.randomUUID().toString())
-            check(directory.mkdir()) { "Cannot stage file for opening" }
-            val staged = File(directory, file.name)
-            try {
-                file.inputStream().use { input -> staged.outputStream().use { input.copyTo(it) } }
-                uri = FileProvider.getUriForFile(context, "${context.packageName}.openfiles", staged)
-                mimeType = MimeTypeMap.getSingleton()
-                    .getMimeTypeFromExtension(file.extension.lowercase(java.util.Locale.ROOT))
-                    ?: "application/octet-stream"
-            } catch (error: Exception) {
-                directory.deleteRecursively()
-                throw error
+    /** Builds a single-file Intent and lets Android own the recipient grant lifetime. */
+    private fun present(file: File?, tree: String?, documentId: String?, title: String?) {
+        try {
+            val uri = if (file != null) {
+                OperitOpenFileProvider.uriForFile(context, file)
+            } else {
+                require(tree != null && documentId != null) { "Missing document capability" }
+                DocumentsContract.buildDocumentUriUsingTree(Uri.parse(tree), documentId)
             }
-        } else {
-            require(tree != null && documentId != null) { "Missing document capability" }
-            uri = DocumentsContract.buildDocumentUriUsingTree(Uri.parse(tree), documentId)
-            mimeType = context.contentResolver.getType(uri) ?: "application/octet-stream"
+            val mimeType = context.contentResolver.getType(uri) ?: "application/octet-stream"
+            val intent = Intent(if (title == null) Intent.ACTION_VIEW else Intent.ACTION_SEND).apply {
+                if (title == null) setDataAndType(uri, mimeType) else {
+                    type = mimeType
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                }
+                clipData = ClipData.newRawUri(file?.name ?: "Selected file", uri)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val launch = if (title == null) intent else Intent.createChooser(intent, title.takeIf { it.isNotBlank() }).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(launch)
+        } catch (error: Exception) {
+            // A failed launch creates no app-owned registration or file to clean up.
+            throw IOException(safeFailureMessage(error))
         }
-        return Pair(uri, mimeType)
     }
 }
-
-/** A concrete provider avoids device-specific issues with registering the base class directly. */
-class OperitOpenFileProvider : FileProvider()

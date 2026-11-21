@@ -2,7 +2,25 @@
 use std::path::PathBuf;
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use operit_providers::chat::llmprovider::ApiKeyProvider::{ApiKeyOutcome, ApiKeyPoolState};
 
+type PoolStateRegistry = Vec<(Weak<dyn operit_host_api::RuntimeStorageHost>, Arc<Mutex<ApiKeyPoolState>>)>;
+
+/// Shares node-local key health between managers using the same storage host.
+fn keyPoolState(storage: &Arc<dyn operit_host_api::RuntimeStorageHost>) -> Arc<Mutex<ApiKeyPoolState>> {
+    static REGISTRY: OnceLock<Mutex<PoolStateRegistry>> = OnceLock::new();
+    let mut registry = REGISTRY.get_or_init(|| Mutex::new(Vec::new())).lock().expect("key health registry mutex poisoned");
+    registry.retain(|(owner, _)| owner.strong_count() > 0);
+    if let Some((_, state)) = registry.iter().find(|(owner, _)| owner.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, storage))) {
+        return state.clone();
+    }
+    let state = Arc::new(Mutex::new(ApiKeyPoolState::default()));
+    registry.push((Arc::downgrade(storage), state.clone()));
+    state
+}
+
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::data::preferences::ApiPreferences::ApiPreferences;
@@ -30,7 +48,8 @@ use operit_providers::chat::llmprovider::ModelListFetcher::ModelListFetcher;
 use operit_providers::chat::llmprovider::ThinkingDialect::ThinkingDialect;
 use operit_providers::runtime_support::ProviderRuntimeContext;
 use operit_store::PreferencesDataStore::{
-    stringPreferencesKey, Flow, Preferences, PreferencesDataStore, PreferencesDataStoreError,
+    stringPreferencesKey, CoreNodeStateStore, Flow, Preferences, PreferencesDataStore,
+    PreferencesDataStoreError,
 };
 use operit_store::RuntimeStorePaths::RuntimeStorePaths;
 
@@ -59,10 +78,14 @@ pub enum ModelConfigError {
     InvalidProviderType(String),
     #[error("model list fetch error: {0}")]
     ModelListFetch(String),
+    #[error("model capability catalog error: {0}")]
+    ModelCatalog(String),
     #[error("connection test error: {0}")]
     ConnectionTest(String),
     #[error("invalid thinking level: {0}")]
     InvalidThinkingLevel(String),
+    #[error("API key pool error: {0}")]
+    ApiKeyPool(String),
 }
 
 /// Reports the result of importing model configuration backup data.
@@ -75,11 +98,29 @@ pub struct ModelConfigImportResult {
     pub total: i32,
 }
 
+/// The last completed connection check, including errors that prevented it from running.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[allow(non_snake_case)]
+pub struct ModelConnectionTestResult {
+    pub providerId: String,
+    pub modelId: String,
+    pub report: Option<ModelConnectionTestReport>,
+    pub error: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredModelConnectionTest {
+    fingerprint: String,
+    result: ModelConnectionTestResult,
+}
+
 /// Stores provider profiles, model profiles, and resolved model configuration.
 #[derive(Clone)]
 pub struct ModelConfigManager {
-    runtimeRoot: PathBuf,
+
     modelConfigDataStore: PreferencesDataStore,
+    connectionTestDataStore: CoreNodeStateStore,
+    keyPoolState: Arc<Mutex<ApiKeyPoolState>>,
 }
 
 impl ModelConfigManager {
@@ -88,7 +129,7 @@ impl ModelConfigManager {
         storage: std::sync::Arc<dyn operit_host_api::RuntimeStorageHost>,
         path: impl Into<String>,
     ) -> PreferencesDataStore {
-        PreferencesDataStore::newEncryptedWithStorage(storage, path)
+        PreferencesDataStore::newWithStorage(storage, path)
             .withMigration(Self::PREFERENCES_VERSION, |from,context| {
                 if from == 3 {
                     operit_store::Transaction::Rule::DropKey {key:"provider_list".into()}.apply(context).map_err(PreferencesDataStoreError::Message)?;
@@ -97,7 +138,7 @@ impl ModelConfigManager {
             })
     }
 
-    const PREFERENCES_VERSION: u32 = 7;
+    const PREFERENCES_VERSION: u32 = 9;
     pub const DEFAULT_PROVIDER_ID: &'static str = ModelConfigDefaults::DEFAULT_PROVIDER_ID;
     pub const DEFAULT_MODEL_ID: &'static str = ModelConfigDefaults::DEFAULT_MODEL_ID;
 
@@ -106,27 +147,15 @@ impl ModelConfigManager {
         stringPreferencesKey("provider_list")
     }
 
-    /// Creates a manager rooted at a runtime data directory.
-    pub fn new(root_dir: PathBuf) -> Self {
-        let path = RuntimeStorePaths::runtime_storage_path_from_root(
-            &root_dir,
-            operit_util::RuntimeStorageLayout::MODEL_CONFIGS_PREFERENCES_PATH,
-        );
-        let modelConfigDataStore = Self::preferenceStore(
-            operit_store::RuntimeStorageHost::defaultRuntimeStorageHost(),
-            operit_store::RuntimeStorageHost::runtimeStoragePath(&path),
-        );
+    /// Opens model configuration in the owning runtime storage namespace.
+    pub fn default() -> Self {
+        let storage = operit_store::RuntimeStorageHost::defaultRuntimeStorageHost();
         Self {
-            runtimeRoot: root_dir,
-            modelConfigDataStore,
+            keyPoolState: keyPoolState(&storage),
+            modelConfigDataStore: Self::preferenceStore(storage.clone(), operit_util::RuntimeStorageLayout::MODEL_CONFIGS_PREFERENCES_PATH),
+            connectionTestDataStore: CoreNodeStateStore::newWithStorage(storage, operit_util::RuntimeStorageLayout::RUNTIME_MODEL_CONNECTION_TESTS_PATH),
         }
     }
-
-    /// Creates a manager using the default API data directory.
-    pub fn default() -> Self {
-        Self::new(ApiPreferences::data_dir())
-    }
-
     /// Persists the default provider and model before a default function binding is used.
     pub(crate) fn ensureDefaultModelConfig(&self) -> Result<(), ModelConfigError> {
         let preferences = self.modelConfigDataStore.data()?;
@@ -203,12 +232,34 @@ impl ModelConfigManager {
         self.hydrateLocalProviderModels(provider)
     }
 
+    /// Reports capabilities only for an existing model, independently of request-time validation.
+    pub(crate) fn configuredModelCapabilities(
+        &self,
+        providerId: &str,
+        modelId: &str,
+    ) -> Result<Option<ModelCapabilities>, ModelConfigError> {
+        let preferences = self.modelConfigDataStore.data()?;
+        let Some(value) = preferences.get(&self.providerKey(providerId)) else {
+            return Ok(None);
+        };
+        let provider = self.hydrateLocalProviderModels(serde_json::from_value(value.clone())?)?;
+        let Some(model) = provider.models.iter().find(|model| model.id == modelId) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            ModelSpecResolver::new(&provider)?.resolve(model).capabilities,
+        ))
+    }
+
     /// Builds summary rows for every configured provider model.
     pub fn getAllModelSummaries(&self) -> Result<Vec<ProviderModelSummary>, ModelConfigError> {
         let providers = self.getProviderProfiles()?;
         let mut summaries = Vec::new();
         for provider in providers {
-            let resolver = ModelSpecResolver::new(&provider);
+            if provider.models.is_empty() {
+                continue;
+            }
+            let resolver = ModelSpecResolver::new(&provider)?;
             for model in &provider.models {
                 let resolved = resolver.resolve(model);
                 summaries.push(ProviderModelSummary {
@@ -267,8 +318,29 @@ impl ModelConfigManager {
         if provider.providerType == ApiProviderType::OPENAI_CODEX {
             provider.endpoint = "https://chatgpt.com/backend-api/codex/responses".to_string();
         }
+        provider.keyRotationMode = "STICKY_FAILOVER".to_string();
         self.modelConfigDataStore.try_edit_result(|preferences| {
             self.assertProviderExistsInPreferences(preferences, &provider.id)?;
+            let current = self.readProviderFromPreferences(preferences, &provider.id)?;
+            provider.currentKeyIndex = usize::try_from(current.currentKeyIndex)
+                .ok()
+                .and_then(|index| current.apiKeyPool.get(index))
+                .and_then(|selected| provider.apiKeyPool.iter().position(|entry| {
+                    entry.id == selected.id && entry.key == selected.key
+                }))
+                .unwrap_or(0) as i32;
+            for entry in &mut provider.apiKeyPool {
+                if let Some(saved) = current.apiKeyPool.iter().find(|saved| saved.id == entry.id && saved.key == entry.key) {
+                    entry.usageCount = saved.usageCount;
+                    entry.lastUsed = saved.lastUsed;
+                    entry.errorCount = saved.errorCount;
+                    if entry.availabilityStatus != saved.availabilityStatus || (!saved.isEnabled && entry.isEnabled) {
+                        self.keyPoolState.lock().expect("key health mutex poisoned").clear(&provider.id, &entry.key);
+                    }
+                } else {
+                    self.keyPoolState.lock().expect("key health mutex poisoned").clear(&provider.id, &entry.key);
+                }
+            }
             Self::assertProviderNameUniqueInPreferences(
                 preferences,
                 &provider.name,
@@ -278,6 +350,38 @@ impl ModelConfigManager {
             Ok::<(), ModelConfigError>(())
         })?;
         Ok(provider)
+    }
+
+    /// Reserves and persists one credential under the preference store's atomic edit lock.
+    pub(crate) fn reserveProviderApiKey(&self, providerId: &str) -> Result<String, ModelConfigError> {
+        self.modelConfigDataStore.try_edit_result(|preferences| {
+            let mut provider = self.readProviderFromPreferences(preferences, providerId)?;
+            let key = self.keyPoolState.lock().expect("key health mutex poisoned")
+                .reserve(&mut provider, operit_host_api::TimeUtils::currentTimeMillis())
+                .map_err(ModelConfigError::ApiKeyPool)?;
+            Self::writeProvider(preferences, &provider)?;
+            Ok(key)
+        })
+    }
+
+    /// Records exact-key feedback without moving affinity back after a late concurrent success.
+    pub(crate) fn reportProviderApiKey(&self, providerId: &str, key: &str, startedAt: i64, outcome: ApiKeyOutcome) -> Result<(), ModelConfigError> {
+        self.modelConfigDataStore.try_edit_result(|preferences| {
+            let mut provider = self.readProviderFromPreferences(preferences, providerId)?;
+            self.keyPoolState.lock().expect("key health mutex poisoned").report(
+                &mut provider, key, startedAt, outcome, operit_host_api::TimeUtils::currentTimeMillis(),
+            );
+            if outcome != ApiKeyOutcome::Success { Self::writeProvider(preferences, &provider)?; }
+            Ok(())
+        })
+    }
+
+    /// Clears node-local credential blocks and cooldowns after an explicit user action.
+    pub fn clearProviderApiKeyFailures(&self, providerId: &str) -> Result<(), ModelConfigError> {
+        let provider = self.getProviderProfile(providerId)?;
+        let mut state = self.keyPoolState.lock().expect("key health mutex poisoned");
+        for entry in &provider.apiKeyPool { state.clear(providerId, &entry.key); }
+        Ok(())
     }
 
     /// Replaces the default provider profile and preserves its id.
@@ -303,6 +407,14 @@ impl ModelConfigManager {
             preferences.remove(&providerKey);
             Ok::<(), ModelConfigError>(())
         })?;
+        for (key, stored) in self
+            .connectionTestDataStore
+            .typedEntries::<StoredModelConnectionTest>()?
+        {
+            if stored.result.providerId == providerId {
+                self.connectionTestDataStore.removeEntry(&key)?;
+            }
+        }
         Ok(())
     }
 
@@ -313,13 +425,15 @@ impl ModelConfigManager {
         modelId: String,
     ) -> Result<String, ModelConfigError> {
         let provider = self.getProviderProfile(providerId)?;
-        let builtinTools = ModelSpecResolver::new(&provider)
+        let resolver = ModelSpecResolver::new(&provider)?;
+        let builtinTools = resolver
             .catalogSpec(&modelId)
             .map(|spec| spec.builtinTools);
         self.updateProviderInternalResult(providerId, |mut provider| {
             Self::assertProviderModelDoesNotExist(&provider, &modelId)?;
             let mut model = ModelProfile::new(modelId.clone());
             model.builtinToolsOverride = builtinTools.clone();
+            resolver.initializeNewModel(&mut model);
             provider.models.push(model);
             Ok(provider)
         })?;
@@ -328,30 +442,39 @@ impl ModelConfigManager {
 
     /// Lists the provider's live models first, then the other models the catalog lists for it.
     ///
-    /// Each model is described as it would be once added. A catalog over a day old is
-    /// downloaded again first; when that download fails the copy in use describes the models
-    /// and `getModelCatalogStatus` reports the failure.
+    /// Each model is described using the active catalog without waiting for a models.dev
+    /// download. The application refreshes the bundled or previously downloaded data in
+    /// the background, so catalog connectivity never blocks model configuration.
     pub fn getAvailableProviderModels(
         &self,
         providerId: &str,
     ) -> Result<Vec<AvailableProviderModel>, ModelConfigError> {
         let provider = self.getProviderProfile(providerId)?;
         if provider.providerType == ApiProviderType::LOCAL_MODEL {
-            let resolver = ModelSpecResolver::new(&provider);
+            let resolver = ModelSpecResolver::new(&provider)?;
             return Ok(provider
                 .models
                 .iter()
                 .map(|model| resolver.configured(model, AvailableProviderModelSource::Local))
                 .collect());
         }
-        ModelCatalogService::refreshCatalogIfStale();
-        let resolver = ModelSpecResolver::new(&provider);
+        let resolver = ModelSpecResolver::new(&provider)?;
         let mut models: Vec<AvailableProviderModel> = Vec::new();
         let mut seenModelIds = HashSet::new();
         if provider.providerType != ApiProviderType::OPENAI_CODEX {
             let providerCatalog = ModelCatalog::provider(&provider.providerTypeId)
                 .map_err(ModelConfigError::ModelListFetch)?;
-            let remoteModels = ModelListFetcher::fetch(&provider, &providerCatalog)
+            let getter = {
+                let reserveManager = self.clone();
+                let reportManager = self.clone();
+                let reserveId = providerId.to_string();
+                let reportId = reserveId.clone();
+                operit_providers::chat::llmprovider::ApiKeyProvider::KeyGetter::from_callbacks(
+                    Arc::new(move || reserveManager.reserveProviderApiKey(&reserveId).map_err(|error| error.to_string())),
+                    Arc::new(move |key, started, outcome| reportManager.reportProviderApiKey(&reportId, key, started, outcome).map_err(|error| error.to_string())),
+                )
+            };
+            let remoteModels = ModelListFetcher::fetch(&provider, &providerCatalog, getter)
                 .map_err(ModelConfigError::ModelListFetch)?;
             for remoteModel in remoteModels {
                 if seenModelIds.insert(remoteModel.modelId.to_ascii_lowercase()) {
@@ -386,11 +509,14 @@ impl ModelConfigManager {
         model: AvailableProviderModel,
     ) -> Result<String, ModelConfigError> {
         let modelId = model.modelId.clone();
+        let provider = self.getProviderProfile(providerId)?;
+        let resolver = ModelSpecResolver::new(&provider)?;
         self.updateProviderInternalResult(providerId, |mut provider| {
             Self::assertProviderModelDoesNotExist(&provider, &modelId)?;
             let mut profile = ModelProfile::new(modelId.clone());
             profile.listed = model.listed.clone();
             profile.builtinToolsOverride = Some(model.builtinTools.clone());
+            resolver.initializeNewModel(&mut profile);
             provider.models.push(profile);
             Ok(provider)
         })?;
@@ -420,6 +546,8 @@ impl ModelConfigManager {
             provider.models.retain(|model| model.id != modelId);
             provider
         })?;
+        self.connectionTestDataStore
+            .removeEntry(&Self::connectionTestKey(providerId, modelId))?;
         Ok(())
     }
 
@@ -475,7 +603,7 @@ impl ModelConfigManager {
         capabilities: ModelCapabilities,
     ) -> Result<ModelProfile, ModelConfigError> {
         let (provider, mut model) = self.findModel(providerId, modelId)?;
-        let inherited = ModelSpecResolver::new(&provider).inherited(&model);
+        let inherited = ModelSpecResolver::new(&provider)?.inherited(&model);
         model.capabilitiesOverride = ModelSpecResolver::capabilityOverrides(&inherited, &capabilities);
         self.updateModelProfile(providerId, model)
     }
@@ -489,7 +617,7 @@ impl ModelConfigManager {
         context: ModelContextSpec,
     ) -> Result<ModelProfile, ModelConfigError> {
         let (provider, mut model) = self.findModel(providerId, modelId)?;
-        let inherited = ModelSpecResolver::new(&provider).inherited(&model);
+        let inherited = ModelSpecResolver::new(&provider)?.inherited(&model);
         model.contextOverride = ModelSpecResolver::contextOverride(&inherited, context);
         self.updateModelProfile(providerId, model)
     }
@@ -515,7 +643,7 @@ impl ModelConfigManager {
         request: ModelRequestSpec,
     ) -> Result<ModelProfile, ModelConfigError> {
         let (provider, mut model) = self.findModel(providerId, modelId)?;
-        let inherited = ModelSpecResolver::new(&provider).inherited(&model);
+        let inherited = ModelSpecResolver::new(&provider)?.inherited(&model);
         model.requestOverride = ModelSpecResolver::requestOverrides(&inherited, &request);
         self.updateModelProfile(providerId, model)
     }
@@ -562,7 +690,7 @@ impl ModelConfigManager {
         modelId: &str,
     ) -> Result<ModelThinkingSettings, ModelConfigError> {
         let (provider, model) = self.findModel(providerId, modelId)?;
-        let thinking = Self::resolvedThinking(&provider, &model);
+        let thinking = Self::resolvedThinking(&provider, &model)?;
         Ok(Self::thinkingSettings(
             &provider,
             &model,
@@ -579,6 +707,9 @@ impl ModelConfigManager {
         modelId: &str,
         level: ThinkingLevel,
     ) -> Result<ModelThinkingSettings, ModelConfigError> {
+        // Resolve catalog readiness before entering the preferences transaction.
+        let provider = self.getProviderProfile(providerId)?;
+        let resolver = ModelSpecResolver::new(&provider)?;
         self.modelConfigDataStore.try_edit_result(|preferences| {
             let provider = self.readProviderFromPreferences(preferences, providerId)?;
             let mut provider = self.hydrateLocalProviderModels(provider)?;
@@ -590,7 +721,7 @@ impl ModelConfigManager {
                     ModelConfigError::ModelNotFound(format!("{providerId}:{modelId}"))
                 })?;
             let model = &provider.models[index];
-            let thinking = Self::resolvedThinking(&provider, model);
+            let thinking = resolver.resolve(model).thinking;
             let offered = Self::thinkingLevels(&provider, model, &thinking.spec);
             if !offered.iter().any(|option| option.level == level) {
                 return Err(ModelConfigError::InvalidThinkingLevel(format!(
@@ -623,21 +754,133 @@ impl ModelConfigManager {
         self.getThinkingSettingsForModel(providerId, modelId)
     }
 
-    /// Tests connectivity for one provider/model configuration.
+    /// Reads completed checks whose connection settings still match this node's configuration.
+    pub fn getModelConnectionTestResults(
+        &self,
+        providerId: &str,
+    ) -> Result<Vec<ModelConnectionTestResult>, ModelConfigError> {
+        let provider = self.getProviderProfile(providerId)?;
+        let stream = Self::connectionTestStreamOutput()?;
+        let mut results = Vec::new();
+        for (_, stored) in self
+            .connectionTestDataStore
+            .typedEntries::<StoredModelConnectionTest>()?
+        {
+            if stored.result.providerId != providerId {
+                continue;
+            }
+            let Some(model) = provider
+                .models
+                .iter()
+                .find(|model| model.id == stored.result.modelId)
+            else {
+                continue;
+            };
+            if stored.fingerprint == Self::connectionTestFingerprint(&provider, model, stream)? {
+                results.push(stored.result);
+            }
+        }
+        Ok(results)
+    }
+
+    fn connectionTestKey(providerId: &str, modelId: &str) -> String {
+        let identity = format!("{}:{providerId}{modelId}", providerId.len());
+        format!("{:x}", Sha256::digest(identity.as_bytes()))
+    }
+
+    /// Hash response mode and credentials without copying secrets into the diagnostic record. Key usage
+    /// counters and rotation position are deliberately excluded from configuration identity.
+    fn connectionTestFingerprint(
+        provider: &ProviderProfile,
+        model: &ModelProfile,
+        stream: bool,
+    ) -> Result<String, ModelConfigError> {
+        let keys = provider
+            .apiKeyPool
+            .iter()
+            .map(|key| (&key.key, key.isEnabled))
+            .collect::<Vec<_>>();
+        let connection = serde_json::json!({
+            "providerTypeId": provider.providerTypeId,
+            "providerType": provider.providerType,
+            "endpoint": provider.endpoint,
+            "apiKey": provider.apiKey,
+            "useMultipleApiKeys": provider.useMultipleApiKeys,
+            "apiKeyPool": keys,
+            "keyRotationMode": provider.keyRotationMode,
+            "customHeaders": provider.customHeaders,
+            "requestLimitPerMinute": provider.requestLimitPerMinute,
+            "maxConcurrentRequests": provider.maxConcurrentRequests,
+            "modelId": model.id,
+            "request": model.requestOverride,
+            "parameters": model.parameters,
+            "localRuntime": model.localRuntime,
+            "stream": stream,
+        });
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&connection)?)))
+    }
+
+    fn saveConnectionTestResult(
+        &self,
+        provider: &ProviderProfile,
+        model: &ModelProfile,
+        stream: bool,
+        outcome: &Result<ModelConnectionTestReport, String>,
+    ) -> Result<(), ModelConfigError> {
+        let stored = StoredModelConnectionTest {
+            fingerprint: Self::connectionTestFingerprint(provider, model, stream)?,
+            result: ModelConnectionTestResult {
+                providerId: provider.id.clone(),
+                modelId: model.id.clone(),
+                report: outcome.as_ref().ok().cloned(),
+                error: outcome.as_ref().err().cloned(),
+            },
+        };
+        self.connectionTestDataStore.setTypedEntry(
+            &Self::connectionTestKey(&provider.id, &model.id),
+            &stored,
+        )?;
+        Ok(())
+    }
+
+    /// Reads the same persisted streaming preference used by chat generation.
+    fn connectionTestStreamOutput() -> Result<bool, ModelConfigError> {
+        Ok(!ApiPreferences::getInstance().disableStreamOutputFlow().first()?)
+    }
+
+    /// Tests the selected output mode and commits the outcome before returning to any client.
     pub async fn testModelConnection(
         &self,
         providerId: &str,
         modelId: &str,
         providerRuntimeContext: ProviderRuntimeContext,
     ) -> Result<ModelConnectionTestReport, ModelConfigError> {
-        ModelConfigConnectionTester::run(
-            self.runtimeRoot.clone(),
+        let (provider, model) = self.findModel(providerId, modelId)?;
+        let stream = Self::connectionTestStreamOutput()?;
+        let outcome = ModelConfigConnectionTester::run(
             providerId,
             modelId,
             providerRuntimeContext,
+            stream,
         )
-        .await
-        .map_err(ModelConfigError::ConnectionTest)
+        .await;
+        self.saveConnectionTestResult(&provider, &model, stream, &outcome)?;
+        outcome.map_err(ModelConfigError::ConnectionTest)
+    }
+
+    /// Tests one draft pool entry against the first configured model without saving the draft.
+    pub async fn testProviderApiKey(
+        &self,
+        provider: ProviderProfile,
+        keyId: &str,
+        providerRuntimeContext: ProviderRuntimeContext,
+    ) -> Result<operit_model::ApiKeyInfo::ApiKeyInfo, ModelConfigError> {
+        let entry = provider.apiKeyPool.iter().find(|entry| entry.id == keyId)
+            .ok_or_else(|| ModelConfigError::ApiKeyPool("API key entry not found".to_string()))?.clone();
+        if entry.key.trim().is_empty() { return Err(ModelConfigError::ApiKeyPool("API key is empty".to_string())); }
+        let model = provider.models.first().ok_or_else(|| ModelConfigError::ApiKeyPool("Configure a model before testing API keys".to_string()))?;
+        let config = self.resolveFromProfiles(&provider, model)?;
+        Ok(operit_providers::chat::llmprovider::ApiKeyPoolAvailabilityTester::test_pool_entry(entry, config, providerRuntimeContext).await)
     }
 
     /// Exports all provider profiles as formatted JSON.
@@ -650,7 +893,7 @@ impl ModelConfigManager {
         .map_err(|error| error.to_string())
     }
 
-    /// Imports provider profiles from the JSON format emitted by exportAllProviders.
+    /// Imports provider profiles, assigning numeric name suffixes to resolve display-name collisions.
     pub fn importAllProvidersFromBackupContent(
         &self,
         jsonContent: &str,
@@ -679,9 +922,7 @@ impl ModelConfigManager {
             if providerName.is_empty() {
                 return Err(format!("模型配置备份中的配置「{providerId}」缺少名称"));
             }
-            if !importedProviderNames.insert(providerName) {
-                return Err(format!("模型配置备份包含重复名称：{providerName}"));
-            }
+            importedProviderNames.insert(providerName.to_string());
 
             if provider.providerTypeId != provider.providerType.name() {
                 return Err(format!(
@@ -711,28 +952,38 @@ impl ModelConfigManager {
             .try_edit_result(|preferences| {
                 let providerIds = Self::readProviderList(preferences)?;
                 let currentProviderIds = providerIds.iter().cloned().collect::<HashSet<_>>();
+                let mut occupiedNames = HashSet::new();
                 for currentProviderId in &providerIds {
                     if importedProviderIds.contains(currentProviderId.as_str()) {
                         continue;
                     }
                     let currentProvider =
                         self.readProviderFromPreferences(preferences, currentProviderId)?;
-                    if importedProviderNames.contains(currentProvider.name.trim()) {
-                        return Err(ModelConfigError::ProviderNameAlreadyExists(
-                            currentProvider.name.trim().to_string(),
-                        ));
-                    }
+                    occupiedNames.insert(currentProvider.name.trim().to_string());
                 }
 
                 let mut newCount = 0;
                 let mut updatedCount = 0;
                 for provider in &providers {
+                    let mut provider = provider.clone();
+                    let originalName = provider.name.trim().to_string();
+                    if !occupiedNames.insert(originalName.clone()) {
+                        for suffix in 1u64.. {
+                            let candidate = format!("{originalName}{suffix}");
+                            if !importedProviderNames.contains(&candidate)
+                                && occupiedNames.insert(candidate.clone())
+                            {
+                                provider.name = candidate;
+                                break;
+                            }
+                        }
+                    }
                     if currentProviderIds.contains(&provider.id) {
                         updatedCount += 1;
                     } else {
                         newCount += 1;
                     }
-                    Self::writeProvider(preferences, provider)?;
+                    Self::writeProvider(preferences, &provider)?;
                 }
 
                 Ok(ModelConfigImportResult {
@@ -751,7 +1002,7 @@ impl ModelConfigManager {
         provider: &ProviderProfile,
         model: &ModelProfile,
     ) -> Result<ResolvedModelConfig, ModelConfigError> {
-        let resolved = ModelSpecResolver::new(provider).resolve(model);
+        let resolved = ModelSpecResolver::new(provider)?.resolve(model);
         let pricing = resolved.pricing;
         let context = resolved.context;
         let capabilities = resolved.capabilities;
@@ -807,8 +1058,11 @@ impl ModelConfigManager {
     }
 
     /// Resolves the thinking controls of a configured model.
-    fn resolvedThinking(provider: &ProviderProfile, model: &ModelProfile) -> ResolvedThinking {
-        ModelSpecResolver::new(provider).resolve(model).thinking
+    fn resolvedThinking(
+        provider: &ProviderProfile,
+        model: &ModelProfile,
+    ) -> Result<ResolvedThinking, ModelConfigError> {
+        Ok(ModelSpecResolver::new(provider)?.resolve(model).thinking)
     }
 
     /// Returns the levels a model offers through the API its provider speaks.
@@ -1053,6 +1307,71 @@ impl ModelConfigManager {
                         provider.remove("thinkingOptionId");
                     }
                     preferences.set(&stringPreferencesKey(&key), record);
+                }
+                Ok(())
+            }
+            7 => {
+                // Remove retired message-count controls from every model, preserving
+                // each user's summary switch, token threshold and all other settings.
+                let records = preferences
+                    .iterEntries()
+                    .filter_map(|(key, value)| {
+                        (key != "provider_list" && key.starts_with("provider_"))
+                            .then(|| (key.to_owned(), value.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (key, value) in records {
+                    let mut record = match value {
+                        serde_json::Value::String(encoded) => serde_json::from_str(&encoded)?,
+                        record => record,
+                    };
+                    if let Some(models) = record
+                        .get_mut("models")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for model in models {
+                            if let Some(summary) = model
+                                .get_mut("summary")
+                                .and_then(serde_json::Value::as_object_mut)
+                            {
+                                summary.remove("enableSummaryByMessageCount");
+                                summary.remove("summaryMessageCountThreshold");
+                            }
+                        }
+                    }
+                    preferences.set(&stringPreferencesKey(&key), record);
+                }
+                Ok(())
+            }
+            8 => {
+                // Reidentify remote models once so existing installations use the same
+                // catalog, context threshold and unknown-model tool defaults as new models.
+                let records = preferences
+                    .iterEntries()
+                    .filter_map(|(key, value)| {
+                        (key != "provider_list" && key.starts_with("provider_"))
+                            .then(|| (key.to_owned(), value.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (key, record) in records {
+                    let mut provider: ProviderProfile = serde_json::from_value(record)?;
+                    if provider.providerType == ApiProviderType::LOCAL_MODEL
+                        || provider.models.is_empty()
+                    {
+                        continue;
+                    }
+                    let resolver = ModelSpecResolver::new(&provider)
+                        .map_err(|error| PreferencesDataStoreError::Message(error.to_string()))?;
+                    for model in &mut provider.models {
+                        Self::clearSpecOverrides(model);
+                        model.listed = None;
+                        model.builtinToolsOverride = resolver
+                            .catalogSpec(&model.id)
+                            .map(|spec| spec.builtinTools);
+                        model.summary = ModelSummarySettings::default();
+                        resolver.initializeNewModel(model);
+                    }
+                    preferences.set(&stringPreferencesKey(&key), serde_json::to_value(provider)?);
                 }
                 Ok(())
             }
@@ -1324,11 +1643,202 @@ mod tests {
     use operit_model::ModelConfigData::{ApiProviderType, ModelConfigDefaults};
     use operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost;
     use operit_util::RuntimeStorageLayout::WORKSPACE_DIR_PATH;
-    use operit_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
+
     use std::fs;
     use std::path::{Component, Path, PathBuf};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn completed_connection_tests_survive_reopen_and_follow_model_lifecycle() {
+        use operit_model::ModelConfigData::{ModelProfile, ProviderProfile};
+        use operit_providers::chat::llmprovider::ModelConfigConnectionTester::{
+            ModelConnectionTestItem, ModelConnectionTestReport, ModelConnectionTestType,
+        };
+
+        let root = unique_test_root("connection_results");
+        setup_test_runtime(root.clone());
+        {
+            let manager = ModelConfigManager::default();
+            let mut provider = ProviderProfile::new(
+                "provider-a".into(),
+                "Provider A".into(),
+                ApiProviderType::OPENAI,
+                "https://example.test/v1".into(),
+            );
+            provider.apiKey = "test-key-not-for-diagnostic-storage".into();
+            provider.models = vec![
+                ModelProfile::new("model/a".into()),
+                ModelProfile::new("model-b".into()),
+            ];
+            manager.saveProviderToDataStore(&provider).unwrap();
+            let mut other = provider.clone();
+            other.id = "provider-b".into();
+            other.name = "Provider B".into();
+            manager.saveProviderToDataStore(&other).unwrap();
+            let report = |provider: &ProviderProfile, success| ModelConnectionTestReport {
+                providerId: provider.id.clone(),
+                providerName: provider.name.clone(),
+                providerType: provider.providerTypeId.clone(),
+                modelId: provider.models[0].id.clone(),
+                success,
+                items: vec![ModelConnectionTestItem {
+                    r#type: ModelConnectionTestType::CHAT,
+                    success,
+                    error: if success {
+                        None
+                    } else {
+                        Some("HTTP 503".into())
+                    },
+                }],
+            };
+            let passed = report(&provider, true);
+            let failed = report(&other, false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    manager
+                        .saveConnectionTestResult(&provider, &provider.models[0], true, &Ok(passed.clone()))
+                        .unwrap();
+                });
+                scope.spawn(|| {
+                    manager
+                        .saveConnectionTestResult(
+                            &provider,
+                            &provider.models[1],
+                            true,
+                            &Err("Request could not start".into()),
+                        )
+                        .unwrap();
+                });
+                scope.spawn(|| {
+                    manager
+                        .saveConnectionTestResult(&other, &other.models[0], true, &Ok(failed.clone()))
+                        .unwrap();
+                });
+            });
+            let encoded = fs::read_to_string(
+                root.join(operit_util::RuntimeStorageLayout::RUNTIME_MODEL_CONNECTION_TESTS_PATH),
+            )
+            .unwrap();
+            assert!(!encoded.contains(&provider.apiKey));
+            drop(manager);
+
+            let manager = ModelConfigManager::default();
+            let results = manager
+                .getModelConnectionTestResults(&provider.id)
+                .unwrap();
+            assert_eq!(results.len(), 2);
+            assert!(results
+                .iter()
+                .any(|result| result.report.as_ref() == Some(&passed)));
+            assert!(results.iter().any(|result| result.modelId == "model-b"
+                && result.error.as_deref() == Some("Request could not start")));
+            assert_eq!(
+                manager.getModelConnectionTestResults(&other.id).unwrap()[0]
+                    .report,
+                Some(failed),
+            );
+
+            let preferences = super::ApiPreferences::getInstance();
+            assert!(ModelConfigManager::connectionTestStreamOutput().unwrap());
+            preferences.saveDisableStreamOutput(true).unwrap();
+            assert!(!ModelConfigManager::connectionTestStreamOutput().unwrap());
+            assert!(manager.getModelConnectionTestResults(&provider.id).unwrap().is_empty());
+            preferences.saveDisableStreamOutput(false).unwrap();
+            assert!(ModelConfigManager::connectionTestStreamOutput().unwrap());
+            assert_eq!(manager.getModelConnectionTestResults(&provider.id).unwrap().len(), 2);
+
+            let failed = report(&provider, false);
+            manager
+                .saveConnectionTestResult(&provider, &provider.models[0], true, &Ok(failed.clone()))
+                .unwrap();
+            let results = manager
+                .getModelConnectionTestResults(&provider.id)
+                .unwrap();
+            assert_eq!(results.len(), 2);
+            assert!(results
+                .iter()
+                .any(|result| result.report.as_ref() == Some(&failed)));
+
+            provider.models[0].localRuntime.llamaThreadCount += 1;
+            manager.saveProviderToDataStore(&provider).unwrap();
+            let results = manager
+                .getModelConnectionTestResults(&provider.id)
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].modelId, "model-b");
+            provider.endpoint = "https://changed.example.test/v1".into();
+            manager.saveProviderToDataStore(&provider).unwrap();
+            assert!(manager
+                .getModelConnectionTestResults(&provider.id)
+                .unwrap()
+                .is_empty());
+
+            manager.deleteModel(&provider.id, "model-b").unwrap();
+            manager
+                .createProviderModel(&provider.id, "model-b".into())
+                .unwrap();
+            assert!(manager
+                .getModelConnectionTestResults(&provider.id)
+                .unwrap()
+                .is_empty());
+            manager.deleteProvider(&other.id).unwrap();
+            assert!(manager
+                .connectionTestDataStore
+                .typedEntries::<super::StoredModelConnectionTest>()
+                .unwrap()
+                .iter()
+                .all(|(_, stored)| stored.result.providerId != other.id));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn connection_test_identity_ignores_key_usage_and_applied_capabilities() {
+        use operit_model::ApiKeyInfo::{ApiKeyAvailabilityStatus, ApiKeyInfo};
+        use operit_model::ModelConfigData::{ModelProfile, ProviderProfile};
+
+        let mut provider = ProviderProfile::new(
+            "provider".into(),
+            "Provider".into(),
+            ApiProviderType::OPENAI,
+            "https://example.test/v1".into(),
+        );
+        provider.apiKeyPool = vec![ApiKeyInfo::new("key-id".into(), "secret".into())];
+        let mut model = ModelProfile::new("model".into());
+        let original = ModelConfigManager::connectionTestFingerprint(&provider, &model, true).unwrap();
+        assert_ne!(
+            original,
+            ModelConfigManager::connectionTestFingerprint(&provider, &model, false).unwrap(),
+        );
+        provider.name = "Renamed".into();
+        provider.currentKeyIndex = 1;
+        provider.apiKeyPool[0].usageCount = 5;
+        provider.apiKeyPool[0].lastUsed = 123;
+        provider.apiKeyPool[0].errorCount = 2;
+        provider.apiKeyPool[0].availabilityStatus = ApiKeyAvailabilityStatus::AVAILABLE;
+        model.capabilitiesOverride.directImage = Some(true);
+        model.summary.enableSummary = false;
+        assert_eq!(
+            original,
+            ModelConfigManager::connectionTestFingerprint(&provider, &model, true).unwrap(),
+        );
+        provider.apiKeyPool[0].key = "changed-secret".into();
+        assert_ne!(
+            original,
+            ModelConfigManager::connectionTestFingerprint(&provider, &model, true).unwrap(),
+        );
+        provider.apiKeyPool[0].key = "secret".into();
+        provider.apiKeyPool[0].isEnabled = false;
+        assert_ne!(
+            original,
+            ModelConfigManager::connectionTestFingerprint(&provider, &model, true).unwrap(),
+        );
+        assert_ne!(
+            ModelConfigManager::connectionTestKey("a:b", "c"),
+            ModelConfigManager::connectionTestKey("a", "b:c"),
+        );
+    }
 
     /// Starts a persisted version-three file at its appended migration and preserves unindexed providers.
     #[test]
@@ -1529,47 +2039,49 @@ mod tests {
         use operit_model::ModelConfigData::ModelProfile;
         let root = unique_test_root("local_llm_settings");
         setup_test_runtime(root.clone());
-        let storage = operit_store::RuntimeStorageHost::defaultRuntimeStorageHost();
-        let registry_store = LocalModelRegistryStore::forRuntimeStorage(storage.clone());
-        let manifest = LocalModelCatalog::qwen3LlamaCpp();
-        let model_id = manifest.registryKey();
-        let mut registry = LocalModelRegistrySnapshot::empty();
-        registry.installedModels.push(InstalledLocalModel {
-            manifest,
-            storagePath: "runtime/models/local/chat/qwen".into(),
-            installedAtMs: 1,
-            verifiedAtMs: Some(1),
-        });
-        registry_store.write(&registry).unwrap();
-        let manager = ModelConfigManager::new(root.clone());
-        let provider_id = local_provider(&manager);
-        let mut model = manager.getModelProfile(&provider_id, &model_id).unwrap();
-        assert!(!model.localRuntime.inferenceBindingKey.is_empty());
-        model.localRuntime.llamaThreadCount = 7;
-        model.localRuntime.llamaContextSize = 4096;
-        manager
-            .updateModelProfile(&provider_id, model.clone())
-            .unwrap();
-        assert_eq!(
+        {
+            let storage = operit_store::RuntimeStorageHost::defaultRuntimeStorageHost();
+            let registry_store = LocalModelRegistryStore::forRuntimeStorage(storage.clone());
+            let manifest = LocalModelCatalog::qwen3LlamaCpp();
+            let model_id = manifest.registryKey();
+            let mut registry = LocalModelRegistrySnapshot::empty();
+            registry.installedModels.push(InstalledLocalModel {
+                manifest,
+                storagePath: "runtime/models/local/chat/qwen".into(),
+                installedAtMs: 1,
+                verifiedAtMs: Some(1),
+            });
+            registry_store.write(&registry).unwrap();
+            let manager = ModelConfigManager::default();
+            let provider_id = local_provider(&manager);
+            let mut model = manager.getModelProfile(&provider_id, &model_id).unwrap();
+            assert!(!model.localRuntime.inferenceBindingKey.is_empty());
+            model.localRuntime.llamaThreadCount = 7;
+            model.localRuntime.llamaContextSize = 4096;
             manager
-                .getModelProfile(&provider_id, &model_id)
+                .updateModelProfile(&provider_id, model.clone())
+                .unwrap();
+            assert_eq!(
+                manager
+                    .getModelProfile(&provider_id, &model_id)
+                    .unwrap()
+                    .localRuntime,
+                model.localRuntime
+            );
+            operit_store::CoreNodeBindingStore::CoreNodeBindingStore::new(storage)
                 .unwrap()
-                .localRuntime,
-            model.localRuntime
-        );
-        operit_store::CoreNodeBindingStore::CoreNodeBindingStore::new(storage)
-            .unwrap()
-            .create("remote-llm", "model-device")
-            .unwrap();
-        let mut provider = manager.getProviderProfile(&provider_id).unwrap();
-        let mut remote = ModelProfile::new("remote-model@revision".into());
-        remote.localRuntime.inferenceBindingKey = "remote-llm".into();
-        provider.models.push(remote.clone());
-        manager.saveProviderToDataStore(&provider).unwrap();
-        registry.installedModels.clear();
-        registry_store.write(&registry).unwrap();
-        let models = manager.getProviderProfile(&provider_id).unwrap().models;
-        assert_eq!(models, vec![remote]);
+                .create("remote-llm", "model-device")
+                .unwrap();
+            let mut provider = manager.getProviderProfile(&provider_id).unwrap();
+            let mut remote = ModelProfile::new("remote-model@revision".into());
+            remote.localRuntime.inferenceBindingKey = "remote-llm".into();
+            provider.models.push(remote.clone());
+            manager.saveProviderToDataStore(&provider).unwrap();
+            registry.installedModels.clear();
+            registry_store.write(&registry).unwrap();
+            let models = manager.getProviderProfile(&provider_id).unwrap().models;
+            assert_eq!(models, vec![remote]);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1582,63 +2094,65 @@ mod tests {
         };
         let root = unique_test_root("local_remote_model_collision");
         setup_test_runtime(root.clone());
-        let storage = operit_store::RuntimeStorageHost::defaultRuntimeStorageHost();
-        let registry_store = LocalModelRegistryStore::forRuntimeStorage(storage.clone());
-        let manifest = LocalModelCatalog::qwen3LlamaCpp();
-        let model_id = manifest.registryKey();
-        let mut registry = LocalModelRegistrySnapshot::empty();
-        registry.installedModels.push(InstalledLocalModel {
-            manifest,
-            storagePath: "runtime/models/local/chat/qwen".into(),
-            installedAtMs: 1,
-            verifiedAtMs: Some(1),
-        });
-        registry_store.write(&registry).unwrap();
-        let manager = ModelConfigManager::new(root.clone());
-        let provider_id = local_provider(&manager);
-        let local = manager.getModelProfile(&provider_id, &model_id).unwrap();
-        assert!(!local.localRuntime.inferenceBindingKey.is_empty());
-        operit_store::CoreNodeBindingStore::CoreNodeBindingStore::new(storage)
-            .unwrap()
-            .create("remote-same-model", "remote-model-device")
-            .unwrap();
-        let mut remote = local.clone();
-        remote.localRuntime.inferenceBindingKey = "remote-same-model".into();
-        remote.localRuntime.llamaThreadCount = 7;
-        remote.localRuntime.llamaContextSize = 4096;
-        manager
-            .updateModelProfile(&provider_id, remote.clone())
-            .unwrap();
+        {
+            let storage = operit_store::RuntimeStorageHost::defaultRuntimeStorageHost();
+            let registry_store = LocalModelRegistryStore::forRuntimeStorage(storage.clone());
+            let manifest = LocalModelCatalog::qwen3LlamaCpp();
+            let model_id = manifest.registryKey();
+            let mut registry = LocalModelRegistrySnapshot::empty();
+            registry.installedModels.push(InstalledLocalModel {
+                manifest,
+                storagePath: "runtime/models/local/chat/qwen".into(),
+                installedAtMs: 1,
+                verifiedAtMs: Some(1),
+            });
+            registry_store.write(&registry).unwrap();
+            let manager = ModelConfigManager::default();
+            let provider_id = local_provider(&manager);
+            let local = manager.getModelProfile(&provider_id, &model_id).unwrap();
+            assert!(!local.localRuntime.inferenceBindingKey.is_empty());
+            operit_store::CoreNodeBindingStore::CoreNodeBindingStore::new(storage)
+                .unwrap()
+                .create("remote-same-model", "remote-model-device")
+                .unwrap();
+            let mut remote = local.clone();
+            remote.localRuntime.inferenceBindingKey = "remote-same-model".into();
+            remote.localRuntime.llamaThreadCount = 7;
+            remote.localRuntime.llamaContextSize = 4096;
+            manager
+                .updateModelProfile(&provider_id, remote.clone())
+                .unwrap();
 
-        // A fresh read must preserve the selected device even with identical local weights.
-        let reloaded = ModelConfigManager::new(root.clone());
-        assert_eq!(
-            reloaded.getModelProfile(&provider_id, &model_id).unwrap(),
-            remote
-        );
+            // A fresh read must preserve the selected device even with identical local weights.
+            let reloaded = ModelConfigManager::default();
+            assert_eq!(
+                reloaded.getModelProfile(&provider_id, &model_id).unwrap(),
+                remote
+            );
 
-        // Removing and reinstalling this node's weights must not change the remote reference.
-        registry_store
-            .write(&LocalModelRegistrySnapshot::empty())
-            .unwrap();
-        assert_eq!(
-            reloaded.getModelProfile(&provider_id, &model_id).unwrap(),
-            remote
-        );
-        registry_store.write(&registry).unwrap();
-        assert_eq!(
-            reloaded.getModelProfile(&provider_id, &model_id).unwrap(),
-            remote
-        );
+            // Removing and reinstalling this node's weights must not change the remote reference.
+            registry_store
+                .write(&LocalModelRegistrySnapshot::empty())
+                .unwrap();
+            assert_eq!(
+                reloaded.getModelProfile(&provider_id, &model_id).unwrap(),
+                remote
+            );
+            registry_store.write(&registry).unwrap();
+            assert_eq!(
+                reloaded.getModelProfile(&provider_id, &model_id).unwrap(),
+                remote
+            );
 
-        // An explicit change back to this node remains possible.
-        reloaded
-            .updateModelProfile(&provider_id, local.clone())
-            .unwrap();
-        assert_eq!(
-            reloaded.getModelProfile(&provider_id, &model_id).unwrap(),
-            local
-        );
+            // An explicit change back to this node remains possible.
+            reloaded
+                .updateModelProfile(&provider_id, local.clone())
+                .unwrap();
+            assert_eq!(
+                reloaded.getModelProfile(&provider_id, &model_id).unwrap(),
+                local
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1651,7 +2165,7 @@ mod tests {
             .build()
             .expect("build Tokio runtime");
         runtime.block_on(async {
-            let manager = ModelConfigManager::new(root.clone());
+            let manager = ModelConfigManager::default();
             let provider_id = local_provider(&manager);
             let providers = manager.getProviderProfiles().expect("provider profiles");
             assert!(providers.iter().any(|provider| provider.id == provider_id));
@@ -1663,29 +2177,31 @@ mod tests {
     fn create_local_provider_with_empty_endpoint() {
         let root = unique_test_root("create_local_provider_with_empty_endpoint");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
-        // A fresh install lists no local models until the user adds the provider.
-        assert!(manager
-            .getProviderProfiles()
-            .expect("provider profiles")
-            .iter()
-            .all(|provider| provider.providerType != ApiProviderType::LOCAL_MODEL));
-        let provider_id = manager
-            .createProvider(
-                "Additional Local Models".to_string(),
-                ApiProviderType::LOCAL_MODEL.name().to_string(),
-                String::new(),
-            )
-            .expect("create local provider");
+        {
+            let manager = ModelConfigManager::default();
+            // A fresh install lists no local models until the user adds the provider.
+            assert!(manager
+                .getProviderProfiles()
+                .expect("provider profiles")
+                .iter()
+                .all(|provider| provider.providerType != ApiProviderType::LOCAL_MODEL));
+            let provider_id = manager
+                .createProvider(
+                    "Additional Local Models".to_string(),
+                    ApiProviderType::LOCAL_MODEL.name().to_string(),
+                    String::new(),
+                )
+                .expect("create local provider");
 
-        let provider = manager
-            .getProviderProfile(&provider_id)
-            .expect("created local provider");
-        assert_eq!(provider.providerType, ApiProviderType::LOCAL_MODEL);
-        assert!(provider.endpoint.is_empty());
-        let ids = manager.getProviderIds().expect("provider ids");
-        assert!(ids.contains(&provider_id));
+            let provider = manager
+                .getProviderProfile(&provider_id)
+                .expect("created local provider");
+            assert_eq!(provider.providerType, ApiProviderType::LOCAL_MODEL);
+            assert!(provider.endpoint.is_empty());
+            let ids = manager.getProviderIds().expect("provider ids");
+            assert!(ids.contains(&provider_id));
 
+        }
         fs::remove_dir_all(root).expect("remove model config test root");
     }
 
@@ -1693,54 +2209,96 @@ mod tests {
     fn delete_and_recreate_local_provider() {
         let root = unique_test_root("delete_and_recreate_local_provider");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
-        let original_id = local_provider(&manager);
-        manager
-            .deleteProvider(&original_id)
-            .expect("delete first local provider");
-        assert!(matches!(
-            manager.getProviderProfile(&original_id),
-            Err(ModelConfigError::ProviderNotFound(_))
-        ));
+        {
+            let manager = ModelConfigManager::default();
+            let original_id = local_provider(&manager);
+            manager
+                .deleteProvider(&original_id)
+                .expect("delete first local provider");
+            assert!(matches!(
+                manager.getProviderProfile(&original_id),
+                Err(ModelConfigError::ProviderNotFound(_))
+            ));
 
-        let manager = ModelConfigManager::new(root.clone());
-        assert!(!manager
-            .getProviderIds()
-            .expect("provider ids after reload")
-            .contains(&original_id));
-        let provider_id = manager
-            .createProvider(
-                "Local Models".to_string(),
-                ApiProviderType::LOCAL_MODEL.name().to_string(),
-                String::new(),
-            )
-            .expect("recreate local provider");
-        let manager = ModelConfigManager::new(root.clone());
-        let provider = manager
-            .getProviderProfile(&provider_id)
-            .expect("recreated local provider after reload");
-        assert_eq!(provider.name, "Local Models");
-        assert_eq!(provider.providerType, ApiProviderType::LOCAL_MODEL);
-        manager
-            .deleteProvider(&provider_id)
-            .expect("delete recreated local provider");
-        assert!(!manager
-            .getProviderIds()
-            .expect("provider ids after deletion")
-            .contains(&provider_id));
-        assert!(matches!(
-            manager.getProviderProfile(&provider_id),
-            Err(ModelConfigError::ProviderNotFound(_))
-        ));
+            let manager = ModelConfigManager::default();
+            assert!(!manager
+                .getProviderIds()
+                .expect("provider ids after reload")
+                .contains(&original_id));
+            let provider_id = manager
+                .createProvider(
+                    "Local Models".to_string(),
+                    ApiProviderType::LOCAL_MODEL.name().to_string(),
+                    String::new(),
+                )
+                .expect("recreate local provider");
+            let manager = ModelConfigManager::default();
+            let provider = manager
+                .getProviderProfile(&provider_id)
+                .expect("recreated local provider after reload");
+            assert_eq!(provider.name, "Local Models");
+            assert_eq!(provider.providerType, ApiProviderType::LOCAL_MODEL);
+            manager
+                .deleteProvider(&provider_id)
+                .expect("delete recreated local provider");
+            assert!(!manager
+                .getProviderIds()
+                .expect("provider ids after deletion")
+                .contains(&provider_id));
+            assert!(matches!(
+                manager.getProviderProfile(&provider_id),
+                Err(ModelConfigError::ProviderNotFound(_))
+            ));
 
+        }
         fs::remove_dir_all(root).expect("remove model config test root");
+    }
+
+    /// Verifies concurrent requests retain affinity and stale drafts preserve fault-driven selection.
+    #[test]
+    fn api_key_pool_reservations_are_atomic_and_survive_editor_save() {
+        use operit_model::ApiKeyInfo::ApiKeyInfo;
+        let root = unique_test_root("api_key_pool_atomic");
+        setup_test_runtime(root.clone());
+        let manager = ModelConfigManager::default();
+        let id = ModelConfigManager::DEFAULT_PROVIDER_ID;
+        let mut provider = manager.getProviderProfile(id).unwrap();
+        provider.useMultipleApiKeys = true;
+        provider.apiKeyPool = (0..3).map(|i| ApiKeyInfo::new(i.to_string(), format!("fixture-{i}"))).collect();
+        let stale_editor = manager.updateProviderProfile(provider).unwrap();
+        let workers: Vec<_> = (0..12).map(|_| {
+            let manager = manager.clone();
+            std::thread::spawn(move || manager.reserveProviderApiKey(id).unwrap())
+        }).collect();
+        let mut keys: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        keys.sort();
+        assert!(keys.iter().all(|key| key == "fixture-0"));
+        manager.reportProviderApiKey(id, "fixture-0", 0, super::ApiKeyOutcome::Authentication).unwrap();
+        assert_eq!(manager.reserveProviderApiKey(id).unwrap(), "fixture-1");
+        manager.updateProviderProfile(stale_editor).unwrap();
+        let saved = manager.getProviderProfile(id).unwrap();
+        assert_eq!(saved.currentKeyIndex, 1);
+        assert_eq!(saved.apiKeyPool.iter().map(|key| key.usageCount).sum::<i64>(), 13);
+        assert_eq!(manager.reserveProviderApiKey(id).unwrap(), "fixture-1");
+        manager.reportProviderApiKey(id, "fixture-0", 0, super::ApiKeyOutcome::Success).unwrap();
+        assert_eq!(manager.reserveProviderApiKey(id).unwrap(), "fixture-1");
+        let mut edited = manager.getProviderProfile(id).unwrap();
+        edited.apiKeyPool[2].isEnabled = false;
+        edited.apiKeyPool.insert(0, ApiKeyInfo::new("new".into(), "fixture-new".into()));
+        manager.updateProviderProfile(edited).unwrap();
+        let another_manager = ModelConfigManager::default();
+        assert_eq!(another_manager.reserveProviderApiKey(id).unwrap(), "fixture-1");
+        assert_eq!(another_manager.getProviderProfile(id).unwrap().currentKeyIndex, 2);
+        another_manager.reportProviderApiKey(id, "fixture-1", 0, super::ApiKeyOutcome::Authentication).unwrap();
+        assert_eq!(manager.reserveProviderApiKey(id).unwrap(), "fixture-new");
+        assert_eq!(manager.getProviderProfile(id).unwrap().apiKeyPool[1].errorCount, 1);
     }
 
     #[test]
     fn provider_model_update_keeps_existing_api_key() {
         let root = unique_test_root("provider_internal_update_keeps_latest_api_key");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
+        let manager = ModelConfigManager::default();
 
         let mut provider = manager
             .getProviderProfile(ModelConfigManager::DEFAULT_PROVIDER_ID)
@@ -1768,16 +2326,22 @@ mod tests {
     /// Verifies exported provider JSON restores a new provider with its API key.
     #[test]
     fn import_all_providers_from_backup_content_restores_provider() {
+        use operit_model::ModelConfigData::{ModelSummarySettings, ProviderProfile};
         let root = unique_test_root("import_all_providers_from_backup_content_restores_provider");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
+        let manager = ModelConfigManager::default();
         let mut provider = manager
             .getProviderProfile(ModelConfigManager::DEFAULT_PROVIDER_ID)
             .expect("default provider");
         provider.id = "restored_provider".to_string();
         provider.name = "Restored provider".to_string();
         provider.apiKey = "sk-restored".to_string();
-        let backup = serde_json::to_string(&vec![provider]).expect("serialize backup");
+        let mut backup = serde_json::to_value(vec![provider]).expect("serialize backup");
+        backup[0]["models"][0]["summary"] = serde_json::json!({
+            "enableSummary": false, "summaryTokenThreshold": 0.92,
+            "enableSummaryByMessageCount": true, "summaryMessageCountThreshold": 1
+        });
+        let backup = backup.to_string();
 
         let result = manager
             .importAllProvidersFromBackupContent(&backup)
@@ -1794,8 +2358,78 @@ mod tests {
                 .apiKey,
             "sk-restored"
         );
+        let restored = manager.getProviderProfile("restored_provider").unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored.models[0].summary).unwrap(),
+            serde_json::to_value(ModelSummarySettings {
+                enableSummary: false,
+                summaryTokenThreshold: 0.92,
+            }).unwrap()
+        );
+        let exported: Vec<ProviderProfile> = serde_json::from_str(
+            &manager.exportAllProviders().expect("export imported settings")
+        ).unwrap();
+        let exported = exported.iter().find(|provider| provider.id == "restored_provider").unwrap();
+        assert_eq!(exported.models[0].summary, restored.models[0].summary);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Resolves backup and target name collisions without changing provider data or reimport identities.
+    #[test]
+    fn import_all_providers_assigns_numeric_suffixes_to_duplicate_names() {
+        let root = unique_test_root("import_provider_name_collisions");
+        setup_test_runtime(root.clone());
+        let manager = ModelConfigManager::default();
+        let template = manager.getProviderProfile(ModelConfigManager::DEFAULT_PROVIDER_ID).unwrap();
+        let retainedId = manager.createProvider(
+            "Shared".to_string(), "OPENAI".to_string(), "https://retained.invalid/v1".to_string(),
+        ).unwrap();
+        manager.createProvider(
+            "Shared1".to_string(), "OPENAI".to_string(), "https://retained.invalid/v1".to_string(),
+        ).unwrap();
+        let retainedBefore = serde_json::to_value(manager.getProviderProfile(&retainedId).unwrap()).unwrap();
+        let mut providers = Vec::new();
+        for (id, name) in [
+            ("import-a", "Shared"),
+            ("import-b", " Shared "),
+            ("import-c", "Shared2"),
+            ("import-d", "Untouched"),
+            ("import-e", "Untouched"),
+        ] {
+            let mut provider = template.clone();
+            provider.id = id.to_string();
+            provider.name = name.to_string();
+            provider.apiKey = format!("secret-{id}");
+            providers.push(provider);
+        }
+        let backup = serde_json::to_string(&providers).unwrap();
+        let result = manager.importAllProvidersFromBackupContent(&backup).unwrap();
+        assert_eq!((result.new, result.updated, result.skipped, result.total), (5, 0, 0, 5));
+        for (source, expectedName) in providers.iter().zip(["Shared3", "Shared4", "Shared2", "Untouched", "Untouched1"]) {
+            let imported = manager.getProviderProfile(&source.id).unwrap();
+            let mut expected = source.clone();
+            expected.name = expectedName.to_string();
+            assert_eq!(serde_json::to_value(&imported).unwrap(), serde_json::to_value(&expected).unwrap());
+        }
+        assert_eq!(serde_json::to_value(manager.getProviderProfile(&retainedId).unwrap()).unwrap(), retainedBefore);
+        let beforeReimport = manager.exportAllProviders().unwrap();
+        let result = manager.importAllProvidersFromBackupContent(&backup).unwrap();
+        assert_eq!((result.new, result.updated, result.skipped, result.total), (0, 5, 0, 5));
+        assert_eq!(manager.exportAllProviders().unwrap(), beforeReimport);
+    }
+
+    /// Keeps identity collisions invalid even when duplicate display names can be renamed.
+    #[test]
+    fn import_all_providers_rejects_duplicate_ids_before_writing() {
+        let root = unique_test_root("import_provider_duplicate_ids");
+        setup_test_runtime(root.clone());
+        let manager = ModelConfigManager::default();
+        let provider = manager.getProviderProfile(ModelConfigManager::DEFAULT_PROVIDER_ID).unwrap();
+        let beforeImport = manager.exportAllProviders().unwrap();
+        let backup = serde_json::to_string(&vec![provider.clone(), provider]).unwrap();
+        assert!(manager.importAllProvidersFromBackupContent(&backup).unwrap_err().starts_with("模型配置备份包含重复 ID："));
+        assert_eq!(manager.exportAllProviders().unwrap(), beforeImport);
     }
 
     /// Verifies provider UUID allocation and rejects an occupied display name.
@@ -1803,7 +2437,7 @@ mod tests {
     fn create_provider_rejects_duplicate_name() {
         let root = unique_test_root("create_provider_rejects_duplicate_name");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
+        let manager = ModelConfigManager::default();
 
         let providerId = manager
             .createProvider(
@@ -1833,7 +2467,7 @@ mod tests {
     fn update_provider_profile_rejects_duplicate_name() {
         let root = unique_test_root("update_provider_profile_rejects_duplicate_name");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
+        let manager = ModelConfigManager::default();
 
         let providerId = manager
             .createProvider(
@@ -1865,11 +2499,114 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Applies catalog context defaults and enables tools for manually entered unknown models.
+    #[test]
+    fn new_model_defaults_apply_to_manual_models() {
+        let root = unique_test_root("new_model_defaults_manual");
+        setup_test_runtime(root);
+        let manager = ModelConfigManager::default();
+        let providerId = manager
+            .createProvider(
+                "Codex defaults".into(),
+                "OPENAI_CODEX".into(),
+                "https://chatgpt.com/backend-api/codex/responses".into(),
+            )
+            .unwrap();
+        for (modelId, expectedThreshold) in [
+            ("gpt-5.3-codex-spark", 0.85),
+            ("gpt-5.4", 0.28),
+            ("unknown-manual-model", 0.85),
+        ] {
+            manager
+                .createProviderModel(&providerId, modelId.into())
+                .unwrap();
+            let resolved = manager
+                .getResolvedModelConfig(&providerId, modelId)
+                .unwrap();
+            assert!((resolved.summary.summaryTokenThreshold - expectedThreshold).abs() < 1e-6);
+            assert!(resolved.summary.enableSummary);
+            assert!(resolved.capabilities.toolCall);
+            assert!(resolved.request.supportsStructuredTools);
+            let profile = manager.getModelProfile(&providerId, modelId).unwrap();
+            assert_eq!(
+                profile.capabilitiesOverride.toolCall,
+                (modelId == "unknown-manual-model").then_some(true)
+            );
+        }
+    }
+
+    /// Covers context boundaries, whole-percent rounding, and explicit provider tool capabilities.
+    #[test]
+    fn new_model_defaults_apply_to_available_models() {
+        use operit_model::ModelConfigData::{ModelCapabilities, ModelContextSpec, ModelListedSpec};
+        let root = unique_test_root("new_model_defaults_available");
+        setup_test_runtime(root);
+        let manager = ModelConfigManager::default();
+        let providerId = ModelConfigManager::DEFAULT_PROVIDER_ID;
+        for (index, (context, expectedThreshold)) in [
+            (128.0, 0.85),
+            (300.0, 0.85),
+            (301.0, 0.99),
+            (400.0, 0.75),
+            (1000.0, 0.30),
+            (1048.576, 0.28),
+            (2000.0, 0.15),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let modelId = format!("unknown-listed-model-{index}");
+            manager
+                .addProviderModelFromAvailable(
+                    providerId,
+                    available_model(
+                        &modelId,
+                        Some(ModelListedSpec {
+                            context: Some(ModelContextSpec {
+                                maxContextLength: context,
+                            }),
+                            ..ModelListedSpec::default()
+                        }),
+                    ),
+                )
+                .unwrap();
+            let resolved = manager
+                .getResolvedModelConfig(providerId, &modelId)
+                .unwrap();
+            assert!((resolved.summary.summaryTokenThreshold - expectedThreshold).abs() < 1e-6);
+            assert!(resolved.capabilities.toolCall);
+            assert!(resolved.request.supportsStructuredTools);
+        }
+        manager
+            .addProviderModelFromAvailable(
+                providerId,
+                available_model(
+                    "explicitly-no-tools",
+                    Some(ModelListedSpec {
+                        capabilities: Some(ModelCapabilities::default()),
+                        supportsStructuredTools: Some(false),
+                        ..ModelListedSpec::default()
+                    }),
+                ),
+            )
+            .unwrap();
+        let resolved = manager
+            .getResolvedModelConfig(providerId, "explicitly-no-tools")
+            .unwrap();
+        assert!(!resolved.capabilities.toolCall);
+        assert!(!resolved.request.supportsStructuredTools);
+        let profile = manager
+            .getModelProfile(providerId, "explicitly-no-tools")
+            .unwrap();
+        assert!(profile.capabilitiesOverride.isEmpty());
+        assert_eq!(profile.requestOverride.supportsStructuredTools, None);
+    }
+
     #[test]
     fn create_provider_model_rejects_existing_model_id() {
         let root = unique_test_root("create_provider_model_rejects_existing_model_id");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
+        let manager = ModelConfigManager::default();
 
         let error = manager
             .createProviderModel(
@@ -1896,7 +2633,7 @@ mod tests {
     fn add_provider_model_from_available_rejects_existing_model_id() {
         let root = unique_test_root("add_provider_model_from_available_rejects_existing_model_id");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
+        let manager = ModelConfigManager::default();
 
         let error = manager
             .addProviderModelFromAvailable(
@@ -1925,7 +2662,7 @@ mod tests {
         use operit_model::ModelConfigData::{ModelCapabilities, ModelListedSpec};
         let root = unique_test_root("capability_updates_keep_only_differing_values");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
+        let manager = ModelConfigManager::default();
         let listed = ModelListedSpec {
             capabilities: Some(ModelCapabilities {
                 directImage: true,
@@ -2008,7 +2745,7 @@ mod tests {
             .unwrap();
         let expectedMigrationStep = std::sync::atomic::AtomicU32::new(5);
         let store = CoreNodeStateStore::newWithStorage(host, path).withSchema(
-            ModelConfigManager::PREFERENCES_VERSION,
+            6,
             move |version, preferences| {
                 assert_eq!(
                     version,
@@ -2027,9 +2764,68 @@ mod tests {
         let model = &provider.models[0];
         assert!(!model.hasSpecOverrides());
         assert_eq!(model.requestOverride.enableClaude1hPromptCache, Some(true));
+        assert_eq!(store.schemaVersion().unwrap(), 6);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Tests the historical summary cleanup independently of later model resets.
+    #[test]
+    fn schema_seven_migration_removes_retired_summary_controls() {
+        use operit_store::PreferencesDataStore::{stringPreferencesKey, PreferencesDataStore};
+        let root = unique_test_root("schema_seven_summary_controls");
+        let host: Arc<dyn RuntimeStorageHost> =
+            Arc::new(TestRuntimeStorageHost { root: root.clone() });
+        let path = "runtime/config/model-schema-seven.preferences.json";
+        let provider = serde_json::json!({
+            "id": "custom",
+            "apiKey": "preserved-test-key",
+            "models": [
+                {"id": "enabled", "summary": {
+                    "enableSummary": true, "summaryTokenThreshold": 0.92,
+                    "enableSummaryByMessageCount": true, "summaryMessageCountThreshold": 1
+                }},
+                {"id": "disabled", "summary": {
+                    "enableSummary": false, "summaryTokenThreshold": 70,
+                    "enableSummaryByMessageCount": false, "summaryMessageCountThreshold": 16
+                }},
+                {"id": "without-summary"}
+            ]
+        });
+        let legacy = serde_json::json!({
+            "__operit_preferences_schema_version": "7",
+            "provider_custom": provider,
+            "provider_unindexed": provider.to_string(),
+            "unrelated_preference": "preserved"
+        });
+        host.writeBytes(path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let store = PreferencesDataStore::newWithStorage(host.clone(), path).withSchema(
+            8,
+            ModelConfigManager::migratePreferences,
+        );
+        let migrated = store.data().unwrap();
+        let mut expected = provider;
+        for summary in expected["models"].as_array_mut().unwrap().iter_mut()
+            .filter_map(|model| model.get_mut("summary"))
+        {
+            let summary = summary.as_object_mut().unwrap();
+            summary.remove("enableSummaryByMessageCount");
+            summary.remove("summaryMessageCountThreshold");
+        }
+        for key in ["provider_custom", "provider_unindexed"] {
+            assert_eq!(migrated.get(&stringPreferencesKey(key)), Some(&expected));
+        }
         assert_eq!(
-            store.schemaVersion().unwrap(),
-            ModelConfigManager::PREFERENCES_VERSION
+            migrated.get(&stringPreferencesKey("unrelated_preference")),
+            Some(&serde_json::json!("preserved"))
+        );
+        assert_eq!(store.schemaVersion().unwrap(), 8);
+        let reopened = PreferencesDataStore::newEncryptedWithStorage(host, path).withMigration(
+            8,
+            |_, _| panic!("a migrated store must not run migration again"),
+        );
+        assert_eq!(
+            reopened.data().unwrap().get(&stringPreferencesKey("provider_custom")),
+            Some(&expected)
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -2067,76 +2863,78 @@ mod tests {
         use operit_model::ModelThinking::{ModelThinkingSpec, ThinkingLevel::*, ThinkingSpecSource};
         let root = unique_test_root("thinking_levels_per_model");
         setup_test_runtime(root.clone());
-        let manager = ModelConfigManager::new(root.clone());
-        let provider = ModelConfigManager::DEFAULT_PROVIDER_ID;
-        let graded = ModelConfigManager::DEFAULT_MODEL_ID;
-        let switch = manager
-            .createProviderModel(provider, "switch-only".to_string())
-            .expect("second model");
-        manager
-            .setThinkingOverrideForModel(
-                provider,
-                graded,
-                Some(ModelThinkingSpec {
-                    supported: true,
-                    toggle: true,
-                    efforts: vec![Low, High, Max],
-                    budget: None,
-                }),
-            )
-            .expect("describe graded model");
-        let described = manager
-            .setThinkingOverrideForModel(provider, &switch, Some(ModelThinkingSpec::switchable()))
-            .expect("describe switch-only model");
-        assert_eq!(described.source, ThinkingSpecSource::Declared);
-
-        // Nothing set yet: no thinking.
-        let fresh = manager.getThinkingSettingsForModel(provider, graded).unwrap();
-        assert_eq!(
-            fresh.levels.iter().map(|option| option.level).collect::<Vec<_>>(),
-            vec![Off, Low, High, Max]
-        );
-        assert_eq!((fresh.current, fresh.chosen), (Some(Off), false));
-
-        // A level set on one model carries to a model never set, as its nearest level.
-        let graded_high = manager
-            .setThinkingLevelForModel(provider, graded, High)
-            .expect("set high");
-        assert_eq!((graded_high.current, graded_high.chosen), (Some(High), true));
-        let carried = manager.getThinkingSettingsForModel(provider, &switch).unwrap();
-        assert_eq!((carried.current, carried.chosen), (Some(Enabled), false));
-
-        // A level set on the second model stays there and leaves the first alone.
-        manager
-            .setThinkingLevelForModel(provider, &switch, Off)
-            .expect("turn off");
-        assert_eq!(
+        {
+            let manager = ModelConfigManager::default();
+            let provider = ModelConfigManager::DEFAULT_PROVIDER_ID;
+            let graded = ModelConfigManager::DEFAULT_MODEL_ID;
+            let switch = manager
+                .createProviderModel(provider, "switch-only".to_string())
+                .expect("second model");
             manager
-                .getResolvedModelConfig(provider, &switch)
-                .unwrap()
-                .thinkingLevel,
-            Some(Off)
-        );
-        assert_eq!(
+                .setThinkingOverrideForModel(
+                    provider,
+                    graded,
+                    Some(ModelThinkingSpec {
+                        supported: true,
+                        toggle: true,
+                        efforts: vec![Low, High, Max],
+                        budget: None,
+                    }),
+                )
+                .expect("describe graded model");
+            let described = manager
+                .setThinkingOverrideForModel(provider, &switch, Some(ModelThinkingSpec::switchable()))
+                .expect("describe switch-only model");
+            assert_eq!(described.source, ThinkingSpecSource::Declared);
+
+            // Nothing set yet: no thinking.
+            let fresh = manager.getThinkingSettingsForModel(provider, graded).unwrap();
+            assert_eq!(
+                fresh.levels.iter().map(|option| option.level).collect::<Vec<_>>(),
+                vec![Off, Low, High, Max]
+            );
+            assert_eq!((fresh.current, fresh.chosen), (Some(Off), false));
+
+            // A level set on one model carries to a model never set, as its nearest level.
+            let graded_high = manager
+                .setThinkingLevelForModel(provider, graded, High)
+                .expect("set high");
+            assert_eq!((graded_high.current, graded_high.chosen), (Some(High), true));
+            let carried = manager.getThinkingSettingsForModel(provider, &switch).unwrap();
+            assert_eq!((carried.current, carried.chosen), (Some(Enabled), false));
+
+            // A level set on the second model stays there and leaves the first alone.
             manager
-                .getResolvedModelConfig(provider, graded)
-                .unwrap()
-                .thinkingLevel,
-            Some(High)
-        );
+                .setThinkingLevelForModel(provider, &switch, Off)
+                .expect("turn off");
+            assert_eq!(
+                manager
+                    .getResolvedModelConfig(provider, &switch)
+                    .unwrap()
+                    .thinkingLevel,
+                Some(Off)
+            );
+            assert_eq!(
+                manager
+                    .getResolvedModelConfig(provider, graded)
+                    .unwrap()
+                    .thinkingLevel,
+                Some(High)
+            );
 
-        // A level the model does not offer is refused.
-        assert!(matches!(
-            manager.setThinkingLevelForModel(provider, graded, Medium),
-            Err(ModelConfigError::InvalidThinkingLevel(_))
-        ));
+            // A level the model does not offer is refused.
+            assert!(matches!(
+                manager.setThinkingLevelForModel(provider, graded, Medium),
+                Err(ModelConfigError::InvalidThinkingLevel(_))
+            ));
 
-        // Clearing the description leaves a model the catalog does not know without levels.
-        let cleared = manager
-            .setThinkingOverrideForModel(provider, &switch, None)
-            .expect("clear description");
-        assert!(cleared.levels.is_empty());
-        assert_eq!(cleared.current, None);
+            // Clearing the description leaves a model the catalog does not know without levels.
+            let cleared = manager
+                .setThinkingOverrideForModel(provider, &switch, None)
+                .expect("clear description");
+            assert!(cleared.levels.is_empty());
+            assert_eq!(cleared.current, None);
+        }
         fs::remove_dir_all(root).expect("remove model config test root");
     }
 
@@ -2151,7 +2949,7 @@ mod tests {
             String::new(),
         );
         let model = ModelProfile::new("qwen3@v1".to_string());
-        let thinking = ModelConfigManager::resolvedThinking(&provider, &model);
+        let thinking = ModelConfigManager::resolvedThinking(&provider, &model).unwrap();
         assert_eq!(thinking.source, ThinkingSpecSource::LocalRuntime);
         assert_eq!(
             ModelConfigManager::thinkingLevels(&provider, &model, &thinking.spec)
@@ -2170,11 +2968,16 @@ mod tests {
         std::env::temp_dir().join(format!("operit_model_config_test_{name}_{now}"))
     }
 
+    /// Seeds a downloaded catalog so configuration tests never depend on network access.
     fn setup_test_runtime(root: PathBuf) {
-        setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(
-            root.clone(),
-            root.join(WORKSPACE_DIR_PATH),
-        ));
+        let catalogDir = root.join(
+            operit_util::RuntimeStorageLayout::RUNTIME_MODELS_DEV_CACHE_DIR_PATH,
+        );
+        fs::create_dir_all(&catalogDir).unwrap();
+        fs::write(catalogDir.join("api.json"), br#"{"fixture":{"models":{}}}"#).unwrap();
+        fs::write(catalogDir.join("models.json"), b"{}").unwrap();
+        fs::write(catalogDir.join("downloaded.json"), br#"{"updatedAt":1}"#).unwrap();
+
         setDefaultRuntimeStorageHost(Arc::new(TestRuntimeStorageHost { root }));
     }
 
@@ -2222,7 +3025,7 @@ mod tests {
 
         /// Returns the temporary runtime root.
         fn runtimeRootDir(&self) -> Option<PathBuf> {
-            Some(self.root.clone())
+            Some(self.root.join("runtime"))
         }
 
         /// Returns the temporary workspace collection root.

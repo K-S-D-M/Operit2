@@ -184,9 +184,12 @@ const ENDPOINT: &str = ": heartbeat\r\n\r\nevent: endpoint\r\ndata: /message?ses
 #[tokio::test]
 async fn liveSseHandshakeAndRepeatedCallsReadFutureChunks() {
     let host = Arc::new(StreamingHost::new(ENDPOINT));
+    let mut registered = service();
+    registered.bearerToken = Some("ignored-token".into());
+    registered.headers.insert("aUtHoRiZaTiOn".into(), "Bearer explicit-token".into());
     let mut active = startRemoteServiceSession(
         host.clone(),
-        &service(),
+        &registered,
         &StartupDeadline::new(testScheduler(), 1000).unwrap(),
     )
     .await
@@ -210,6 +213,13 @@ async fn liveSseHandshakeAndRepeatedCallsReadFutureChunks() {
         "tool calls must not be replayed"
     );
     assert!(host.cancelled.lock().unwrap().is_empty());
+    for request in host.requests.lock().unwrap().iter() {
+        let authorization: Vec<_> = request.headers.iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(authorization, ["Bearer explicit-token"]);
+    }
     drop(active);
     assert_eq!(host.cancelled.lock().unwrap().len(), 1);
 }
@@ -323,11 +333,8 @@ async fn readerReportsCleanClosureAndDisconnectWithoutBusyLoop() {
             host.chunk.lock().unwrap().take();
             host.closed.lock().unwrap().take();
         }
-        assert!(reader
-            .next(&deadline)
-            .await
-            .unwrap_err()
-            .contains(if closed { "closed" } else { "disconnected" }));
+        assert!(matches!(reader.next(&deadline).await.unwrap(),
+            RemoteSseEvent::Closed(error) if error.contains(if closed { "closed" } else { "disconnected" })));
     }
 }
 
@@ -457,4 +464,64 @@ async fn concurrentStartupIsSerializedAndDroppedOwnerReleasesGate() {
     drop(second);
     assert_eq!(host.cancelled.lock().unwrap().len(), 2);
     assert!(!fixture.bridge.getServiceInfo(&fixture.name).unwrap().active);
+}
+
+/// Keeps automatic and manual starts on the same session when configuration is unchanged.
+#[tokio::test]
+async fn identicalRemoteRegistrationPreservesPendingAndReadySession() {
+    let host = Arc::new(StreamingHost::new(": heartbeat\n\n"));
+    let fixture = RegisteredFixture::new(host.clone());
+    let mut first = Box::pin(fixture.spawn());
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    fixture.bridge.registerRemoteMcpService(
+        fixture.name.clone(),
+        "https://test.invalid/sse".into(),
+        Some("sse".into()),
+        Some("Updated display metadata".into()),
+        None,
+        BTreeMap::new(),
+    );
+    let mut second = Box::pin(fixture.spawn());
+    assert!(futures_util::poll!(second.as_mut()).is_pending());
+    assert!(host.cancelled.lock().unwrap().is_empty());
+    assert_eq!(host.requests.lock().unwrap().len(), 1);
+    let chunk = host.chunk.lock().unwrap().clone().unwrap();
+    chunk(ENDPOINT.as_bytes().to_vec());
+    assert_eq!(first.await["success"], true);
+    assert_eq!(second.await["success"], true);
+    let before = host.requests.lock().unwrap().len();
+    fixture.bridge.registerRemoteMcpService(
+        fixture.name.clone(),
+        "https://test.invalid/sse".into(),
+        Some("sse".into()),
+        None,
+        None,
+        BTreeMap::new(),
+    );
+    assert_eq!(fixture.spawn().await["success"], true);
+    assert_eq!(host.requests.lock().unwrap().len(), before);
+    assert!(host.cancelled.lock().unwrap().is_empty());
+}
+
+/// Cancels the old authenticated session when a connection credential actually changes.
+#[tokio::test]
+async fn changedRemoteCredentialReplacesReadySession() {
+    let host = Arc::new(StreamingHost::new(ENDPOINT));
+    let fixture = RegisteredFixture::new(host.clone());
+    assert_eq!(fixture.spawn().await["success"], true);
+    fixture.bridge.registerRemoteMcpService(
+        fixture.name.clone(),
+        "https://test.invalid/sse".into(),
+        Some("sse".into()),
+        None,
+        Some("replacement-credential".into()),
+        BTreeMap::new(),
+    );
+    assert!(!fixture.bridge.getServiceInfo(&fixture.name).unwrap().active);
+    assert_eq!(host.cancelled.lock().unwrap().len(), 1);
+    assert_eq!(fixture.spawn().await["success"], true);
+    let requests = host.requests.lock().unwrap();
+    assert!(requests.last().unwrap().headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("Authorization") && value == "Bearer replacement-credential"
+    }));
 }

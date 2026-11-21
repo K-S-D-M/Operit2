@@ -17,6 +17,11 @@ pub const TOOLPKG_EVENT_XML_RENDER: &str = "toolpkg_xml_render";
 pub const TOOLPKG_EVENT_INPUT_MENU_TOGGLE: &str = "toolpkg_input_menu_toggle";
 pub const TOOLPKG_EVENT_CHAT_INPUT: &str = "toolpkg_chat_input";
 pub const TOOLPKG_EVENT_CHAT_VIEW: &str = "toolpkg_chat_view";
+/// Routes awaited text-only transformations without exposing structural message mutation.
+pub const TOOLPKG_EVENT_MESSAGE_TRANSFORM: &str = "toolpkg_message_transform";
+pub const TOOLPKG_EVENT_MESSAGE_STREAM_TRANSFORM: &str = "toolpkg_message_stream_transform";
+pub const TOOLPKG_REGISTRATION_MESSAGE_STREAM_TRANSFORM: &str = "ToolPkg.registerMessageStreamTransform";
+pub const TOOLPKG_REGISTRATION_MESSAGE_TRANSFORM_HOOK: &str = "ToolPkg.registerMessageTransformHook";
 pub const TOOLPKG_EVENT_CHAT_MESSAGE: &str = "toolpkg_chat_message";
 /// Routes the awaited generic conversation creation lifecycle envelope.
 pub const TOOLPKG_EVENT_CHAT_LIFECYCLE: &str = "toolpkg_chat_lifecycle";
@@ -25,6 +30,7 @@ pub const TOOLPKG_EVENT_CHAT_RUNTIME: &str = "toolpkg_chat_runtime";
 pub const TOOLPKG_EVENT_NAVIGATION_ENTRY_ACTION: &str = "toolpkg_navigation_entry_action";
 pub const TOOLPKG_EVENT_HOST_EVENT: &str = "toolpkg_host_event";
 pub const TOOLPKG_EVENT_TOOL_LIFECYCLE: &str = "toolpkg_tool_lifecycle";
+pub const TOOLPKG_EVENT_TOOL_PERMISSION: &str = "toolpkg_tool_permission";
 pub const TOOLPKG_EVENT_PROMPT_INPUT: &str = "toolpkg_prompt_input";
 pub const TOOLPKG_EVENT_PROMPT_HISTORY: &str = "toolpkg_prompt_history";
 pub const TOOLPKG_EVENT_PROMPT_ESTIMATE_HISTORY: &str = "toolpkg_prompt_estimate_history";
@@ -62,6 +68,7 @@ pub const TOOLPKG_EVENT_CHAT_RESPONSE: &str = "chat_response";
 pub const TOOLPKG_REGISTRATION_CHAT_RUNTIME_HOOK: &str = "ToolPkg.registerChatRuntimeHook";
 pub const TOOLPKG_REGISTRATION_HOST_EVENT_HOOK: &str = "ToolPkg.registerHostEventHook";
 pub const TOOLPKG_REGISTRATION_TOOL_LIFECYCLE_HOOK: &str = "ToolPkg.registerToolLifecycleHook";
+pub const TOOLPKG_REGISTRATION_TOOL_PERMISSION_HOOK: &str = "ToolPkg.registerToolPermissionHook";
 pub const TOOLPKG_REGISTRATION_PROMPT_INPUT_HOOK: &str = "ToolPkg.registerPromptInputHook";
 pub const TOOLPKG_REGISTRATION_PROMPT_HISTORY_HOOK: &str = "ToolPkg.registerPromptHistoryHook";
 pub const TOOLPKG_REGISTRATION_PROMPT_ESTIMATE_HISTORY_HOOK: &str =
@@ -94,6 +101,8 @@ pub const TOOLPKG_NAV_SURFACE_CHAT_INPUT_MENU_SECTIONS: &str = "chat_input_menu_
 pub const TOOLPKG_NAV_SURFACE_CHAT_MESSAGE_AFTER: &str = "chat_message_after";
 /// Opens plugin-owned pages inside the workspace without sidebar docking ownership.
 pub const TOOLPKG_NAV_SURFACE_WORKSPACE: &str = "workspace";
+/// Opens workspace files with matching filename extensions in a Compose route.
+pub const TOOLPKG_NAV_SURFACE_WORKSPACE_FILE: &str = "workspace_file";
 /// Embeds plugin-owned content on the workspace overview page.
 pub const TOOLPKG_NAV_SURFACE_WORKSPACE_HOME: &str = "workspace_home";
 
@@ -106,6 +115,7 @@ pub(crate) fn isToolPkgEmbeddedUiSurface(surface: &str) -> bool {
         | TOOLPKG_NAV_SURFACE_CHAT_INPUT_MENU_SECTIONS
         | TOOLPKG_NAV_SURFACE_CHAT_MESSAGE_AFTER
         | TOOLPKG_NAV_SURFACE_WORKSPACE
+        | TOOLPKG_NAV_SURFACE_WORKSPACE_FILE
         | TOOLPKG_NAV_SURFACE_WORKSPACE_HOME
     )
 }
@@ -123,6 +133,7 @@ pub(crate) fn requireToolPkgNavigationSurface(surface: &str) -> Result<(), Strin
         | TOOLPKG_NAV_SURFACE_CHAT_INPUT_MENU_SECTIONS
         | TOOLPKG_NAV_SURFACE_CHAT_MESSAGE_AFTER
         | TOOLPKG_NAV_SURFACE_WORKSPACE
+        | TOOLPKG_NAV_SURFACE_WORKSPACE_FILE
         | TOOLPKG_NAV_SURFACE_WORKSPACE_HOME => Ok(()),
         _ => Err(format!("is unsupported: {surface}")),
     }

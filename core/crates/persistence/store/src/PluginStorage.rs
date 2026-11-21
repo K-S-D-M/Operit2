@@ -11,7 +11,7 @@ use crate::SyncOperationStore::{
 };
 use operit_host_api::PluginStorage::*;
 use operit_host_api::{RuntimeSqliteHost, RuntimeStorageHost, SqliteValue};
-use operit_util::RuntimeStorageLayout::{runtimeStorageOwnership, RuntimeStorageOwnership, PLUGIN_DATA_SPACE_DIR_PATH, PLUGIN_DATA_DEVICE_DIR_PATH};
+use operit_util::RuntimeStorageLayout::{runtimeStorageOwnership, RuntimeStorageOwnership};
 pub use operit_util::PluginStoragePaths::resolveStoragePath;
 use operit_util::PluginStoragePaths::storageNamespace;
 use serde_json::Value;
@@ -87,7 +87,7 @@ struct Database {
 }
 
 /// Preserves the durable database identity carried by a change transaction.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     pub path: String,
@@ -1308,7 +1308,13 @@ pub fn ownsFile(host: Arc<dyn RuntimeStorageHost>, path: &str) -> Result<bool, S
         .iter()
         .find_map(|suffix| path.strip_suffix(suffix))
         .unwrap_or(path);
-    if database.ends_with(".preferences.json") && [PLUGIN_DATA_SPACE_DIR_PATH, PLUGIN_DATA_DEVICE_DIR_PATH].iter().any(|root| database.strip_prefix(root).is_some_and(|relative| relative.starts_with('/'))) {
+    // Ownership comes from the database's live namespace, not from a copied
+    // marker. Workspace/output copies (even with stale or invalid markers)
+    // remain ordinary files on both the sending and receiving nodes.
+    if storageNamespace(database).is_err() {
+        return Ok(false);
+    }
+    if database.ends_with(".preferences.json") {
         resolveStoragePath(database).map_err(failure)?;
         return Ok(true);
     }
@@ -1316,12 +1322,19 @@ pub fn ownsFile(host: Arc<dyn RuntimeStorageHost>, path: &str) -> Result<bool, S
     if !host.exists(&marker)? {
         return Ok(false);
     }
-    let manifest: Manifest =
-        decodeManifest(serde_json::from_slice(&host.readBytes(&marker)?).map_err(|error| failure(error.to_string()))?)?;
+    let manifest = readStorageMarker(host.as_ref(), &marker)?;
     if manifest.path != database {
-        return Err(failure("Storage marker identity mismatch"));
+        return Err(failure(format!("Storage marker identity mismatch at {marker}: expected path {database:?}, found {:?}", manifest.path)));
     }
     Ok(true)
+}
+
+fn readStorageMarker(host: &dyn RuntimeStorageHost, marker: &str) -> Result<Manifest, SqliteStoreError> {
+    let bytes = host.readBytes(marker)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| failure(error.to_string()))
+        .and_then(decodeManifest)
+        .map_err(|error| failure(format!("Invalid storage marker at {marker}: {error}")))
 }
 
 /// Removes discovery metadata before an explicitly authorized plugin uninstall deletes its files.
@@ -1344,11 +1357,15 @@ fn registerFile(
     let marker = format!("{}.operit-storage.json", manifest.path);
     let mut current = manifest.clone();
     if host.exists(&marker)? {
-        let stored = decodeManifest(serde_json::from_slice(&host.readBytes(&marker)?).map_err(|error| failure(error.to_string()))?)?;
+        let stored = readStorageMarker(host.as_ref(), &marker)?;
         if stored.path != manifest.path || stored.owner != manifest.owner
             || stored.kind != manifest.kind || stored.sync != manifest.sync
         {
-            return Err(failure("Storage marker conflicts with database identity"));
+            return Err(failure(format!(
+                "Storage marker conflicts with database identity at {marker}: expected path={:?} owner={:?} kind={} sync={}, found path={:?} owner={:?} kind={} sync={}",
+                manifest.path, manifest.owner, kindName(&manifest.kind), manifest.sync,
+                stored.path, stored.owner, kindName(&stored.kind), stored.sync,
+            )));
         }
         current.merge = mergeDescriptorForOpen(stored.merge.clone(), manifest.merge.clone())?;
         if current.merge == stored.merge {
@@ -1356,7 +1373,7 @@ fn registerFile(
         }
     }
     let content = serde_json::to_vec(&current).map_err(|error| failure(error.to_string()))?;
-    host.writeBytes(&marker, &content)?;
+    host.writeBytesAtomically(&marker, &content)?;
     Ok(())
 }
 
@@ -1396,12 +1413,13 @@ pub fn receipt(
         let result = (|| -> Result<(), SqliteStoreError> {
             let store = openSyncedDatabase(host.clone(), &path)?.store;
             crate::Transaction::compaction::prepare(&store)?;
-            for row in store.queryRows(
+            store.visitRows(
                 "SELECT origin,sequence FROM _operit_log UNION SELECT origin,sequence FROM _operit_compacted ORDER BY origin,sequence",
-                Vec::new(),
-            )? {
-                receipt.observe(&row.get::<_, String>(0)?, row.get(1)?);
-            }
+                Vec::new(), &mut |row| {
+                    receipt.observe(&row.valueAt(0)?.asString()?, row.valueAt(1)?.asI64()?);
+                    Ok(())
+                },
+            )?;
             if let Some((_,origin,sequence)) = crate::Transaction::compaction::initialization_identity(&store)? { receipt.observe(&origin,sequence); }
             crate::Transaction::compaction::observe_coverage(&store,&mut receipt)?;
             Ok(())
@@ -1504,6 +1522,11 @@ fn restoreSnapshotSchema(tx: &mut SqliteTransaction<'_>, definition: &Value) -> 
     Ok((names, true))
 }
 
+/// Blob roots include temporarily disabled databases: their current initializers remain durable.
+pub fn blobDatasetPaths(host: Arc<dyn RuntimeSqliteHost>) -> Result<Vec<String>, SqliteStoreError> {
+    catalog(host)?.queryRows("SELECT path FROM plugin_databases ORDER BY path", vec![])?.iter().map(|row|row.get(0)).collect()
+}
+
 pub fn syncDatasetPaths(host: Arc<dyn RuntimeSqliteHost>) -> Result<Vec<String>, SqliteStoreError> {
     catalog(host)?.queryRows("SELECT path FROM plugin_databases WHERE sync=1 ORDER BY path", vec![])?.iter().map(|row|row.get(0)).collect()
 }
@@ -1519,34 +1542,40 @@ pub fn syncCoverage(host: Arc<dyn RuntimeSqliteHost>, path: &str) -> Result<BTre
     withSyncDataset(host, path, "", |dataset| dataset.coverage())
 }
 
-/// Compares synchronized plugin records independently of local materialization bookkeeping.
-pub fn snapshotContentDigest(snapshot: &crate::Transaction::Snapshot) -> Result<String, String> {
+/// Hashes and counts synchronized plugin contents independently of local bookkeeping.
+pub fn snapshotContentSummary(snapshot: &crate::Transaction::Snapshot) -> Result<(String, u64), String> {
+    let mut values=snapshot.data.values.clone();
+    if let Some(sql)=&snapshot.data.sql {
+        for (name,columns) in &sql.columns { values.insert(name.clone(),serde_json::json!({"columns":columns})); }
+        values.insert("_operit_tables".into(),sql.table("_operit_tables")?);
+    }
     for (name, columns) in [
         ("_operit_versions", &["collection", "key", "created_at", "origin", "sequence"][..]),
         ("_operit_merge_map", &["collection", "origin", "remote_key", "canonical_key"][..]),
         ("_operit_merge_names", &["collection", "key", "name"][..]),
         ("_operit_tables", &["name", "definition"][..]),
     ] {
-        if snapshot.data.values.get(name).and_then(|table|table.get("columns")) != Some(&serde_json::json!(columns)) {
+        if values.get(name).and_then(|table|table.get("columns")) != Some(&serde_json::json!(columns)) {
             return Err(format!("Invalid synchronized SQL schema: {name}"));
         }
     }
-    let declarations: crate::Transaction::Table = serde_json::from_value(snapshot.data.values["_operit_tables"].clone()).map_err(|e|e.to_string())?;
+    let declarations: crate::Transaction::Table = serde_json::from_value(values["_operit_tables"].clone()).map_err(|e|e.to_string())?;
     let mut declared = BTreeSet::new();
     for row in declarations.rows {
         let table: StorageTable = match row.get(1) { Some(crate::Transaction::Cell::Text(value)) => serde_json::from_str(value).map_err(|e|e.to_string())?, _ => return Err("Invalid SQL table declaration".into()) };
         declared.insert(table.name.clone());
-        let actual = snapshot.data.values.get(&table.name).ok_or("Missing declared SQL table")?;
+        let actual = values.get(&table.name).ok_or("Missing declared SQL table")?;
         let expected = table.columns.iter().map(|column| column.name.as_str()).collect::<BTreeSet<_>>();
         let columns: Vec<String> = serde_json::from_value(actual["columns"].clone()).map_err(|e|e.to_string())?;
         if columns.iter().map(String::as_str).collect::<BTreeSet<_>>() != expected {
             return Err(format!("SQL table declaration differs: {}", table.name));
         }
     }
-    if snapshot.data.values.keys().filter(|name|!name.starts_with("_operit_")).cloned().collect::<BTreeSet<_>>() != declared {
+    if values.keys().filter(|name|!name.starts_with("_operit_")).cloned().collect::<BTreeSet<_>>() != declared {
         return Err("Synchronized SQL declarations are incomplete".into());
     }
-    snapshot.projected_content_digest(|table, value| match table {
+    if let Some(sql)=&snapshot.data.sql { return sql.content_summary(&snapshot.data.owner); }
+    snapshot.projected_content_summary(|table, value| match table {
         // Derived reference/name projection may allocate a device-local CAS token.
         "_operit_values" => crate::Transaction::project_sql_table(value, &["version"], None).map(Some),
         // A receipt's self mapping and the origin recording an equivalent alias do not change its meaning.
@@ -1648,8 +1677,20 @@ pub fn exportWithBudget<K: SyncOperationKnowledge>(
             crate::Transaction::compaction::prepare(&store)?;
             let mut entries = Vec::new();
             if let Some((_,origin,sequence)) = crate::Transaction::compaction::initialization_identity(&store)? {
+                // Every seal rotates the checkpoint identity; peers that already
+                // cover the sealed history rebuild it from ordinary records.
                 if !clock.containsSequence(&origin,sequence) {
-                    entries.push((0,origin,sequence,stores.len(),128));
+                    if let Some(reason) = crate::Transaction::compaction::initialization_transfer_reason(&store,clock)? {
+                        let size: i64 = store.queryOne("SELECT length(CAST(original AS BLOB)) FROM _operit_transaction_initialization WHERE id=1", vec![])?.ok_or_else(||failure("Missing initialization"))?.get(0)?;
+                        let shortOrigin = origin.trim_start_matches("~init:").get(..12).unwrap_or(origin.trim_start_matches("~init:"));
+                        operit_util::AppLogger::AppLogger::i("CoreSyncTrace", &format!(
+                            "sync_checkpoint.export path={path} origin={shortOrigin} sequence={sequence} bytes={size} reason={}",
+                            reason.as_str()));
+                        entries.push((0,origin,sequence,stores.len(),usize::try_from(size).map_err(|_|failure("Invalid initialization size"))?));
+                    } else {
+                        operit_util::AppLogger::AppLogger::trace("CoreSyncTrace", &format!(
+                            "sync_checkpoint.covered path={path} origin={}", origin.trim_start_matches("~init:")));
+                    }
                 }
             }
             for row in store.queryRows(
@@ -2654,8 +2695,11 @@ fn mergePayload(
     let sourceChanges = payload.changes.clone();
     let mut pending = BTreeMap::<(String, String), String>::new();
     for entity in &descriptor.entities {
+        if !payload.changes.iter().any(|change| change.collection == entity.collection) { continue; }
         let collection = MergeCollection::open(tx, payload.manifest.kind, &entity.collection)?;
-        let localRows = collection.read(tx)?;
+        let localRows = if entity.key_references.is_empty() && entity.match_mode != StorageMergeMatchMode::Identity {
+            collection.read(tx)?
+        } else { Vec::new() };
         let localContent = localRows.iter().map(|(key, value)| {
             let mut value = value.clone();
             rewriteMergeReferences(tx, &collection, descriptor, &mut value, &pending, preferenceReferences)?;
@@ -2871,9 +2915,7 @@ fn reconcileDurableMappings(
 /// Identifies the explicit plugin database commit boundary without interpreting its record mutations.
 pub fn syncDatasetPath(operation: &SyncOperation) -> Result<String, SqliteStoreError> {
     if operation.domain != PLUGIN_STORAGE_SYNC_DOMAIN { return Err(failure("Not a plugin storage operation")); }
-    if let Some(initialization) = crate::Transaction::compaction::Initialization::decode(operation).map_err(failure)? {
-        return resolveStoragePath(&initialization.data.owner.path).map_err(failure);
-    }
+    if operation.operation=="initialize" && operation.entityType=="initialization" { return resolveStoragePath(&operation.entityId).map_err(failure); }
     let path = operation.payload.get("manifest").and_then(|manifest| manifest.get("path")).and_then(Value::as_str)
         .ok_or_else(|| failure("Plugin transaction dataset path is missing"))?;
     resolveStoragePath(path).map_err(failure)
@@ -2886,14 +2928,36 @@ pub fn applyOperation(
     operation: &SyncOperation,
     preferences: &BTreeMap<String, String>,
 ) -> Result<(), SqliteStoreError> {
+    applyOperations(host, storage, std::slice::from_ref(operation), preferences)
+}
+
+/// Reuses a validated database handle while replaying one owner's ordered operations.
+pub fn applyOperations(
+    host: Arc<dyn RuntimeSqliteHost>, storage: Arc<dyn RuntimeStorageHost>,
+    operations: &[SyncOperation], preferences: &BTreeMap<String, String>,
+) -> Result<(), SqliteStoreError> {
+    let mut database = None;
+    for operation in operations { applyOperationInternal(host.clone(),storage.clone(),operation,preferences,&mut database)?; }
+    Ok(())
+}
+
+fn applyOperationInternal(
+    host: Arc<dyn RuntimeSqliteHost>, storage: Arc<dyn RuntimeStorageHost>,
+    operation: &SyncOperation, preferences: &BTreeMap<String, String>,
+    cached: &mut Option<(Manifest, Database)>,
+) -> Result<(), SqliteStoreError> {
     if operation.domain == PLUGIN_STORAGE_SYNC_DOMAIN {
-        if let Some(initialization) = crate::Transaction::compaction::Initialization::decode(operation).map_err(failure)? {
+        if operation.operation=="initialize" && operation.entityType=="initialization" {
+            *cached = None;
+            let initialization=if crate::RuntimeFileSyncStore::RuntimeFileSyncStore::requiredBlob(operation).map_err(failure)?.is_some() {
+                crate::RuntimeFileSyncStore::RuntimeFileSyncStore::new(storage.clone(),"runtime/sync").readSqlInitialization(operation).map_err(failure)?
+            } else { crate::Transaction::compaction::Initialization::decode(operation).map_err(failure)?.ok_or_else(||failure("Missing initialization"))? };
             let path = initialization.data.owner.path.clone();
-            let definition = initialization.definition.ok_or_else(||failure("Missing database definition for initialization"))?;
+            let definition = initialization.definition.clone().ok_or_else(||failure("Missing database definition for initialization"))?;
             provisionSnapshotDatabase(host.clone(),storage,&path,definition.clone())?;
             let manifest = decodeManifest(definition["manifest"].clone())?;
             let database = openDatabase(host.clone(),&manifest,String::new())?;
-            withSyncDataset(host,&path,"",|dataset|dataset.receive_initialization(operation,|tx,snapshot| {
+            withSyncDataset(host,&path,"",|dataset|dataset.receive_validated_initialization(operation,initialization,|tx,snapshot| {
                 reconcileInitialization(tx,snapshot,Some((&database,preferences)))
             })).map_err(failure)?;
             return Ok(());
@@ -2936,9 +3000,13 @@ pub fn applyOperation(
             "Remote storage origin does not match its database path and epoch",
         ));
     }
-    let database = openDatabase(host.clone(), &payload.manifest, String::new())?;
-    registerDatabase(host, &payload.manifest)?;
-    registerFile(storage, &payload.manifest)?;
+    if cached.as_ref().is_none_or(|(manifest,_)| manifest != &payload.manifest) {
+        let database = openDatabase(host.clone(), &payload.manifest, String::new())?;
+        registerDatabase(host, &payload.manifest)?;
+        registerFile(storage, &payload.manifest)?;
+        *cached = Some((payload.manifest.clone(), database));
+    }
+    let database = &cached.as_ref().expect("validated database").1;
     database.store.transaction(|tx| {
         if crate::Transaction::compaction::retired(tx.raw(), operation)? { return Ok(()); }
         if let Some(row) = tx.queryOne("SELECT payload,created_at FROM _operit_log WHERE origin=?1 AND sequence=?2",vec![SqliteValue::Text(operation.originDeviceId.clone()),SqliteValue::Integer(operation.sequence)])? {

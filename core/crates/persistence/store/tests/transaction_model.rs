@@ -178,8 +178,9 @@ fn missing_higher_order_targets_wait_and_immutable_conflicts_are_errors() {
     assert!(h.materialize(&Data::empty(owner.clone()), &migration(&owner, &owner)).unwrap().pending.contains_key("missing"));
 }
 
+/// Equal-size business contents retain revision and node ordering, with CAS enforced.
 #[test]
-fn correction_chooses_business_revision_then_node_and_uses_cas() {
+fn correction_breaks_size_ties_by_business_revision_then_node_and_uses_cas() {
     let owner = owner(Backend::DataStore, 1, "file");
     let mut a = Data::empty(owner.clone());
     a.apply(&tx(&owner, "older", 20, vec![set("x", json!("a"))])).unwrap();
@@ -197,7 +198,7 @@ fn correction_chooses_business_revision_then_node_and_uses_cas() {
     assert_eq!(local.covered, BTreeSet::from(["older".into(), "newer".into()]));
     let mut tied = remote.clone();
     tied.node = "z".into();
-    tied.data.values.insert("x".into(), json!("tie"));
+    tied.data.values.insert("x".into(), json!("z"));
     assert_eq!(compare(&remote, &tied).unwrap().unwrap().source.node, "z");
 }
 
@@ -212,4 +213,73 @@ fn checkpoint_replay_keeps_uncovered_older_edits_on_an_independent_scope() {
     let replay = checkpoint.replay(&history(&[newer_x, older_y]), &migration(&owner, &owner)).unwrap();
     assert_eq!(replay.data.values["x"], "new");
     assert_eq!(replay.data.values["y"], "independent");
+}
+
+#[test]
+fn batch_replay_matches_sequential_conflicts_and_rolls_back_the_whole_failed_batch() {
+    let owner = owner(Backend::DataStore, 1, "batch");
+    let operations = vec![
+        tx(&owner, "base", 10, vec![set("obj", json!({"field":1})), set("count", json!(0))]),
+        tx(&owner, "new", 30, vec![Edit::Set { key:"obj".into(), path:vec![Path::Field("field".into())], value:json!(3) }]),
+        tx(&owner, "old", 20, vec![set("obj", json!({"field":2, "other":2}))]),
+        tx(&owner, "add", 40, vec![Edit::Increment { key:"count".into(), path:vec![], delta:5 }]),
+    ];
+    let mut sequential = Data::empty(owner.clone());
+    for operation in &operations { sequential.apply(operation).unwrap(); }
+    let mut batched = Data::empty(owner.clone());
+    batched.apply_batch(&operations).unwrap();
+    assert_eq!(batched, sequential);
+    assert_eq!(batched.values["obj"]["field"], 3);
+    let before = batched.clone();
+    let good = tx(&owner, "prefix", 50, vec![set("new-key", json!(true))]);
+    let bad = tx(&owner, "bad", 60, vec![Edit::Increment { key:"obj".into(), path:vec![], delta:1 }]);
+    assert!(batched.apply_batch(&[good, bad]).is_err());
+    assert_eq!(batched, before);
+    assert!(batched.apply_batch(&[tx(&Owner { format:2, path:"other".into(), ..owner.clone() }, "wrong", 70, vec![])]).is_err());
+    assert_eq!(batched, before);
+}
+
+#[test]
+fn batched_scope_filter_keeps_namespace_tombstones_and_escaped_keys() {
+    let owner = owner(Backend::DataStore, 1, "scopes");
+    let mut data = Data::empty(owner.clone());
+    data.apply_batch(&[
+        tx(&owner, "replace", 30, vec![Edit::ReplaceRecords { prefix:"record_".into(), records:BTreeMap::new() }]),
+        tx(&owner, "stale", 20, vec![set("record_late", json!(1))]),
+        tx(&owner, "escaped", 40, vec![set("quote\"\\中文", json!({"x":1}))]),
+        tx(&owner, "patch", 50, vec![Edit::Set { key:"quote\"\\中文".into(), path:vec![Path::Field("x".into())], value:json!(2) }]),
+        tx(&owner, "other", 60, vec![set("quote", json!(3))]),
+    ]).unwrap();
+    assert!(!data.values.contains_key("record_late"));
+    assert_eq!(data.values["quote\"\\中文"]["x"], 2);
+    assert_eq!(data.values["quote"], 3);
+    let before = data.clone();
+    data.versions.insert("malformed".into(), Revision {createdAt:1,originDeviceId:"bad".into(),sequence:1});
+    let malformed = data.clone();
+    assert!(data.apply_batch(&[tx(&owner, "unrelated", 70, vec![set("other", json!(4))])]).is_err());
+    assert_eq!(data, malformed);
+    assert_ne!(data, before);
+}
+
+#[test]
+fn restored_noncanonical_scopes_keep_versions_and_additive_effects() {
+    let owner = owner(Backend::DataStore, 1, "restored-scopes");
+    let mut canonical = Data::empty(owner.clone());
+    canonical.apply_batch(&[
+        tx(&owner, "base", 10, vec![set("中文", json!({"count":0}))]),
+        tx(&owner, "add", 30, vec![Edit::Increment { key:"中文".into(), path:vec!["count".into()], delta:5 }]),
+        tx(&owner, "field", 40, vec![Edit::Set { key:"中文".into(), path:vec!["new".into()], value:json!(true) }]),
+    ]).unwrap();
+    let encode = |key: String| {
+        let scope: (String,Vec<Path>) = serde_json::from_str(&key).unwrap();
+        serde_json::to_string_pretty(&scope).unwrap().replace("中文", "\\u4e2d\\u6587")
+    };
+    let mut restored = canonical.clone();
+    restored.versions = restored.versions.into_iter().map(|(k,v)|(encode(k),v)).collect();
+    restored.additions = restored.additions.into_iter().map(|(k,v)|(encode(k),v)).collect();
+    let edits = vec![tx(&owner, "older-parent", 20, vec![set("中文", json!({"count":2}))])];
+    canonical.apply_batch(&edits).unwrap(); restored.apply_batch(&edits).unwrap();
+    assert_eq!(restored.values, canonical.values);
+    assert_eq!(restored.values["中文"]["count"], 7);
+    assert_eq!(restored.values["中文"]["new"], true);
 }

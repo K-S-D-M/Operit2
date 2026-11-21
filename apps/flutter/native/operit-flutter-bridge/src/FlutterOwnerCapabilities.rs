@@ -2,6 +2,8 @@
 //! No platform selection, string heuristics, or alternate backend policy belongs here.
 
 use std::sync::Arc;
+
+pub(crate) use crate::FlutterSystemOperationBridge::{FlutterSystemBindings, FlutterSystemOperationBridge};
 use std::time::Duration;
 
 use operit_host_api::{
@@ -16,7 +18,7 @@ use operit_host_api::{
 use operit_runtime::services::RuntimeHostInteractionService::{
     requestOwnerAudioPlay, requestOwnerBluetooth, requestOwnerFileOpen, requestOwnerFileShare,
     requestOwnerLocalInference, requestOwnerMusicPlayback, requestOwnerSystemCaptureScreenshot,
-    requestOwnerSystemOperation, requestOwnerSystemRecognizeText, requestOwnerTtsPlayback,
+    requestOwnerSystemOperation, requestOwnerSystemOperationAsync, requestOwnerSystemRecognizeText, requestOwnerTtsPlayback,
     requestOwnerTtsSynthesis, RuntimeHostInteractionAudioPlayPayload,
     RuntimeHostInteractionBluetoothPayload, RuntimeHostInteractionFileOpenPayload,
     RuntimeHostInteractionFileSharePayload, RuntimeHostInteractionLocalInferencePayload,
@@ -40,8 +42,24 @@ pub(crate) fn ownerSystemOperation<T: serde::de::DeserializeOwned>(
         Duration::from_secs(120),
     )
     .map_err(HostError::new)?;
+    if operation == "ui_automation" {
+        return operit_host_api::UiAutomation::decode_ui_json(response.resultJson.as_bytes());
+    }
     serde_json::from_str(&response.resultJson)
         .map_err(|error| HostError::new(format!("{operation} response decode failed: {error}")))
+}
+
+/// Forwards a floating window command without blocking the owner event loop.
+pub(crate) async fn floatingWindowCommand(request: serde_json::Value) -> HostResult<serde_json::Value> {
+    let response = requestOwnerSystemOperationAsync(
+        RuntimeHostInteractionSystemOperationPayload {
+            operation: "floating_window".to_string(),
+            paramsJson: request.to_string(),
+        },
+        Duration::from_secs(120),
+    ).await.map_err(HostError::new)?;
+    serde_json::from_str(&response.resultJson)
+        .map_err(|error| HostError::new(format!("floating_window response decode failed: {error}")))
 }
 
 /// Requires an explicit success acknowledgement from an owner operation.
@@ -179,13 +197,13 @@ pub(crate) fn ownerScreenshot() -> HostResult<String> {
 
 /// Recognizes text through the owner OCR boundary.
 pub(crate) fn ownerRecognizeText(
-    imagePath: &str,
+    source: &dyn operit_host_api::FileSource,
     language: OCRLanguage,
     quality: OCRQuality,
 ) -> HostResult<String> {
     requestOwnerSystemRecognizeText(
         RuntimeHostInteractionSystemRecognizeTextPayload {
-            imagePath: imagePath.to_string(),
+            imagePath: source.nativePath()?,
             language: language.asHostValue().to_string(),
             quality: quality.asHostValue().to_string(),
         },
@@ -247,120 +265,6 @@ pub(crate) fn ownerFileShare(path: &str, title: &str) -> HostResult<()> {
     Err(HostError::new(response.error.ok_or_else(|| {
         HostError::new("File share response omitted its error")
     })?))
-}
-
-/// Selects concrete owner callbacks once, during host assembly.
-pub(crate) struct FlutterSystemBindings {
-    pub notificationSender: Arc<dyn Fn(&SystemNotificationRequest) -> HostResult<()> + Send + Sync>,
-    pub notifications: Arc<dyn Fn(i32, bool) -> HostResult<NotificationData> + Send + Sync>,
-    pub location: Arc<dyn Fn(i32, bool, bool) -> HostResult<LocationData> + Send + Sync>,
-    pub deviceInfo: Arc<dyn Fn() -> HostResult<DeviceInfoData> + Send + Sync>,
-    pub screenshot: Arc<dyn Fn() -> HostResult<String> + Send + Sync>,
-    pub recognition: Arc<dyn Fn(&str, OCRLanguage, OCRQuality) -> HostResult<String> + Send + Sync>,
-}
-
-/// Adds owner authorization and UI operations to an already selected system host.
-pub(crate) struct FlutterSystemOperationBridge {
-    host: Arc<dyn SystemOperationHost>,
-    bindings: FlutterSystemBindings,
-}
-
-impl FlutterSystemOperationBridge {
-    /// Creates a fixed binding set without choosing another backend after failures.
-    pub(crate) fn new(host: Arc<dyn SystemOperationHost>, bindings: FlutterSystemBindings) -> Self {
-        Self { host, bindings }
-    }
-}
-
-impl SystemOperationHost for FlutterSystemOperationBridge {
-    /// Reads the selected host's language.
-    fn getSystemLanguageCode(&self) -> HostResult<String> {
-        self.host.getSystemLanguageCode()
-    }
-    /// Sends a system notification using the owner's authorization UI.
-    fn sendNotification(&self, request: &SystemNotificationRequest) -> HostResult<()> {
-        (self.bindings.notificationSender)(request)
-    }
-    /// Modifies settings through the selected system host.
-    fn modifySystemSetting(
-        &self,
-        namespace: &str,
-        setting: &str,
-        value: &str,
-    ) -> HostResult<SystemSettingData> {
-        self.host.modifySystemSetting(namespace, setting, value)
-    }
-    /// Reads settings through the selected system host.
-    fn getSystemSetting(&self, namespace: &str, setting: &str) -> HostResult<SystemSettingData> {
-        self.host.getSystemSetting(namespace, setting)
-    }
-    /// Installs an app through the selected system host.
-    fn installApp(&self, path: &str) -> HostResult<AppOperationData> {
-        self.host.installApp(path)
-    }
-    /// Uninstalls an app through the selected system host.
-    fn uninstallApp(&self, name: &str) -> HostResult<AppOperationData> {
-        self.host.uninstallApp(name)
-    }
-    /// Lists apps through the selected system host.
-    fn listInstalledApps(&self, includeSystem: bool) -> HostResult<AppListData> {
-        self.host.listInstalledApps(includeSystem)
-    }
-    /// Starts an app through the selected system host.
-    fn startApp(&self, name: &str) -> HostResult<AppOperationData> {
-        self.host.startApp(name)
-    }
-    fn startAppWithActivity(
-        &self,
-        name: &str,
-        activity: Option<&str>,
-    ) -> HostResult<AppOperationData> {
-        self.host.startAppWithActivity(name, activity)
-    }
-    /// Stops an app through the selected system host.
-    fn stopApp(&self, name: &str) -> HostResult<AppOperationData> {
-        self.host.stopApp(name)
-    }
-    /// Reads notifications through the callback selected at host assembly.
-    fn getNotifications(&self, limit: i32, includeOngoing: bool) -> HostResult<NotificationData> {
-        (self.bindings.notifications)(limit, includeOngoing)
-    }
-    /// Reads app usage through the selected system host.
-    fn getAppUsageTime(
-        &self,
-        name: &str,
-        hours: i32,
-        limit: i32,
-        includeSystem: bool,
-    ) -> HostResult<AppUsageTimeResultData> {
-        self.host.getAppUsageTime(name, hours, limit, includeSystem)
-    }
-    /// Reads current location through the owner's authorization UI.
-    fn getDeviceLocation(
-        &self,
-        timeout: i32,
-        highAccuracy: bool,
-        includeAddress: bool,
-    ) -> HostResult<LocationData> {
-        (self.bindings.location)(timeout, highAccuracy, includeAddress)
-    }
-    /// Reads information through the callback selected at host assembly.
-    fn getDeviceInfo(&self) -> HostResult<DeviceInfoData> {
-        (self.bindings.deviceInfo)()
-    }
-    /// Captures a screen through the callback selected at host assembly.
-    fn captureScreenshot(&self) -> HostResult<String> {
-        (self.bindings.screenshot)()
-    }
-    /// Recognizes text through the owner's OCR implementation.
-    fn recognizeText(
-        &self,
-        path: &str,
-        language: OCRLanguage,
-        quality: OCRQuality,
-    ) -> HostResult<String> {
-        (self.bindings.recognition)(path, language, quality)
-    }
 }
 
 /// Implements audio and music directly against typed host methods.
@@ -546,6 +450,14 @@ impl TtsPlaybackHost for FlutterTtsPlaybackHost {
 pub(crate) struct FlutterTtsSynthesisHost;
 
 impl TtsSynthesisHost for FlutterTtsSynthesisHost {
+    /// Exports synthesized audio while keeping temporary native files inside the host.
+    fn synthesizeSpeechBytes(&self, request: TtsSynthesisRequest) -> HostResult<Vec<u8>> {
+        let result = self.synthesizeSpeech(request)?;
+        let bytes = std::fs::read(&result.audioPath).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        std::fs::remove_file(&result.audioPath).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        Ok(bytes)
+    }
+
     /// Forwards the exact synthesis request to the authorized owner.
     fn synthesizeSpeech(&self, request: TtsSynthesisRequest) -> HostResult<TtsSynthesisResponse> {
         let result = requestOwnerTtsSynthesis(
@@ -607,213 +519,5 @@ impl LocalInferenceHost for FlutterLocalInferenceHost {
         request: LocalTtsInferenceHostRequest,
     ) -> HostResult<LocalTtsInferenceHostResponse> {
         Self::execute("synthesizeLocalSpeech", request)
-    }
-}
-
-/// Publishes session changes while delegating terminal work to the supplied host.
-#[derive(Clone)]
-pub(crate) struct RuntimeSessionPublishingTerminalHost {
-    inner: Arc<dyn operit_host_api::TerminalHost>,
-}
-
-impl RuntimeSessionPublishingTerminalHost {
-    /// Creates a terminal host wrapper that publishes runtime session snapshots.
-    pub(crate) fn new(inner: Arc<dyn operit_host_api::TerminalHost>) -> Self {
-        Self { inner }
-    }
-
-    /// Publishes the current terminal session snapshot through RuntimeTerminalService.
-    fn publish_sessions(&self) -> operit_host_api::HostResult<()> {
-        operit_runtime::services::publish_terminal_sessions_for_host(self)
-            .map(|_| ())
-            .map_err(operit_host_api::HostError::new)
-    }
-}
-
-impl operit_host_api::TerminalHost for RuntimeSessionPublishingTerminalHost {
-    /// Preserves the wrapped terminal's ownership of its working-directory namespace.
-    fn resolveWorkingDirectory(
-        &self,
-        terminal: &str,
-        terminalType: &str,
-        workingDir: &str,
-        resolveHostDirectory: &dyn Fn(&str) -> operit_host_api::HostResult<String>,
-    ) -> operit_host_api::HostResult<String> {
-        self.inner.resolveWorkingDirectory(
-            terminal,
-            terminalType,
-            workingDir,
-            resolveHostDirectory,
-        )
-    }
-
-    /// Returns terminal capabilities exposed by the wrapped host.
-    fn terminalInfo(&self) -> operit_host_api::HostResult<operit_host_api::TerminalInfo> {
-        self.inner.terminalInfo()
-    }
-
-    /// Starts a PTY session and publishes the updated session list.
-    fn startPtySession(
-        &self,
-        sessionName: &str,
-        terminal: &str,
-        terminalType: &str,
-        workingDir: &str,
-        rows: u16,
-        cols: u16,
-    ) -> operit_host_api::HostResult<String> {
-        let sessionId = self.inner.startPtySession(
-            sessionName,
-            terminal,
-            terminalType,
-            workingDir,
-            rows,
-            cols,
-        )?;
-        self.publish_sessions()?;
-        Ok(sessionId)
-    }
-
-    /// Reads buffered PTY output from the wrapped host.
-    fn readPtySession(&self, sessionId: &str) -> operit_host_api::HostResult<Vec<u8>> {
-        self.inner.readPtySession(sessionId)
-    }
-
-    /// Writes bytes to a PTY session on the wrapped host.
-    fn writePtySession(&self, sessionId: &str, data: &[u8]) -> operit_host_api::HostResult<usize> {
-        self.inner.writePtySession(sessionId, data)
-    }
-
-    /// Resizes a PTY session on the wrapped host.
-    fn resizePtySession(
-        &self,
-        sessionId: &str,
-        rows: u16,
-        cols: u16,
-    ) -> operit_host_api::HostResult<()> {
-        self.inner.resizePtySession(sessionId, rows, cols)
-    }
-
-    /// Polls one PTY session exit state from the wrapped host.
-    fn pollPtyExitCode(&self, sessionId: &str) -> operit_host_api::HostResult<Option<i32>> {
-        self.inner.pollPtyExitCode(sessionId)
-    }
-
-    /// Closes a PTY session and publishes the updated session list.
-    fn closePtySession(&self, sessionId: &str) -> operit_host_api::HostResult<()> {
-        self.inner.closePtySession(sessionId)?;
-        self.publish_sessions()
-    }
-
-    /// Lists terminal sessions from the wrapped host.
-    fn listSessions(
-        &self,
-    ) -> operit_host_api::HostResult<Vec<operit_host_api::TerminalSessionListEntry>> {
-        self.inner.listSessions()
-    }
-
-    /// Creates or returns a named terminal session and publishes the updated session list.
-    fn createOrGetSession(
-        &self,
-        sessionName: &str,
-    ) -> operit_host_api::HostResult<operit_host_api::TerminalSessionInfo> {
-        let session = self.inner.createOrGetSession(sessionName)?;
-        self.publish_sessions()?;
-        Ok(session)
-    }
-
-    /// Creates or returns an exactly typed session and publishes the updated session list.
-    fn createOrGetTypedSession(
-        &self,
-        sessionName: &str,
-        terminalType: &str,
-    ) -> operit_host_api::HostResult<operit_host_api::TerminalSessionInfo> {
-        let session = self.inner.createOrGetTypedSession(sessionName, terminalType)?;
-        self.publish_sessions()?;
-        Ok(session)
-    }
-
-    /// Executes a command inside an existing terminal session.
-    fn executeInSession(
-        &self,
-        sessionId: &str,
-        command: &str,
-        timeoutMs: u64,
-    ) -> operit_host_api::HostResult<operit_host_api::TerminalCommandOutput> {
-        self.inner.executeInSession(sessionId, command, timeoutMs)
-    }
-
-    /// Preserves raw streaming when terminal access passes through the Flutter owner wrapper.
-    fn executeInSessionStreaming(
-        &self,
-        sessionId: &str,
-        command: &str,
-        timeoutMs: u64,
-        onOutput: &mut dyn FnMut(&[u8]) -> HostResult<()>,
-    ) -> HostResult<operit_host_api::TerminalCommandOutput> {
-        self.inner.executeInSessionStreaming(sessionId, command, timeoutMs, onOutput)
-    }
-
-    /// Retains the concrete Host's scheduling model and publishes command lifecycle changes.
-    fn scheduleInSessionStreaming(
-        self: Arc<Self>,
-        scheduler: Arc<dyn operit_host_api::HostRuntimeTaskSchedulerHost>,
-        sessionId: String,
-        command: String,
-        timeoutMs: u64,
-        mut onOutput: operit_host_api::TerminalOutputCallback,
-        onComplete: operit_host_api::TerminalCompletionCallback,
-    ) -> HostResult<()> {
-        let publisher = self.clone();
-        let mut started = false;
-        self.inner.clone().scheduleInSessionStreaming(
-            scheduler, sessionId, command, timeoutMs,
-            Box::new(move |bytes, finalFrame| {
-                if !started { publisher.publish_sessions()?; started = true; }
-                onOutput(bytes, finalFrame)
-            }),
-            Box::new(move |result| {
-                onComplete(result.and_then(|receipt| { self.publish_sessions()?; Ok(receipt) }));
-            }),
-        )
-    }
-
-    /// Executes a hidden command through the wrapped host.
-    fn executeHiddenCommand(
-        &self,
-        command: &str,
-        executorKey: &str,
-        timeoutMs: u64,
-    ) -> operit_host_api::HostResult<operit_host_api::HiddenTerminalCommandOutput> {
-        self.inner
-            .executeHiddenCommand(command, executorKey, timeoutMs)
-    }
-
-    /// Sends text or control input to an existing terminal session.
-    fn inputInSession(
-        &self,
-        sessionId: &str,
-        input: Option<&str>,
-        control: Option<&str>,
-    ) -> operit_host_api::HostResult<operit_host_api::TerminalInputOutput> {
-        self.inner.inputInSession(sessionId, input, control)
-    }
-
-    /// Closes a terminal session and publishes the updated session list.
-    fn closeSession(
-        &self,
-        sessionId: &str,
-    ) -> operit_host_api::HostResult<operit_host_api::TerminalCloseOutput> {
-        let output = self.inner.closeSession(sessionId)?;
-        self.publish_sessions()?;
-        Ok(output)
-    }
-
-    /// Reads the current terminal screen from the wrapped host.
-    fn getSessionScreen(
-        &self,
-        sessionId: &str,
-    ) -> operit_host_api::HostResult<operit_host_api::TerminalScreenOutput> {
-        self.inner.getSessionScreen(sessionId)
     }
 }

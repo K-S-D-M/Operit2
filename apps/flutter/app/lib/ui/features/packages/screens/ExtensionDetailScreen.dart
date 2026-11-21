@@ -10,6 +10,7 @@ import '../../../../core/bridge/ProxyCoreRuntimeBridge.dart';
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../../common/components/PageActivityMixin.dart';
+import '../../../main/navigation/AppNavigationModels.dart';
 import '../../settings/components/SettingsControlStyles.dart';
 import '../components/DeviceSpaceVisuals.dart';
 import '../components/ExtensionAvatar.dart';
@@ -17,6 +18,7 @@ import '../components/ExtensionMotion.dart';
 import '../components/ExtensionTopBar.dart';
 import '../components/StoreDetailKit.dart';
 import '../components/StoreVisuals.dart';
+import '../components/ToolPkgDependencyTree.dart';
 import '../dialogs/MCPConfigDialogs.dart';
 import '../dialogs/A2AImportDialog.dart';
 import '../dialogs/A2ATaskDialog.dart';
@@ -24,6 +26,7 @@ import '../dialogs/MCPToolRunDialog.dart';
 import '../dialogs/PackageToolRunDialog.dart';
 import '../model/DeviceSpaceState.dart';
 import '../model/ExtensionCatalogController.dart';
+import '../model/ToolPkgDependencyGraph.dart';
 import '../utils/MCPCommandRunner.dart';
 import '../utils/PackageDisplayUtils.dart';
 import 'ToolPkgDesktopWidgetsScreen.dart';
@@ -52,10 +55,37 @@ sealed class _KindDetails {
 }
 
 class _ToolPkgDetails extends _KindDetails {
-  const _ToolPkgDetails({required this.runtime, required this.details});
+  const _ToolPkgDetails({
+    required this.runtime,
+    required this.details,
+    required this.runtimes,
+  });
 
   final core_proxy.ToolPkgContainerRuntime runtime;
   final core_proxy.ToolPkgContainerDetails? details;
+  final List<core_proxy.ToolPkgContainerRuntime> runtimes;
+
+  /// Excludes routes that are exposed only through a workspace surface.
+  String? get standaloneRouteId {
+    final workspaceRoutes = <String>{};
+    final standaloneRoutes = <String>{};
+    for (final entry in runtime.navigationEntries) {
+      switch (entry.surface) {
+        case 'workspace' || 'workspace_file' || 'workspace_home':
+          workspaceRoutes.add(entry.routeId);
+        case 'toolbox' || 'main_sidebar_plugins' || 'app_bar':
+          if (entry.action == null) standaloneRoutes.add(entry.routeId);
+      }
+    }
+    return runtime.uiRoutes
+        .where(
+          (route) =>
+              !workspaceRoutes.contains(route.routeId) ||
+              standaloneRoutes.contains(route.routeId),
+        )
+        .firstOrNull
+        ?.routeId;
+  }
 }
 
 class _ScriptDetails extends _KindDetails {
@@ -99,6 +129,7 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
   bool _useEnglish = false;
   bool _active = false;
   bool _mcpBusy = false;
+  String? _mcpLifecycleError;
   bool _describing = false;
   final Set<String> _togglingSubpackages = <String>{};
 
@@ -169,8 +200,11 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
     if (entry == null) {
       return;
     }
+    final catalogRevision = widget.kind == 'toolpkg'
+        ? _controller.snapshot?.revision
+        : null;
     final marker =
-        '${entry.activationState}|${entry.runtimeState}|${entry.version}|${entry.scope}';
+        '${entry.activationState}|${entry.runtimeState}|${entry.version}|${entry.scope}|$catalogRevision';
     if (marker == _detailsMarker) {
       return;
     }
@@ -207,7 +241,11 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
           packageName: widget.id,
           useEnglish: _useEnglish,
         );
-        return _ToolPkgDetails(runtime: runtime, details: details);
+        return _ToolPkgDetails(
+          runtime: runtime,
+          details: details,
+          runtimes: runtimes,
+        );
       case 'script':
         final packages = await _clients.application
             .packageManager()
@@ -297,15 +335,18 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
     final enabled = ExtensionCatalogController.isEnabled(entry);
     final toggleValue = _controller.pendingEnabled(key) ?? enabled;
     final hasUpdate = _controller.hasUpdate(entry);
-    final canOpenUi = entry.kind == 'toolpkg' && entry.hasUi;
+    final details = _details;
+    final toolPkg = details is _ToolPkgDetails ? details : null;
+    final standaloneRouteId = toolPkg?.standaloneRouteId;
     final subtitle = <String>[
       if (entry.authors.isNotEmpty) entry.authors.join('、'),
       storeSourceLabel(entry.source),
     ].join(' · ');
-    final mcpError = entry.runtimeState.startsWith('error:')
-        ? entry.runtimeState.substring('error:'.length)
-        : null;
-    final details = _details;
+    final mcpError =
+        _mcpLifecycleError ??
+        (entry.runtimeState.startsWith('error:')
+            ? entry.runtimeState.substring('error:'.length)
+            : null);
     final wide = MediaQuery.sizeOf(context).width >= 600;
     return StoreDetailScaffold(
       header: StoreDetailHeader(
@@ -334,13 +375,15 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
               busy: busy,
               onPressed: () => _run(() => _controller.update(entry)),
             )
-          else if (canOpenUi)
+          else if (toolPkg != null && standaloneRouteId != null)
             StoreGetButton(
               label: '打开',
               icon: Icons.open_in_new_rounded,
               prominent: true,
               large: true,
-              onPressed: enabled ? () => _openUi(null) : null,
+              onPressed: enabled
+                  ? () => _openUi(toolPkg.runtime, standaloneRouteId)
+                  : null,
             ),
           _EnableToggle(
             label: _toggleLabel(entry, toggleValue),
@@ -716,6 +759,11 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
   List<Widget> _toolPkgSections(bool enabled, _ToolPkgDetails data) {
     final runtime = data.runtime;
     final details = data.details;
+    final graph = ToolPkgDependencyGraph(
+      root: runtime,
+      runtimes: data.runtimes,
+      installed: _controller.snapshot?.installed ?? const [],
+    );
     return <Widget>[
       if (runtime.dependencyIssues.isNotEmpty)
         StoreDetailSection(
@@ -753,7 +801,9 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
                       : '${module.uiModuleId} · ${module.runtime}',
                   trailing: StoreGetButton(
                     label: '打开',
-                    onPressed: enabled ? () => _openUi(module.routeId) : null,
+                    onPressed: enabled
+                        ? () => _openUi(runtime, module.routeId)
+                        : null,
                   ),
                 ),
             ],
@@ -781,26 +831,11 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
                   ],
                 ),
         ),
-      if (details != null && details.requires.isNotEmpty)
-        StoreDetailSection(
-          title: '依赖',
-          count: details.requires.length,
-          child: StoreGroupedList(
-            children: <Widget>[
-              for (final requirement in details.requires)
-                StoreListRow(
-                  leading: const StoreRowGlyph(icon: Icons.link_rounded),
-                  title: requirement.id,
-                  subtitle: <String>[
-                    requirement.description,
-                    if (requirement.minVersion != null)
-                      '≥ ${requirement.minVersion}',
-                    if (requirement.maxVersion != null)
-                      '≤ ${requirement.maxVersion}',
-                  ].where((part) => part.trim().isNotEmpty).join(' · '),
-                ),
-            ],
-          ),
+      if (graph.nodes.isNotEmpty)
+        ToolPkgDependencyTree(
+          clients: _clients,
+          rootId: runtime.packageName,
+          nodes: graph.nodes.toList(),
         ),
       if (details != null && details.workspaceTemplates.isNotEmpty)
         StoreDetailSection(
@@ -905,31 +940,27 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
     }
   }
 
-  Future<void> _openUi(String? routeId) async {
-    final runtime = await _toolPkgRuntime();
-    if (!mounted) {
+  /// Launches the exact route selected by the detail page.
+  void _openUi(core_proxy.ToolPkgContainerRuntime runtime, String routeId) {
+    // Use the same back stack as the sidebar so a plugin can navigate to
+    // another shell page without a Flutter overlay covering the destination.
+    if (AppRouteDiscoveryGateway.contains(routeId)) {
+      AppRouterGateway.navigate(
+        routeId: routeId,
+        source: RouteEntrySource.script,
+      );
       return;
     }
-    await Navigator.of(context).push(
+    Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (context) => ToolPkgUiLauncherScreen(
           clients: _clients,
           plugin: runtime,
           initialRouteId: routeId,
+          dismissOnExternalNavigation: true,
         ),
       ),
     );
-  }
-
-  Future<core_proxy.ToolPkgContainerRuntime> _toolPkgRuntime() async {
-    final details = _details;
-    if (details is _ToolPkgDetails) {
-      return details.runtime;
-    }
-    final runtimes = await _clients.application
-        .packageManager()
-        .getToolPkgContainerRuntimes();
-    return runtimes.firstWhere((item) => item.packageName == widget.id);
   }
 
   void _openDesktopWidgets(core_proxy.ToolPkgContainerRuntime runtime) {
@@ -1266,13 +1297,20 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
     await _loadDetails();
   }
 
+  /// Keeps lifecycle failures visible in the detail page after the toast closes.
   Future<void> _runMcpLifecycle(Future<String> Function() action) async {
     setState(() => _mcpBusy = true);
     try {
       await action();
+      if (mounted) {
+        setState(() => _mcpLifecycleError = null);
+      }
       await _afterMcpChange();
     } catch (error, stackTrace) {
       debugPrint('Failed to update MCP lifecycle: $error\n$stackTrace');
+      if (mounted) {
+        setState(() => _mcpLifecycleError = error.toString());
+      }
       _showError(error);
     } finally {
       if (mounted) {
@@ -1374,16 +1412,18 @@ class _ExtensionDetailScreenState extends State<ExtensionDetailScreen>
       ),
       StoreInfoItem('分类', entry.category),
       if (details is _ToolPkgDetails) ...<StoreInfoItem>[
-        StoreInfoItem('ToolPkg API', details.runtime.apiVersion),
+        StoreInfoItem('API 版本', details.runtime.apiVersion),
         StoreInfoItem('入口', details.runtime.mainEntry),
         StoreInfoItem('路径', details.runtime.sourcePath),
         StoreInfoItem('许可证', details.runtime.license ?? ''),
       ],
-      if (details is _ScriptDetails)
+      if (details is _ScriptDetails) ...<StoreInfoItem>[
+        StoreInfoItem('API 版本', details.package.apiVersion),
         StoreInfoItem(
           '默认状态',
           details.package.enabledByDefault ? '默认启用' : '默认停用',
         ),
+      ],
       if (marketEntryId != null) StoreInfoItem('市场条目', marketEntryId),
     ];
   }

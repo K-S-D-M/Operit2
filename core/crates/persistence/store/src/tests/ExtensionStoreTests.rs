@@ -7,12 +7,31 @@ use std::sync::Mutex;
 
 #[derive(Default)]
 struct MemoryStorage {
-    files: Mutex<BTreeMap<String, Vec<u8>>>,
-    fail_write: Mutex<Option<String>>,
-    modified: Mutex<BTreeMap<String, i64>>,
+    files: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    fail_write: Arc<Mutex<Option<String>>>,
+    modified: Arc<Mutex<BTreeMap<String, i64>>>,
     journal: crate::transaction_test_host::TransactionJournalHost,
+    reads: Mutex<Vec<String>>,
+    lists: Mutex<Vec<String>>,
+}
+struct MemoryWriteSession {
+    host: MemoryStorage,
+    path: String,
+    bytes: Vec<u8>,
+}
+impl operit_host_api::RuntimeStorageWriteSession for MemoryWriteSession {
+    fn writeChunk(&mut self, bytes: &[u8]) -> HostResult<()> { self.bytes.extend_from_slice(bytes); Ok(()) }
+    fn commit(self: Box<Self>) -> HostResult<()> { self.host.writeBytes(&self.path, &self.bytes) }
+    fn discard(self: Box<Self>) -> HostResult<()> { Ok(()) }
 }
 impl RuntimeStorageHost for MemoryStorage {
+    fn openWriteSession(&self, path: &str) -> HostResult<Option<Box<dyn operit_host_api::RuntimeStorageWriteSession>>> {
+        Ok(Some(Box::new(MemoryWriteSession {
+            host: MemoryStorage { files: self.files.clone(), fail_write: self.fail_write.clone(),
+                modified: self.modified.clone(), ..MemoryStorage::default() },
+            path: path.into(), bytes: Vec::new(),
+        })))
+    }
     fn openTransactionDatabase(&self,path: &str) -> HostResult<Box<dyn operit_host_api::RuntimeSqliteConnection>> { self.journal.open(path) }
     /// Confirms synchronous in-memory publication without copying or rewriting bytes.
     fn flushFile(&self, path: &str) -> operit_host_api::HostResult<()> {
@@ -29,6 +48,7 @@ impl RuntimeStorageHost for MemoryStorage {
         None
     }
     fn readBytes(&self, path: &str) -> HostResult<Vec<u8>> {
+        self.reads.lock().unwrap().push(path.to_string());
         self.files
             .lock()
             .unwrap()
@@ -86,6 +106,7 @@ impl RuntimeStorageHost for MemoryStorage {
             .any(|key| key == path || key.starts_with(&format!("{path}/"))))
     }
     fn list(&self, path: &str) -> HostResult<Vec<RuntimeStorageEntry>> {
+        self.lists.lock().unwrap().push(path.to_string());
         let mut entries = BTreeMap::new();
         for (key, bytes) in self.files.lock().unwrap().iter() {
             if let Some(relative) = key.strip_prefix(&format!("{path}/")) {
@@ -356,6 +377,63 @@ fn generic_file_tracking_only_publishes_changed_files_and_recursive_tombstones()
     assert!(ops.iter().all(|op| op.operation == "delete"));
 }
 
+/// Keeps local file edits independent of an invalid shared recovery entry without bypassing shared validation.
+#[test]
+fn local_log_writes_do_not_recover_unrelated_workspace_operations() {
+    let source = host();
+    let log = operit_util::RuntimeStorageLayout::OPERIT_LOG_PATH;
+    let inventory = format!("{RUNTIME_SYNC_DIR_PATH}/workspace_inventory.json");
+    let recovery = serde_json::to_vec(&json!({"files": {}, "pending": [log, null]})).unwrap();
+    source.writeBytes(&inventory, &recovery).unwrap();
+    let files = RuntimeFileSyncStore::new(source.clone(), RUNTIME_SYNC_DIR_PATH);
+    for path in [log, "runtime/logs/client.log", "runtime/cache/download.part", "runtime/data/chat_outputs-other/file.txt", "workspaces-other/file.txt"] {
+        files.trackChanges(&[path.into()], || source.writeBytes(path, b"local bytes").map_err(|e| e.to_string())).unwrap();
+        files.trackChanges(&[path.into()], || source.appendBytes(path, b" appended").map_err(|e| e.to_string())).unwrap();
+        assert_eq!(source.readBytes(path).unwrap(), b"local bytes appended");
+    }
+    assert_eq!(source.readBytes(&inventory).unwrap(), recovery);
+    assert!(operations(&source, &SyncClock::empty()).is_empty());
+
+    for path in ["workspaces", "workspaces/demo/file.txt", "runtime", "runtime/data", "runtime/data/chat_outputs", "runtime/data/chat_outputs/chat/file.txt", "runtime/data/chat_attachments/chat/file.txt"] {
+        let result = files.trackChanges(&[log.into(), path.into()], || Err::<(), _>("mutation must not run".into()));
+        assert_eq!(result.unwrap_err(), format!("Workspace path {log}: Not a managed shared path: {log}"), "{path}");
+    }
+}
+
+/// Preserves managed snapshots and tombstones when an edit includes a root ancestor and a local log.
+#[test]
+fn managed_file_tracking_captures_ancestor_edits_and_mixed_local_paths() {
+    for (ancestor, path) in [
+        ("workspaces", "workspaces/demo/file.txt"),
+        ("runtime", "runtime/data/chat_outputs/chat/file.txt"),
+        ("runtime/data", "runtime/data/chat_attachments/chat/file.txt"),
+    ] {
+        let source = host();
+        // The mock infers directories from files; keep the collection root present after deletion.
+        let directory = crate::WorkspaceFileSyncStore::managedDirectory(path).unwrap();
+        let collection = directory.rsplit_once('/').unwrap().0;
+        source.writeBytes(&format!("{collection}/.keep"), b"").unwrap();
+        let files = RuntimeFileSyncStore::new(source.clone(), RUNTIME_SYNC_DIR_PATH);
+        let log = operit_util::RuntimeStorageLayout::OPERIT_LOG_PATH;
+        files.trackChanges(&[ancestor.into(), log.into()], || {
+            source.writeBytes(log, b"local log").map_err(|e| e.to_string())?;
+            source.writeBytes(path, b"shared file").map_err(|e| e.to_string())
+        }).unwrap();
+        crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(source.clone(), RUNTIME_SYNC_DIR_PATH).scan().unwrap();
+        let ops = operations(&source, &SyncClock::empty());
+        assert_eq!(ops.len(), 1, "{ancestor}");
+        assert_eq!(ops[0].entityId, path);
+        assert_eq!(ops[0].operation, "upsert");
+        let before_delete = clock(&source);
+        files.trackChanges(&[ancestor.into()], || source.delete(path, false).map_err(|e| e.to_string())).unwrap();
+        crate::WorkspaceFileSyncStore::WorkspaceFileSyncStore::new(source.clone(), RUNTIME_SYNC_DIR_PATH).scan().unwrap();
+        let ops = operations(&source, &before_delete);
+        assert_eq!(ops.len(), 1, "{ancestor}");
+        assert_eq!(ops[0].entityId, path);
+        assert_eq!(ops[0].operation, "delete");
+    }
+}
+
 #[test]
 fn legacy_bundle_upgrade_retries_actual_files_without_overwriting_local_edits() {
     let source = host();
@@ -599,6 +677,124 @@ fn register_package_owner(store: &ExtensionStore, id: &str, members: &[&str]) {
         .unwrap();
 }
 
+/// Keeps per-plugin lookups and repeated registrations independent of the installed count.
+#[test]
+fn exact_record_reads_scale_linearly_for_one_hundred_plugins() {
+    let storage = host();
+    let store = ExtensionStore::new(storage.clone());
+    for index in 0..100 {
+        let id = format!("plugin_{index}");
+        register_package_owner(&store, &id, &[&id]);
+    }
+    storage.reads.lock().unwrap().clear();
+    storage.lists.lock().unwrap().clear();
+    for index in 0..100 {
+        let id = format!("plugin_{index}");
+        assert_eq!(store.record("package", &id).unwrap().id, id);
+        register_package_owner(&store, &id, &[&id]);
+    }
+    assert_eq!(storage.reads.lock().unwrap().len(), 200);
+    assert!(storage.lists.lock().unwrap().is_empty());
+}
+
+/// Selects space ownership while preserving exact-identity validation.
+#[test]
+fn exact_record_read_selects_space_and_rejects_mismatched_paths() {
+    let storage = host();
+    let store = ExtensionStore::new(storage.clone());
+    register_package_owner(&store, "demo", &["demo"]);
+    let mut record = store.record("package", "demo").unwrap();
+    record.scope = "space".into();
+    let shared = recordPath("package", "demo", "space").unwrap();
+    storage.writeBytes(&shared, &serde_json::to_vec(&record).unwrap()).unwrap();
+    assert_eq!(store.record("package", "demo").unwrap().scope, "space");
+    assert_eq!(store.packageOwner("demo").unwrap().scope, "space");
+    let selection = store.selection("package").unwrap();
+    assert_eq!(selection.records.len(), 1);
+    assert_eq!(selection.shadowed.len(), 1);
+    assert!(!(selection.sourceFilter("device"))("demo.toolpkg"));
+    assert!((selection.sourceFilter("space"))("demo.toolpkg"));
+    record.id = "other".into();
+    storage.writeBytes(&shared, &serde_json::to_vec(&record).unwrap()).unwrap();
+    let message = store.record("package", "demo").unwrap_err();
+    let expected = recordPath("package", "other", "space").unwrap();
+    assert!(
+        message.contains("Extension identity does not match its record path"),
+        "{message}"
+    );
+    assert!(message.contains(&format!("expected {expected}")), "{message}");
+    assert!(message.contains(&format!("actual {shared}")), "{message}");
+    assert!(message.contains("kind=package, id=other, scope=space"), "{message}");
+}
+
+/// Reports both paths and the actual identity through scans and direct lookups.
+#[test]
+fn record_path_mismatch_reports_paths_and_identity() {
+    for (kind, id, scope) in [
+        ("package", "other", "device"),
+        ("package", "demo", "space"),
+        ("skill", "demo", "device"),
+    ] {
+        let storage = host();
+        let store = ExtensionStore::new(storage.clone());
+        register_package_owner(&store, "demo", &["demo"]);
+        let actual = recordPath("package", "demo", "device").unwrap();
+        let mut record = store.record("package", "demo").unwrap();
+        record.kind = kind.into();
+        record.id = id.into();
+        record.scope = scope.into();
+        if kind == "skill" {
+            record.sourceName = "demo".into();
+            record.settings = json!({"visible": true});
+        }
+        let expected = recordPath(kind, id, scope).unwrap();
+        storage
+            .writeBytes(&actual, &serde_json::to_vec(&record).unwrap())
+            .unwrap();
+        for message in [
+            store.records("package").unwrap_err(),
+            store.record("package", "demo").unwrap_err(),
+        ] {
+            assert!(
+                message.contains("Extension identity does not match its record path"),
+                "{message}"
+            );
+            assert!(message.contains(&format!("expected {expected}")), "{message}");
+            assert!(message.contains(&format!("actual {actual}")), "{message}");
+            assert!(
+                message.contains(&format!("kind={kind}, id={id}, scope={scope}")),
+                "{message}"
+            );
+        }
+    }
+}
+
+/// Applies identical ownership and settings isolation to skills, MCP, and A2A.
+#[test]
+fn duplicate_extension_kinds_keep_local_data_and_use_shared_settings() {
+    let storage = host();
+    let store = ExtensionStore::new(storage.clone());
+    for (kind, source, settings) in [
+        ("skill", "demo", json!({"visible": true})),
+        ("mcp", "", json!({"server": {"url": "https://example.com/mcp"}, "metadata": {}})),
+        ("a2a", "", json!({"agent": {"url": "https://example.com/agent", "disabled": false, "headers": {}}})),
+    ] {
+        store.registerDevice(kind, "demo", source, settings.clone()).unwrap();
+        let local = recordPath(kind, "demo", "device").unwrap();
+        let bytes = storage.readBytes(&local).unwrap();
+        let mut shared = store.record(kind, "demo").unwrap();
+        shared.scope = "space".into();
+        store.write(&shared).unwrap();
+        assert_eq!(store.activeRecords(kind).unwrap().len(), 1);
+        assert_eq!(store.record(kind, "demo").unwrap().scope, "space");
+        let mut changed = settings;
+        changed["label"] = json!("shared-only");
+        store.setSettings(kind, "demo", changed).unwrap();
+        assert_eq!(storage.readBytes(&local).unwrap(), bytes);
+        assert_eq!(store.selection(kind).unwrap().shadowed.len(), 1);
+    }
+}
+
 /// Resolves ownership directly from persisted records without a runtime package manager.
 #[test]
 fn package_owner_resolves_container_and_subpackage() {
@@ -768,10 +964,7 @@ fn deleting_failed_package_removes_conflicting_owners_and_preserves_other_packag
             )
             .unwrap();
     }
-    assert!(store
-        .record("package", "broken")
-        .unwrap_err()
-        .contains("ownership conflict"));
+    assert_eq!(store.record("package", "broken").unwrap().scope, "space");
     let before = clock(&storage);
     assert!(store.deleteFailedPackageInstallations("broken").unwrap());
     assert!(!store.deleteFailedPackageInstallations("broken").unwrap());
@@ -931,9 +1124,9 @@ fn shared_builtin_customization_syncs_source_changes_without_deleting_configurat
     assert_eq!(target.readBytes(&config).unwrap(), b"shared configuration");
 }
 
-/// Shared ownership replaces the bundled local record without merging independent local settings.
+/// Shared ownership preserves the shadowed local installation and its settings.
 #[test]
-fn shared_builtin_owner_replaces_local_state() {
+fn shared_builtin_owner_preserves_local_state() {
     let storage = host();
     let store = ExtensionStore::new(storage.clone());
     let settings = |enabled: Value, order: u64| {
@@ -956,11 +1149,6 @@ fn shared_builtin_owner_replaces_local_state() {
     canonical.settings["installationScope"] = json!("space");
     store.write(&canonical).unwrap();
     assert!(store
-        .record("package", "bundle")
-        .unwrap_err()
-        .contains("ownership conflict"));
-
-    assert!(store
         .acceptsBuiltinPackage("bundle")
         .unwrap());
     let merged = store.record("package", "bundle").unwrap();
@@ -968,17 +1156,16 @@ fn shared_builtin_owner_replaces_local_state() {
     assert_eq!(merged.settings["enabledNames"], json!(["canonical"]));
     assert_eq!(merged.settings["order"], json!(2));
     assert_eq!(merged.settings["installationScope"], json!("space"));
-    assert!(store
-        .records("package")
-        .unwrap()
-        .iter()
-        .all(|record| record.scope == "space"));
+    let local = store.selection("package").unwrap().shadowed.remove(0);
+    assert_eq!(local.scope, "device");
+    assert_eq!(local.settings["enabledNames"], json!(["legacy"]));
+    assert_eq!(local.settings["order"], json!(7));
     assert!(store.acceptsBuiltinPackage("bundle").unwrap());
 }
 
-/// Genuine ownership conflicts must keep failing instead of being auto-merged.
+/// A shared external installation also shadows the local installation without selecting bundled code.
 #[test]
-fn builtin_scope_reconciliation_refuses_non_builtin_duplicates() {
+fn shared_external_owner_shadows_local_without_using_builtin_code() {
     let storage = host();
     let store = ExtensionStore::new(storage);
     register_package_owner(&store, "bundle", &["bundle"]);
@@ -987,11 +1174,9 @@ fn builtin_scope_reconciliation_refuses_non_builtin_duplicates() {
     duplicate.settings["installationScope"] = json!("space");
     store.write(&duplicate).unwrap();
 
-    assert!(store.acceptsBuiltinPackage("bundle").unwrap_err().contains("ownership conflict"));
-    assert!(store
-        .record("package", "bundle")
-        .unwrap_err()
-        .contains("ownership conflict"));
+    assert!(!store.acceptsBuiltinPackage("bundle").unwrap());
+    assert_eq!(store.record("package", "bundle").unwrap().scope, "space");
+    assert_eq!(store.records("package").unwrap().len(), 2);
 }
 
 /// Keeps installation source and configuration in the same synchronized entity.
@@ -1042,9 +1227,9 @@ fn late_builtin_initialization_preserves_explicit_shared_installation() {
     assert_eq!(peer.record("package", "demo").unwrap(), expected);
 }
 
-/// Moves bundled ownership through the existing sync path and preserves the selected subpackage flags.
+/// Preserves local state during shared sync and rejects a move over the retained installation.
 #[test]
-fn builtin_scope_moves_sync_flags_and_allows_deleting_bundled_installations() {
+fn builtin_sync_preserves_shadowed_state_and_rejects_move_over_local() {
     let source = host();
     let target = host();
     let store = ExtensionStore::new(source.clone());
@@ -1070,8 +1255,8 @@ fn builtin_scope_moves_sync_flags_and_allows_deleting_bundled_installations() {
     assert!(peer.acceptsBuiltinPackage("demo").unwrap());
     assert_eq!(peer.record("package", "demo").unwrap(), store.record("package", "demo").unwrap());
     assert_eq!(clock(&target), before_adoption);
-    assert!(!target.exists(&recordPath("package", "demo", "device").unwrap()).unwrap());
-    assert!(!target.exists(&local_config).unwrap());
+    assert!(target.exists(&recordPath("package", "demo", "device").unwrap()).unwrap());
+    assert_eq!(target.readBytes(&local_config).unwrap(), b"old local configuration");
     assert_eq!(target.readBytes(&shared_config).unwrap(), b"shared configuration");
     assert_eq!(target.readBytes(&private_data).unwrap(), b"private device data");
     let before_toggle = clock(&source);
@@ -1080,13 +1265,14 @@ fn builtin_scope_moves_sync_flags_and_allows_deleting_bundled_installations() {
     store.setSettings("package", "demo", updated).unwrap();
     transfer(&source, &target, &operations(&source, &before_toggle)).unwrap();
     assert_eq!(peer.record("package", "demo").unwrap().settings["subpackageStates"]["demo_tools"], true);
-    let before_move = clock(&target);
-    peer.moveScope("package", "demo", "device").unwrap();
-    transfer(&target, &source, &operations(&target, &before_move)).unwrap();
+    assert!(peer.moveScope("package", "demo", "device").is_err());
+    let before_delete = clock(&target);
+    peer.delete("package", "demo").unwrap();
+    transfer(&target, &source, &operations(&target, &before_delete)).unwrap();
     assert!(!store.acceptsBuiltinPackage("demo").unwrap());
     assert!(store.record("package", "demo").is_err());
     assert!(peer.acceptsBuiltinPackage("demo").unwrap());
-    assert_eq!(target.readBytes(&local_config).unwrap(), b"shared configuration");
+    assert_eq!(target.readBytes(&local_config).unwrap(), b"old local configuration");
     assert_eq!(target.readBytes(&private_data).unwrap(), b"private device data");
     let local = peer.record("package", "demo").unwrap();
     assert_eq!(local.scope, "device");

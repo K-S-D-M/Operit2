@@ -9,6 +9,48 @@ import 'package:flutter/widgets.dart';
 part 'src/application_windows.dart';
 part 'src/drag_surface.dart';
 
+/// Native accessibility screen coordinates: pixels on Windows/Android,
+/// desktop points on macOS and AT-SPI desktop units on X11.
+class FloatingScreenBounds {
+  const FloatingScreenBounds(this.left, this.top, this.right, this.bottom);
+  final double left, top, right, bottom;
+
+  factory FloatingScreenBounds.fromMap(Map value) {
+    final edges = [
+      for (final key in ['left', 'top', 'right', 'bottom']) value[key],
+    ];
+    if (edges.any(
+      (edge) => edge is! num || !edge.isFinite || edge.abs() > 1000000,
+    )) {
+      throw ArgumentError('Screen bounds must contain four finite coordinates');
+    }
+    final bounds = FloatingScreenBounds(
+      (edges[0] as num).toDouble(),
+      (edges[1] as num).toDouble(),
+      (edges[2] as num).toDouble(),
+      (edges[3] as num).toDouble(),
+    );
+    bounds.toMap();
+    return bounds;
+  }
+
+  Map<String, double> toMap() {
+    if ([
+          left,
+          top,
+          right,
+          bottom,
+        ].any((edge) => !edge.isFinite || edge.abs() > 1000000) ||
+        right <= left ||
+        bottom <= top) {
+      throw ArgumentError(
+        'Screen bounds must describe a nonempty finite rectangle',
+      );
+    }
+    return {'left': left, 'top': top, 'right': right, 'bottom': bottom};
+  }
+}
+
 /// A partial update, expressed in logical pixels. Input passes through the whole
 /// rectangle when clickThrough is true; alpha-based hit testing is not implied.
 class FloatingWindowOptions {
@@ -21,9 +63,19 @@ class FloatingWindowOptions {
     this.clickThrough,
     this.focusable,
     this.draggable,
+    this.screenBounds,
   });
   final double? x, y, width, height;
   final bool? alwaysOnTop, clickThrough, focusable, draggable;
+  final FloatingScreenBounds? screenBounds;
+
+  /// Reports explicit bounds that cannot be combined with host-sized layout.
+  bool get hasBounds =>
+      x != null ||
+      y != null ||
+      width != null ||
+      height != null ||
+      screenBounds != null;
 
   factory FloatingWindowOptions.fromMap(Map<String, Object?> value) {
     const keys = {
@@ -35,6 +87,7 @@ class FloatingWindowOptions {
       'clickThrough',
       'focusable',
       'draggable',
+      'screenBounds',
     };
     if (value.keys.any((key) => !keys.contains(key))) {
       throw ArgumentError('Unknown floating window option');
@@ -64,6 +117,9 @@ class FloatingWindowOptions {
       clickThrough: value['clickThrough'] as bool?,
       focusable: value['focusable'] as bool?,
       draggable: value['draggable'] as bool?,
+      screenBounds: value['screenBounds'] == null
+          ? null
+          : FloatingScreenBounds.fromMap(value['screenBounds'] as Map),
     );
   }
 
@@ -88,6 +144,7 @@ class FloatingWindowOptions {
       if (clickThrough != null) 'clickThrough': clickThrough,
       if (focusable != null) 'focusable': focusable,
       if (draggable != null) 'draggable': draggable,
+      if (screenBounds != null) 'screenBounds': screenBounds!.toMap(),
     };
   }
 
@@ -102,13 +159,22 @@ class FloatingWindowOptions {
     focusable: false,
     draggable: false,
   );
+
+  static const _fillDefaults = FloatingWindowOptions(
+    alwaysOnTop: true,
+    clickThrough: false,
+    focusable: false,
+    draggable: false,
+  );
 }
 
 /// Opaque application content kept separate from host presentation options.
 class FloatingWindowLaunch {
+  /// Carries opaque content and window configuration to the presentation engine.
   const FloatingWindowLaunch({
     required this.payload,
     required this.options,
+    this.fill = false,
     this.onBeforeCloseChanged,
   });
 
@@ -116,6 +182,7 @@ class FloatingWindowLaunch {
   final void Function(Future<void> Function()? callback)? onBeforeCloseChanged;
   final Map<String, Object?> payload;
   final FloatingWindowOptions options;
+  final bool fill;
 }
 
 /// Owns secondary-engine startup and native surfaces without app-specific data.
@@ -155,6 +222,7 @@ class FloatingWindows {
       options: FloatingWindowOptions.fromMap(
         (raw['options'] as Map).cast<String, Object?>(),
       ),
+      fill: (raw['fill'] as bool?) ?? false,
     );
   }
 
@@ -208,35 +276,49 @@ class FloatingWindows {
     return await channel.invokeMethod<bool>('requestPermission') ?? false;
   }
 
+  /// Opens a bounded or host-sized surface in the available scope.
   static Future<FloatingWindow> open({
     required Map<String, Object?> payload,
-    FloatingWindowOptions options = FloatingWindowOptions.defaults,
+    FloatingWindowOptions options = const FloatingWindowOptions(),
+    bool fill = false,
     Duration startupTimeout = const Duration(seconds: 30),
   }) async {
     if (startupTimeout <= Duration.zero)
       throw ArgumentError.value(startupTimeout, 'startupTimeout');
+    if (fill && (options.hasBounds || options.draggable == true)) {
+      throw ArgumentError('A fill window cannot set bounds or enable dragging');
+    }
     final support = await capabilities();
     if (support['supported'] != true || support['permissionGranted'] != true) {
       throw StateError(
         'Floating windows are unsupported or overlay permission is missing',
       );
     }
-    final normalized = FloatingWindowOptions.defaults.merge(options);
+    final normalized =
+        (fill || options.screenBounds != null
+                ? FloatingWindowOptions._fillDefaults
+                : FloatingWindowOptions.defaults)
+            .merge(options);
     if (normalized.alwaysOnTop == false && support['alwaysOnTop'] != true) {
       throw UnsupportedError('This host requires alwaysOnTop');
     }
     if (support['scope'] == 'application') {
-      return _applicationHost!.open(payload, normalized);
+      if (options.screenBounds != null) {
+        throw UnsupportedError('Native screen bounds require a system surface');
+      }
+      return _applicationHost!.open(payload, normalized, fill: fill);
     }
     final encoded = jsonEncode({
       'kind': _kind,
       'payload': payload,
       'options': normalized.toMap(),
+      if (fill) 'fill': true,
     });
     late final FloatingWindow window;
     if (_android) {
       window = FloatingWindow._(
         (await channel.invokeMethod<String>('create', {'arguments': encoded}))!,
+        fill: fill,
       );
     } else {
       final controller = await WindowController.create(
@@ -246,7 +328,7 @@ class FloatingWindows {
           arguments: encoded,
         ),
       );
-      window = FloatingWindow._(controller.windowId);
+      window = FloatingWindow._(controller.windowId, fill: fill);
     }
     try {
       final deadline = DateTime.now().add(startupTimeout);
@@ -369,6 +451,7 @@ class FloatingWindows {
           options: previous.options.merge(
             FloatingWindowOptions.fromMap(options),
           ),
+          fill: previous.fill,
         );
         return null;
       }
@@ -394,6 +477,7 @@ class FloatingWindows {
       await channel.invokeMethod<void>('configure', {
         'role': _kind,
         ...launch.options.toMap(),
+        if (launch.fill) 'fill': true,
       });
       runApp(
         Listener(
@@ -430,8 +514,10 @@ class FloatingWindows {
 }
 
 class FloatingWindow {
-  const FloatingWindow._(this.id);
+  /// Keeps the host identity and immutable layout policy together.
+  const FloatingWindow._(this.id, {this.fill = false});
   final String id;
+  final bool fill;
   Future<Object?> _command(String method, [Object? arguments]) {
     if (id.startsWith('application:')) {
       final host = FloatingWindows._applicationHost;
@@ -450,13 +536,23 @@ class FloatingWindow {
     ).invokeMethod<Object?>(method, arguments);
   }
 
+  /// Applies a partial window update while preserving the selected layout mode.
   Future<void> update(
     FloatingWindowOptions options, {
     Map<String, Object?>? payload,
-  }) async => _command('update', {
-    ...options.toMap(),
-    if (payload != null) 'payload': payload,
-  });
+  }) async {
+    if (id.startsWith('application:') && options.screenBounds != null) {
+      throw UnsupportedError('Native screen bounds require a system surface');
+    }
+    if (fill && (options.hasBounds || options.draggable == true)) {
+      throw ArgumentError('A fill window cannot set bounds or enable dragging');
+    }
+    await _command('update', {
+      ...options.toMap(),
+      if (payload != null) 'payload': payload,
+    });
+  }
+
   Future<FloatingWindowOptions> getBounds() async =>
       FloatingWindowOptions.fromMap(
         Map<String, Object?>.from((await _command('getBounds')) as Map),

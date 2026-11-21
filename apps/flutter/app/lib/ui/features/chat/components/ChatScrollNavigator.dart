@@ -1,14 +1,12 @@
 // ignore_for_file: file_names
 
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import '../../../../l10n/generated/app_localizations.dart';
-import '../../../../core/proxy/generated/CoreProxyModels.g.dart'
-    show ChatMessageDisplayMode;
-import '../../../common/ChatMessageIdentity.dart';
 import '../viewmodel/ChatViewModel.dart';
 import 'ChatScrollRailGeometry.dart';
 import 'ChatMessageLocatorContent.dart';
@@ -109,17 +107,16 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   List<ChatMessageLocatorPreview> _locatorEntries =
       const <ChatMessageLocatorPreview>[];
 
-  late List<ChatMessageLocatorPreview> _visibleEntries;
+  bool _locatorLoadFailed = false;
   int? _hoveredEntryIndex;
   double _hoveredEntryCenter = 0;
   int _locatorLoadGeneration = 0;
 
-  /// Loads history previews once instead of generating them on pointer motion.
+  /// Loads global index metadata and bounded previews through the dedicated index API.
   @override
   void initState() {
     super.initState();
     widget.messageNavigation?.addListener(_onMessageNavigation);
-    _visibleEntries = _fallbackEntriesFromMessages();
     _loadLocatorEntries();
   }
 
@@ -137,9 +134,6 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
     final favoritesChanged =
         !identical(oldWidget.messages, widget.messages) &&
         _favoritesChanged(oldWidget.messages, widget.messages);
-    if (!identical(oldWidget.messages, widget.messages)) {
-      _visibleEntries = _fallbackEntriesFromMessages();
-    }
     final messagesChanged =
         oldWidget.messages.length != widget.messages.length ||
         oldWidget.messages.firstOrNull?.timestamp !=
@@ -160,18 +154,18 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
   /// Builds an isolated paint-driven rail and a preview only for the selected row.
   @override
   Widget build(BuildContext context) {
-    if (widget.messages.isEmpty ||
-        widget.viewportHeight <= 60.0 ||
-        !widget.viewportHeight.isFinite) {
+    if (widget.viewportHeight <= 60.0 || !widget.viewportHeight.isFinite) {
       return const SizedBox.shrink();
     }
 
     final entries = _getEntries();
     final activeTimestamp = _resolveActiveTimestamp();
-    final geometry = ChatScrollRailGeometry(
-      entryCount: entries.length,
-      viewportHeight: widget.viewportHeight,
-    );
+    final geometry = entries.isEmpty
+        ? null
+        : ChatScrollRailGeometry(
+            entryCount: entries.length,
+            viewportHeight: widget.viewportHeight,
+          );
     final hoveredIndex = _hoveredEntryIndex;
 
     return LayoutBuilder(
@@ -185,29 +179,43 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
         );
         return Stack(
           children: <Widget>[
-            Positioned(
-              right: 0,
-              top: 0,
-              bottom: 0,
-              width: ChatScrollRailGeometry.interactionWidth,
-              child: _MessageTickRail(
-                key: ValueKey(widget.currentChatId),
-                entries: entries,
-                activeTimestamp: activeTimestamp,
-                geometry: geometry,
-                onHoverEntry: (index, center) {
-                  if (_hoveredEntryIndex == index &&
-                      _hoveredEntryCenter == center) {
-                    return;
-                  }
-                  setState(() {
-                    _hoveredEntryIndex = index;
-                    _hoveredEntryCenter = center;
-                  });
-                },
-                onTapTick: _handleJumpToMessage,
+            if (_locatorLoadFailed)
+              Positioned(
+                right: 0,
+                top: 16,
+                child: IconButton(
+                  key: const ValueKey('chat-message-index-retry'),
+                  tooltip: AppLocalizations.of(
+                    context,
+                  )!.messageLocatorLoadFailed,
+                  onPressed: _loadLocatorEntries,
+                  icon: const Icon(Icons.refresh_rounded),
+                ),
               ),
-            ),
+            if (geometry != null)
+              Positioned(
+                right: 0,
+                top: 0,
+                bottom: 0,
+                width: ChatScrollRailGeometry.interactionWidth,
+                child: _MessageTickRail(
+                  key: ValueKey(widget.currentChatId),
+                  entries: entries,
+                  activeTimestamp: activeTimestamp,
+                  geometry: geometry,
+                  onHoverEntry: (index, center) {
+                    if (_hoveredEntryIndex == index &&
+                        _hoveredEntryCenter == center) {
+                      return;
+                    }
+                    setState(() {
+                      _hoveredEntryIndex = index;
+                      _hoveredEntryCenter = center;
+                    });
+                  },
+                  onTapTick: _handleJumpToMessage,
+                ),
+              ),
             if (hoveredIndex != null &&
                 hoveredIndex < entries.length &&
                 previewWidth > 0)
@@ -277,31 +285,7 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
 
   /// Returns the current cached history preview collection.
   List<ChatMessageLocatorPreview> _getEntries() {
-    return _locatorEntries.isNotEmpty ? _locatorEntries : _visibleEntries;
-  }
-
-  /// Projects the loaded transcript into locator previews once per message update.
-  List<ChatMessageLocatorPreview> _fallbackEntriesFromMessages() {
-    return widget.messages.indexed
-        .map<ChatMessageLocatorPreview>((item) {
-          final idx = item.$1;
-          final msg = item.$2;
-          final text = msg.displayText;
-          return ChatMessageLocatorPreview(
-            messageIndex: idx,
-            timestamp: msg.timestamp,
-            sender: msg.sender,
-            displayName: readChatMessageIdentity(msg)?.title.trim() ?? '',
-            previewContent: text,
-            contentLength: text.length,
-            displayMode:
-                msg.displayMode == ChatMessageDisplayMode.hiddenPlaceholder
-                ? 'HIDDEN_PLACEHOLDER'
-                : 'NORMAL',
-            isFavorite: msg.isFavorite,
-          );
-        })
-        .toList(growable: false);
+    return _locatorEntries;
   }
 
   /// Routes a confirmed tap to its visible row or its history timestamp.
@@ -343,35 +327,38 @@ class _ChatScrollNavigatorState extends State<ChatScrollNavigator> {
     super.dispose();
   }
 
-  /// Rejects stale preview loads after a chat or history window changes.
+  /// Reads the complete lightweight index and rejects responses from superseded chats.
   Future<void> _loadLocatorEntries() async {
     final generation = ++_locatorLoadGeneration;
     final chatId = widget.currentChatId;
     if (chatId == null || chatId.trim().isEmpty) {
       setState(() {
         _locatorEntries = const <ChatMessageLocatorPreview>[];
+        _locatorLoadFailed = false;
       });
       return;
     }
-    List<ChatMessageLocatorPreview> entries;
+    setState(() => _locatorLoadFailed = false);
     try {
-      entries = await widget.loadLocatorEntries(chatId, '');
+      final entries = await widget.loadLocatorEntries(chatId, '');
+      if (!mounted || generation != _locatorLoadGeneration) return;
+      setState(() {
+        _locatorEntries = entries;
+        _hoveredEntryIndex = null;
+      });
     } catch (_) {
-      // The transcript remains navigable while history is unavailable.
-      return;
+      if (!mounted || generation != _locatorLoadGeneration) return;
+      setState(() {
+        _locatorEntries = const <ChatMessageLocatorPreview>[];
+        _hoveredEntryIndex = null;
+        _locatorLoadFailed = true;
+      });
     }
-    if (!mounted || generation != _locatorLoadGeneration) {
-      return;
-    }
-    setState(() {
-      _locatorEntries = entries;
-      _hoveredEntryIndex = null;
-    });
   }
 }
 
 class _MessageTickRail extends StatefulWidget {
-  /// Creates a painted rail with a separate, finger-sized scrolling strip.
+  /// Creates one continuous interaction region for the painted message index.
   const _MessageTickRail({
     super.key,
     required this.entries,
@@ -397,7 +384,8 @@ class _MessageTickRailState extends State<_MessageTickRail>
   final _pointer = ValueNotifier<Offset>(Offset.zero);
   final _scroll = ScrollController();
   bool _scrolling = false;
-  bool _selecting = false;
+  Timer? _edgeScrollTimer;
+  Offset? _lastPressPosition;
 
   double get _scrollOffset => _scroll.hasClients ? _scroll.offset : 0;
   late final AnimationController _proximity;
@@ -465,6 +453,7 @@ class _MessageTickRailState extends State<_MessageTickRail>
   /// Releases the single repaint animation and pointer notifier.
   @override
   void dispose() {
+    _edgeScrollTimer?.cancel();
     _scroll.dispose();
     _proximity.dispose();
     _pointer.dispose();
@@ -507,18 +496,27 @@ class _MessageTickRailState extends State<_MessageTickRail>
   /// Repaints on every motion but rebuilds the preview only when its row changes.
   void _updatePointer(Offset position) {
     final geometry = widget.geometry;
-    _pointer.value = position;
-    if (_scrolling && !_selecting) return;
+    _pointer.value = Offset(
+      position.dx,
+      position.dy.clamp(geometry.top, geometry.top + geometry.height),
+    );
+    if (_scrolling && _touchPointer == null) return;
     final insideHeight =
         position.dy >= geometry.hitTop &&
         position.dy <= geometry.hitTop + geometry.hitHeight;
-    _animateProximity(insideHeight ? geometry.proximityAt(position.dx) : 0);
+    final selecting = _touchPointer != null;
+    _animateProximity(
+      selecting
+          ? 1
+          : insideHeight
+          ? geometry.proximityAt(position.dx)
+          : 0,
+    );
     final index =
-        insideHeight &&
-            position.dx >=
-                ChatScrollRailGeometry.interactionWidth -
-                    ChatScrollRailGeometry.hitWidth &&
-            position.dx <= ChatScrollRailGeometry.interactionWidth
+        selecting ||
+            (insideHeight &&
+                position.dx >= 0 &&
+                position.dx <= ChatScrollRailGeometry.interactionWidth)
         ? geometry.entryIndexAt(position.dy, scrollOffset: _scrollOffset)
         : null;
     if (index != _previewIndex) {
@@ -541,48 +539,76 @@ class _MessageTickRailState extends State<_MessageTickRail>
     }
   }
 
-  /// Shows touch previews immediately, before a tap or drag wins its gesture arena.
+  /// The narrow right-hand strip owns one continuous press/move/release gesture.
   void _handlePointerDown(PointerDownEvent event) {
-    if (event.kind != PointerDeviceKind.mouse) {
-      if (_touchPointer != null) return;
-      _touchPointer = event.pointer;
-    }
+    if (_touchPointer != null || event.buttons != kPrimaryButton) return;
+    _touchPointer = event.pointer;
+    _lastPressPosition = event.localPosition;
+    _scrolling = false;
+    if (_scroll.hasClients) _scroll.jumpTo(_scrollOffset);
     _updatePointer(event.localPosition);
+    _edgeScrollTimer = Timer.periodic(
+      const Duration(milliseconds: 16),
+      (_) => _scrollAtSelectionEdge(),
+    );
   }
 
-  /// Scrubs previews without jumping through the transcript on drag updates.
+  /// Moving always updates selection, without a long-press or swipe threshold.
   void _handlePointerMove(PointerMoveEvent event) {
-    if (event.kind != PointerDeviceKind.mouse &&
-        event.pointer != _touchPointer) {
-      return;
-    }
+    if (event.pointer != _touchPointer) return;
+    _lastPressPosition = event.localPosition;
     _updatePointer(event.localPosition);
   }
 
-  /// Clears touch state on both release and cancellation without hiding mouse hover.
-  void _handlePointerEnd(PointerEvent event) {
-    if (event.pointer != _touchPointer) return;
-    _touchPointer = null;
-    _clearPointer();
+  /// Holding near either edge browses long histories while preserving selection.
+  void _scrollAtSelectionEdge() {
+    final position = _lastPressPosition;
+    if (!mounted || position == null || !_scroll.hasClients) return;
+    final direction = widget.geometry.edgeScrollFactorAt(position.dy);
+    if (direction == 0) return;
+    final offset = (_scrollOffset + direction * 12).clamp(
+      0.0,
+      widget.geometry.maxScrollOffset,
+    );
+    if (offset == _scrollOffset) return;
+    _scroll.jumpTo(offset);
+    _updatePointer(position);
   }
 
-  /// Commits a deliberate tap or long-press selection using the scrolled geometry.
-  void _jumpAt(double localY) {
+  /// Release always confirms the current selection, including horizontal drift.
+  void _handlePointerUp(PointerUpEvent event) {
+    if (event.pointer != _touchPointer) return;
     final index = widget.geometry.entryIndexAt(
-      localY + widget.geometry.hitTop,
+      event.localPosition.dy,
       scrollOffset: _scrollOffset,
     );
+    _endPress();
     widget.onTapTick(widget.entries[index].timestamp);
   }
 
-  /// Observes proximity without consuming transcript gestures outside the hit strip.
+  /// Stops a cancelled press without committing its current message.
+  void _handlePointerCancel(PointerCancelEvent event) {
+    if (event.pointer == _touchPointer) _endPress();
+  }
+
+  /// Stops edge scrolling and clears all state owned by the completed press.
+  void _endPress() {
+    _edgeScrollTimer?.cancel();
+    _edgeScrollTimer = null;
+    _touchPointer = null;
+    _lastPressPosition = null;
+    _scrolling = false;
+    _clearPointer();
+  }
+
+  /// Captures the entire region; individual painted ticks have no hit targets.
   @override
   Widget build(BuildContext context) {
     _disableAnimations = MediaQuery.disableAnimationsOf(context);
     final geometry = widget.geometry;
     final colors = Theme.of(context).colorScheme;
     return MouseRegion(
-      opaque: false,
+      opaque: true,
       hitTestBehavior: HitTestBehavior.translucent,
       onHover: (event) => _updatePointer(event.localPosition),
       onExit: (_) {
@@ -590,10 +616,6 @@ class _MessageTickRailState extends State<_MessageTickRail>
       },
       child: Listener(
         behavior: HitTestBehavior.translucent,
-        onPointerDown: _handlePointerDown,
-        onPointerMove: _handlePointerMove,
-        onPointerUp: _handlePointerEnd,
-        onPointerCancel: _handlePointerEnd,
         child: Stack(
           fit: StackFit.expand,
           children: <Widget>[
@@ -620,70 +642,50 @@ class _MessageTickRailState extends State<_MessageTickRail>
             Positioned(
               right: 0,
               top: geometry.hitTop,
-              width: ChatScrollRailGeometry.hitWidth,
+              width: ChatScrollRailGeometry.interactionWidth,
               height: geometry.hitHeight,
               child: MouseRegion(
                 cursor: SystemMouseCursors.click,
-                opaque: false,
-                child: GestureDetector(
+                opaque: true,
+                child: RawGestureDetector(
                   key: const ValueKey<String>('chat-scroll-rail-hit-target'),
                   behavior: HitTestBehavior.opaque,
-                  onTapUp: (details) => _jumpAt(details.localPosition.dy),
-                  onLongPressStart: (details) {
-                    _selecting = true;
-                    _updatePointer(
-                      Offset(
-                        ChatScrollRailGeometry.interactionWidth -
-                            ChatScrollRailGeometry.hitWidth +
-                            details.localPosition.dx,
-                        details.localPosition.dy + geometry.hitTop,
-                      ),
-                    );
+                  gestures: <Type, GestureRecognizerFactory>{
+                    EagerGestureRecognizer:
+                        GestureRecognizerFactoryWithHandlers<
+                          EagerGestureRecognizer
+                        >(EagerGestureRecognizer.new, (_) {}),
                   },
-                  onLongPressMoveUpdate: (details) => _updatePointer(
-                    Offset(
-                      ChatScrollRailGeometry.interactionWidth -
-                          ChatScrollRailGeometry.hitWidth +
-                          details.localPosition.dx,
-                      details.localPosition.dy + geometry.hitTop,
-                    ),
-                  ),
-                  onLongPressEnd: (details) {
-                    _selecting = false;
-                    if (details.localPosition.dy >= 0 &&
-                        details.localPosition.dy <= geometry.hitHeight &&
-                        details.localPosition.dx >= 0 &&
-                        details.localPosition.dx <=
-                            ChatScrollRailGeometry.hitWidth) {
-                      _jumpAt(details.localPosition.dy);
-                    }
-                    _clearPointer();
-                  },
-                  onLongPressCancel: () {
-                    _selecting = false;
-                    _clearPointer();
-                  },
-                  child: NotificationListener<ScrollNotification>(
-                    onNotification: (notification) {
-                      if (notification is ScrollStartNotification) {
-                        _scrolling = true;
-                        _clearPointer();
-                      } else if (notification is ScrollEndNotification) {
-                        _scrolling = false;
-                      }
-                      return true;
-                    },
-                    child: ScrollConfiguration(
-                      behavior: ScrollConfiguration.of(
-                        context,
-                      ).copyWith(scrollbars: false, overscroll: false),
-                      child: SingleChildScrollView(
-                        controller: _scroll,
-                        primary: false,
-                        physics: const ClampingScrollPhysics(),
-                        child: SizedBox(
-                          height: geometry.hitHeight + geometry.maxScrollOffset,
-                          width: ChatScrollRailGeometry.hitWidth,
+                  child: Listener(
+                    behavior: HitTestBehavior.opaque,
+                    onPointerDown: _handlePointerDown,
+                    onPointerMove: _handlePointerMove,
+                    onPointerUp: _handlePointerUp,
+                    onPointerCancel: _handlePointerCancel,
+                    child: NotificationListener<ScrollNotification>(
+                      onNotification: (notification) {
+                        if (_touchPointer != null) return true;
+                        if (notification is ScrollStartNotification) {
+                          _scrolling = true;
+                          _clearPointer();
+                        } else if (notification is ScrollEndNotification) {
+                          _scrolling = false;
+                        }
+                        return true;
+                      },
+                      child: ScrollConfiguration(
+                        behavior: ScrollConfiguration.of(
+                          context,
+                        ).copyWith(scrollbars: false, overscroll: false),
+                        child: SingleChildScrollView(
+                          controller: _scroll,
+                          primary: false,
+                          physics: const ClampingScrollPhysics(),
+                          child: SizedBox(
+                            height:
+                                geometry.hitHeight + geometry.maxScrollOffset,
+                            width: ChatScrollRailGeometry.interactionWidth,
+                          ),
                         ),
                       ),
                     ),

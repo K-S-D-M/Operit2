@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import '../../../../../core/bridge/ProxyCoreRuntimeBridge.dart';
 import '../../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../common/ChatAvatarImage.dart';
+import '../../../../common/contributions/EmbeddedContributionDialog.dart';
 import 'browser/WorkspaceBrowserViewStore.dart';
 import 'terminal/WorkspaceTerminalSessions.dart';
 import 'WorkspaceOverviewModels.dart';
@@ -28,6 +29,7 @@ class WorkspaceHomeContent extends StatefulWidget {
     required this.onChooseExistingWorkspace,
     required this.onUnbindWorkspace,
     required this.onOpenTerminal,
+    this.onChooseTerminal,
     required this.onOpenTerminalSessions,
     required this.onOpenBrowserSessions,
     required this.onOpenBrowser,
@@ -51,6 +53,7 @@ class WorkspaceHomeContent extends StatefulWidget {
   final VoidCallback onChooseExistingWorkspace;
   final VoidCallback onUnbindWorkspace;
   final VoidCallback onOpenTerminal;
+  final VoidCallback? onChooseTerminal;
   final VoidCallback onOpenTerminalSessions;
   final VoidCallback onOpenBrowserSessions;
   final VoidCallback onOpenBrowser;
@@ -129,6 +132,7 @@ class _WorkspaceHomeContentState extends State<WorkspaceHomeContent> {
           browserSessionCountListenable: widget.browserSessionCountListenable,
           terminalSessionsListenable: widget.terminalSessionsListenable,
           onOpenTerminal: widget.onOpenTerminal,
+          onChooseTerminal: widget.onChooseTerminal,
           onOpenTerminalSessions: widget.onOpenTerminalSessions,
           onOpenBrowser: widget.onOpenBrowser,
           onOpenBrowserSessions: widget.onOpenBrowserSessions,
@@ -230,6 +234,7 @@ class _WorkspaceWorkstationGrid extends StatelessWidget {
     required this.browserSessionCountListenable,
     required this.terminalSessionsListenable,
     required this.onOpenTerminal,
+    this.onChooseTerminal,
     required this.onOpenTerminalSessions,
     required this.onOpenBrowser,
     required this.onOpenBrowserSessions,
@@ -244,6 +249,7 @@ class _WorkspaceWorkstationGrid extends StatelessWidget {
   final ValueListenable<List<WorkspaceTerminalSessionInfo>>?
   terminalSessionsListenable;
   final VoidCallback onOpenTerminal;
+  final VoidCallback? onChooseTerminal;
   final VoidCallback onOpenTerminalSessions;
   final VoidCallback onOpenBrowser;
   final VoidCallback onOpenBrowserSessions;
@@ -262,6 +268,7 @@ class _WorkspaceWorkstationGrid extends StatelessWidget {
           terminalCountListenable: terminalSessionCountListenable,
           sessionsListenable: terminalSessionsListenable,
           onOpenTerminal: onOpenTerminal,
+          onChooseTerminal: onChooseTerminal,
           onOpenTerminalSessions: onOpenTerminalSessions,
           onSelectSession: onSelectTerminalSession,
           onCloseSession: onCloseTerminalSession,
@@ -303,6 +310,7 @@ class _TerminalWorkstationCard extends StatelessWidget {
     required this.terminalCountListenable,
     required this.sessionsListenable,
     required this.onOpenTerminal,
+    this.onChooseTerminal,
     required this.onOpenTerminalSessions,
     required this.onSelectSession,
     required this.onCloseSession,
@@ -311,6 +319,7 @@ class _TerminalWorkstationCard extends StatelessWidget {
   final ValueListenable<int> terminalCountListenable;
   final ValueListenable<List<WorkspaceTerminalSessionInfo>>? sessionsListenable;
   final VoidCallback onOpenTerminal;
+  final VoidCallback? onChooseTerminal;
   final VoidCallback onOpenTerminalSessions;
   final ValueChanged<WorkspaceTerminalSessionInfo>? onSelectSession;
   final ValueChanged<WorkspaceTerminalSessionInfo>? onCloseSession;
@@ -356,6 +365,13 @@ class _TerminalWorkstationCard extends StatelessWidget {
                   visualDensity: VisualDensity.compact,
                   color: colorScheme.onSurfaceVariant,
                   icon: const Icon(Icons.add_rounded, size: 18),
+                ),
+                IconButton(
+                  onPressed: onChooseTerminal,
+                  tooltip: '选择终端配置',
+                  visualDensity: VisualDensity.compact,
+                  color: colorScheme.onSurfaceVariant,
+                  icon: const Icon(Icons.arrow_drop_down_rounded, size: 18),
                 ),
               ],
             ),
@@ -1105,7 +1121,12 @@ class _WorkspaceContributionAvatarState
     }
     setState(() => _presenting = true);
     try {
-      await widget.usage.preview.present(context: context, clients: _clients);
+      await showEmbeddedContributionDialog(
+        route: widget.usage.previewRoute,
+        input: widget.usage.previewInput,
+        context: context,
+        clients: _clients,
+      );
     } catch (error) {
       if (!mounted) {
         return;

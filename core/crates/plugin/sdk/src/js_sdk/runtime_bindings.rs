@@ -47,7 +47,7 @@ pub struct JsToolParameterRules {
 pub const JS_TOOL_PARAMETER_RULES: JsToolParameterRules = JsToolParameterRules {
     flatten_arguments: &["options", "params", "updates"],
     scalar_union_suffixes: &["OrOptions", "OrParams"],
-    preserve_object_namespaces: &["Net", "Media"],
+    preserve_object_namespaces: &["Net", "Media", "UI"],
     argument_names: &[
         ("Chat", "cancel", "chatId", "chatId"),
         ("Files", "writeBinary", "base64Content", "base64Content"),
@@ -78,6 +78,15 @@ pub struct JsToolApiVariant {
 /// Contains every active JavaScript Tools method binding.
 #[rustfmt::skip]
 pub const JS_TOOL_BINDINGS: &[JsToolBinding] = &[
+    JsToolBinding { namespace: "UI", method: "listWindows", target: BuiltinToolName::ListWindows, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "focusWindow", target: BuiltinToolName::FocusWindow, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "getPageInfo", target: BuiltinToolName::GetPageInfo, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "tap", target: BuiltinToolName::Tap, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "longPress", target: BuiltinToolName::LongPress, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "clickElement", target: BuiltinToolName::ClickElement, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "setText", target: BuiltinToolName::SetInputText, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "pressKey", target: BuiltinToolName::PressKey, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "UI", method: "swipe", target: BuiltinToolName::Swipe, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Net", method: "webSocket", target: BuiltinToolName::WebSocket, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Chat", method: "agentStatus", target: BuiltinToolName::AgentStatus, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Chat", method: "createNew", target: BuiltinToolName::CreateNewChat, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
@@ -196,6 +205,7 @@ pub const JS_TOOL_BINDINGS: &[JsToolBinding] = &[
     JsToolBinding { namespace: "System.music", method: "status", target: BuiltinToolName::MusicStatus, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "System.music", method: "stop", target: BuiltinToolName::MusicStop, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "System.terminal", method: "close", target: BuiltinToolName::CloseTerminalSession, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "System.terminal", method: "closeIfIdle", target: BuiltinToolName::CloseTerminalSession, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[("if_idle", "true")] },
     JsToolBinding { namespace: "System.terminal", method: "create", target: BuiltinToolName::CreateTerminalSession, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "System.terminal", method: "exec", target: BuiltinToolName::ExecuteInTerminalSession, strict_arguments: false, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "System.terminal", method: "execStreaming", target: BuiltinToolName::TerminalObserve, strict_arguments: false, facade: JsToolFacade::TerminalCallback, fixed_parameters: &[] },
@@ -211,11 +221,16 @@ pub const JS_TOOL_BINDINGS: &[JsToolBinding] = &[
     JsToolBinding { namespace: "Chat", method: "sendMessageStreaming", target: BuiltinToolName::ChatObserve, strict_arguments: true, facade: JsToolFacade::AsyncIterator, fixed_parameters: &[] },
     JsToolBinding { namespace: "Chat", method: "cancel", target: BuiltinToolName::ChatCancel, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Chat", method: "readExtension", target: BuiltinToolName::ChatReadExtension, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "Chat", method: "deliverPrepared", target: BuiltinToolName::ChatDeliverPrepared, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "Chat", method: "listScheduledMessages", target: BuiltinToolName::ChatListScheduledMessages, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "Chat", method: "scheduleMessage", target: BuiltinToolName::ChatScheduleMessage, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "Chat", method: "cancelScheduledMessage", target: BuiltinToolName::ChatCancelScheduledMessage, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Chat", method: "writeExtension", target: BuiltinToolName::ChatWriteExtension, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Chat", method: "deleteExtension", target: BuiltinToolName::ChatDeleteExtension, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Models", method: "listSummaries", target: BuiltinToolName::ModelsListSummaries, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Tts", method: "synthesize", target: BuiltinToolName::TtsSynthesize, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Tts", method: "speak", target: BuiltinToolName::TtsSpeak, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
+    JsToolBinding { namespace: "Tts", method: "cancel", target: BuiltinToolName::TtsCancel, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Stt", method: "transcribe", target: BuiltinToolName::SttTranscribe, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Tts", method: "listConfigs", target: BuiltinToolName::TtsListConfigs, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
     JsToolBinding { namespace: "Tts", method: "getCurrentConfigId", target: BuiltinToolName::TtsGetCurrentConfigId, strict_arguments: true, facade: JsToolFacade::Promise, fixed_parameters: &[] },
@@ -229,6 +244,10 @@ pub const JS_TOOL_BINDINGS: &[JsToolBinding] = &[
 
 /// Contains every versioned implementation applied to generated Tools methods.
 pub const JS_TOOL_API_VARIANTS: &[JsToolApiVariant] = &[
+    JsToolApiVariant { namespace: "Chat", method: "listScheduledMessages", since: "2.0.0", until: None, arguments: None },
+    JsToolApiVariant { namespace: "Chat", method: "cancelScheduledMessage", since: "2.0.0", until: None, arguments: None },
+    JsToolApiVariant { namespace: "Chat", method: "scheduleMessage", since: "2.0.0", until: None, arguments: None },
+    JsToolApiVariant { namespace: "Chat", method: "deliverPrepared", since: "2.0.0", until: None, arguments: None },
     JsToolApiVariant { namespace: "Net", method: "webSocket", since: "2.0.0", until: None, arguments: None },
     JsToolApiVariant { namespace: "Storage", method: "request", since: "2.0.0", until: None, arguments: None },
     JsToolApiVariant { namespace: "Chat", method: "sendMessage", since: "2.0.0", until: None, arguments: None },
@@ -240,6 +259,7 @@ pub const JS_TOOL_API_VARIANTS: &[JsToolApiVariant] = &[
     JsToolApiVariant { namespace: "Models", method: "listSummaries", since: "2.0.0", until: None, arguments: None },
     JsToolApiVariant { namespace: "Tts", method: "synthesize", since: "2.0.0", until: None, arguments: None },
     JsToolApiVariant { namespace: "Tts", method: "speak", since: "2.0.0", until: None, arguments: None },
+    JsToolApiVariant { namespace: "Tts", method: "cancel", since: "2.0.0", until: None, arguments: None },
     JsToolApiVariant { namespace: "Stt", method: "transcribe", since: "2.0.0", until: None, arguments: None },
     JsToolApiVariant { namespace: "Tts", method: "listConfigs", since: "2.0.0", until: None, arguments: None },
     JsToolApiVariant { namespace: "Tts", method: "getCurrentConfigId", since: "2.0.0", until: None, arguments: None },

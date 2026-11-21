@@ -1,4 +1,6 @@
 mod packages;
+mod application_update;
+mod update_msi;
 use crate::process::background_command;
 
 use std::collections::BTreeMap;
@@ -29,9 +31,98 @@ impl WindowsSystemOperationHost {
     pub fn new() -> Self {
         Self
     }
+
+    /// Reads the SMBIOS model directly without starting a hardware inventory query.
+    pub fn deviceModel() -> HostResult<String> {
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+
+        let key: Vec<u16> = r"HARDWARE\DESCRIPTION\System\BIOS"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let name: Vec<u16> = "SystemProductName".encode_utf16().chain(Some(0)).collect();
+        let mut bytes = 0;
+        // SAFETY: Both strings are terminated; the first call only reads the required size.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bytes,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(HostError::new(format!(
+                "Failed to read Windows device model: {}",
+                std::io::Error::from_raw_os_error(status as i32),
+            )));
+        }
+        if bytes < 2 || bytes % 2 != 0 {
+            return Err(HostError::new(
+                "Windows device model has an invalid UTF-16 size",
+            ));
+        }
+        let mut value = vec![0u16; bytes as usize / 2];
+        // SAFETY: The output buffer is aligned and holds the requested byte count.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                value.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(HostError::new(format!(
+                "Failed to read Windows device model: {}",
+                std::io::Error::from_raw_os_error(status as i32),
+            )));
+        }
+        if bytes < 2 || bytes % 2 != 0 {
+            return Err(HostError::new(
+                "Windows device model has an invalid UTF-16 size",
+            ));
+        }
+        let value = value[..bytes as usize / 2]
+            .strip_suffix(&[0])
+            .ok_or_else(|| HostError::new("Windows device model is not terminated"))?;
+        let model = String::from_utf16(value)
+            .map_err(|error| HostError::new(format!("Invalid Windows device model: {error}")))?;
+        if model.trim().is_empty() {
+            return Err(HostError::new("Windows device model is empty"));
+        }
+        Ok(model)
+    }
 }
 
 impl SystemOperationHost for WindowsSystemOperationHost {
+    /// Reversibly exposes embedded CAB data to the shared package delta decoder.
+    fn transformApplicationUpdate(
+        &self,
+        source: &dyn operit_host_api::FileSource,
+        target: &dyn operit_host_api::FileTarget,
+        transform: operit_host_api::ApplicationUpdateTransform,
+        control: &operit_host_api::HttpDownloadControl,
+        onProgress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> HostResult<()> {
+        update_msi::transform(
+            Path::new(&source.nativePath()?), Path::new(&target.nativePath()?), transform, control, onProgress,
+        ).map_err(|error| HostError::new(error.to_string()))
+    }
+    /// Selects MSI or ZIP from the running copy's registered installation identity.
+    fn applicationUpdateTarget(
+        &self,
+    ) -> HostResult<Option<operit_host_api::ApplicationUpdateTarget>> {
+        application_update::target()
+    }
+
     fn getSystemLanguageCode(&self) -> HostResult<String> {
         get_windows_system_language_code()
     }
@@ -53,8 +144,13 @@ impl SystemOperationHost for WindowsSystemOperationHost {
         get_windows_system_setting(namespace, setting)
     }
 
-    fn installApp(&self, path: &str) -> HostResult<AppOperationData> {
-        request_windows_install_app(path)
+    /// Installs a VFS file reference using the requested platform execution timing.
+    fn installApp(&self, source: &dyn operit_host_api::FileSource, timing: operit_host_api::AppInstallTiming) -> HostResult<AppOperationData> {
+        let path = source.nativePath()?;
+        match timing {
+            operit_host_api::AppInstallTiming::Immediate => request_windows_install_app(&path),
+            operit_host_api::AppInstallTiming::AfterProcessExit => application_update::prepare(&path),
+        }
     }
 
     fn uninstallApp(&self, packageName: &str) -> HostResult<AppOperationData> {
@@ -100,17 +196,26 @@ impl SystemOperationHost for WindowsSystemOperationHost {
         get_windows_device_info()
     }
 
+    /// Writes image bytes through the selected VFS capability and removes native staging.
+    fn captureScreenshotTo(&self, target: &dyn operit_host_api::FileTarget) -> HostResult<()> {
+        let path = self.captureScreenshot()?;
+        let bytes = std::fs::read(&path).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        let written = target.writeBytes(&bytes);
+        std::fs::remove_file(&path).map_err(|error| operit_host_api::HostError::new(error.to_string()))?;
+        written
+    }
+
     fn captureScreenshot(&self) -> HostResult<String> {
         capture_windows_screenshot()
     }
 
     fn recognizeText(
         &self,
-        imagePath: &str,
+        imagePath: &dyn operit_host_api::FileSource,
         language: OCRLanguage,
         quality: OCRQuality,
     ) -> HostResult<String> {
-        recognize_windows_text(imagePath, language, quality)
+        recognize_windows_text(&imagePath.nativePath()?, language, quality)
     }
 }
 
@@ -906,7 +1011,7 @@ $battery = Get-CimInstance Win32_Battery | Select-Object -First 1
 $network = Get-CimInstance Win32_NetworkAdapter -Filter "NetEnabled=True" | Select-Object -First 1
 $buildNumber = 0
 [int]::TryParse([string]$os.BuildNumber, [ref]$buildNumber) > $null
-$batteryLevel = 0
+$batteryLevel = -1
 $batteryCharging = $false
 if ($null -ne $battery) {
     $batteryLevel = [int]$battery.EstimatedChargeRemaining

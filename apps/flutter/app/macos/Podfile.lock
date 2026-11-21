@@ -16,11 +16,16 @@ PODS:
     - desktop_multi_window
     - FlutterMacOS
   - FlutterMacOS (1.0.0)
+  - fvp (0.39.1):
+    - Flutter
+    - FlutterMacOS
+    - mdk (~> 0.39.0)
   - geolocator_apple (1.2.0):
     - Flutter
     - FlutterMacOS
   - image_picker_macos (0.0.1):
     - FlutterMacOS
+  - mdk (0.39.0)
   - mobile_scanner (7.0.0):
     - Flutter
     - FlutterMacOS
@@ -28,11 +33,16 @@ PODS:
     - FlutterMacOS
   - operit_keep_alive (0.1.0):
     - FlutterMacOS
+  - operit_system_fonts (0.1.0):
+    - Flutter
+    - FlutterMacOS
   - package_info_plus (0.0.1):
     - FlutterMacOS
   - printing (1.0.0):
     - FlutterMacOS
   - record_macos (1.2.1):
+    - FlutterMacOS
+  - share_plus (0.0.1):
     - FlutterMacOS
   - url_launcher_macos (0.0.1):
     - FlutterMacOS
@@ -52,17 +62,24 @@ DEPENDENCIES:
   - file_selector_macos (from `Flutter/ephemeral/.symlinks/plugins/file_selector_macos/macos`)
   - floating_windows (from `Flutter/ephemeral/.symlinks/plugins/floating_windows/macos`)
   - FlutterMacOS (from `Flutter/ephemeral`)
+  - fvp (from `Flutter/ephemeral/.symlinks/plugins/fvp/darwin`)
   - geolocator_apple (from `Flutter/ephemeral/.symlinks/plugins/geolocator_apple/darwin`)
   - image_picker_macos (from `Flutter/ephemeral/.symlinks/plugins/image_picker_macos/macos`)
   - mobile_scanner (from `Flutter/ephemeral/.symlinks/plugins/mobile_scanner/darwin`)
   - operit_folder_access (from `Flutter/ephemeral/.symlinks/plugins/operit_folder_access/macos`)
   - operit_keep_alive (from `Flutter/ephemeral/.symlinks/plugins/operit_keep_alive/macos`)
+  - operit_system_fonts (from `Flutter/ephemeral/.symlinks/plugins/operit_system_fonts/darwin`)
   - package_info_plus (from `Flutter/ephemeral/.symlinks/plugins/package_info_plus/macos`)
   - printing (from `Flutter/ephemeral/.symlinks/plugins/printing/macos`)
   - record_macos (from `Flutter/ephemeral/.symlinks/plugins/record_macos/macos`)
+  - share_plus (from `Flutter/ephemeral/.symlinks/plugins/share_plus/macos`)
   - url_launcher_macos (from `Flutter/ephemeral/.symlinks/plugins/url_launcher_macos/macos`)
   - video_player_avfoundation (from `Flutter/ephemeral/.symlinks/plugins/video_player_avfoundation/darwin`)
   - webview_flutter_wkwebview (from `Flutter/ephemeral/.symlinks/plugins/webview_flutter_wkwebview/darwin`)
+
+SPEC REPOS:
+  trunk:
+    - mdk
 
 EXTERNAL SOURCES:
   audioplayers_darwin:
@@ -81,6 +98,8 @@ EXTERNAL SOURCES:
     :path: Flutter/ephemeral/.symlinks/plugins/floating_windows/macos
   FlutterMacOS:
     :path: Flutter/ephemeral
+  fvp:
+    :path: Flutter/ephemeral/.symlinks/plugins/fvp/darwin
   geolocator_apple:
     :path: Flutter/ephemeral/.symlinks/plugins/geolocator_apple/darwin
   image_picker_macos:
@@ -91,12 +110,16 @@ EXTERNAL SOURCES:
     :path: Flutter/ephemeral/.symlinks/plugins/operit_folder_access/macos
   operit_keep_alive:
     :path: Flutter/ephemeral/.symlinks/plugins/operit_keep_alive/macos
+  operit_system_fonts:
+    :path: Flutter/ephemeral/.symlinks/plugins/operit_system_fonts/darwin
   package_info_plus:
     :path: Flutter/ephemeral/.symlinks/plugins/package_info_plus/macos
   printing:
     :path: Flutter/ephemeral/.symlinks/plugins/printing/macos
   record_macos:
     :path: Flutter/ephemeral/.symlinks/plugins/record_macos/macos
+  share_plus:
+    :path: Flutter/ephemeral/.symlinks/plugins/share_plus/macos
   url_launcher_macos:
     :path: Flutter/ephemeral/.symlinks/plugins/url_launcher_macos/macos
   video_player_avfoundation:
@@ -113,14 +136,18 @@ SPEC CHECKSUMS:
   file_selector_macos: 3e56eaea051180007b900eacb006686fd54da150
   floating_windows: 940db3255162263c08f3efc5a6d71c4244e796c6
   FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+  fvp: 0394396e293caeee0602df3eed0b050de4f1124d
   geolocator_apple: 66b711889fd333205763b83c9dcf0a57a28c7afd
   image_picker_macos: 2506ff19cb68903beebc6327ce4024277de6faa8
+  mdk: d60f5c4a7726bd0732bdd740d65d9de91090b138
   mobile_scanner: 77265f3dc8d580810e91849d4a0811a90467ed5e
   operit_folder_access: e49c215aae854e85a2c736a3105f8992373a9768
   operit_keep_alive: b2583e0fe8e3963dd038afd796a8067863e6a474
+  operit_system_fonts: 90b789bf0b0c39ad0e0b4f6dd4f137e208b97223
   package_info_plus: 12f1c5c2cfe8727ca46cbd0b26677728972d9a5b
   printing: 1dd6a1fce2209ec240698e2439a4adbb9b427637
   record_macos: ccd7864c9922136e50c2937b21384f0b175922f2
+  share_plus: 1fa619de8392a4398bfaf176d441853922614e89
   url_launcher_macos: 175a54c831f4375a6cf895875f716ee5af3888ce
   video_player_avfoundation: e54d03b3b19f64f2c557354f72ce538387541ba6
   webview_flutter_wkwebview: 08f7e3ddafd07a1c7319987f5af4ddb173964b24

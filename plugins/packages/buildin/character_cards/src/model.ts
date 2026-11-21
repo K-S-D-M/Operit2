@@ -41,6 +41,8 @@ export interface Group {
   id: string;
   name: string;
   description: string;
+  /** Stores an explicit custom portrait; released records without this field use member portraits. */
+  avatarUri?: string | null;
   members: GroupMember[];
   themeConfigId: string | null;
   createdAt: number;
@@ -64,7 +66,7 @@ export interface ConversationGroupRecord {
 /** Reports explicit membership without inventing an ungrouped record. */
 /** Releases all manual memberships without deleting any host chats. */
 
-export type GroupValues = Pick<Group, "id" | "name" | "description" | "members" | "themeConfigId">;
+export type GroupValues = Pick<Group, "id" | "name" | "description" | "avatarUri" | "members" | "themeConfigId">;
 
 /** Matches the complete serde record in operit_model::Memory::SharedMemoryStore. */
 export interface Store { id: string; name: string; createdAt: number; updatedAt: number }
@@ -207,18 +209,8 @@ export interface MemoryGraphResult { graph: MemoryGraph; items: Memory[] }
 export interface UserDocument { ownerKey: string; content: string }
 export interface MemoryOwner { kind: "CHARACTER" | "SHARED"; id: string }
 
-/** Matches the complete owner-scoped serde record in operit_model::MemorySettings. */
-export interface MemorySettings {
-  autoSaveIntervalMinutes: number;
-  nextAutoSaveRunAtMs: number;
-  memoryExtractionCustomRules: string;
-  profileAutoUpdateEnabled: boolean;
-  profileAutoUpdateLocked: boolean;
-  cloudEmbeddingEnabled: boolean;
-  cloudEmbeddingEndpoint: string;
-  cloudEmbeddingApiKey: string;
-  cloudEmbeddingModel: string;
-}
+/** Stores settings for one character or shared memory library. */
+export type MemorySettings = import("./api").MemorySettingsRecord;
 export interface MemorySearchConfig {
   scoreMode: "BALANCED" | "KEYWORD_FIRST" | "SEMANTIC_FIRST";
   keywordWeight: number;
@@ -262,6 +254,7 @@ export type Request =
   | { action: "readMemoryRecallSettings" }
   | { action: "writeMemoryRecallSettings"; settings: MemoryRecallSettings }
   | { action: "searchMemoryDebug"; ownerKey: string; query: string; config: MemorySearchConfig; relevanceThreshold: number }
+  | { action: "previewMemorySearch"; ownerKey: string; query: string; folderPath: string | null }
   | { action: "readMemoryLink"; ownerKey: string; linkId: string }
   | { action: "listThemeChoices" }
   | { action: "listCharacters" }
@@ -468,6 +461,7 @@ export interface RequestResults {
   readMemoryRecallSettings: MemoryRecallSettings;
   writeMemoryRecallSettings: MemoryRecallSettings;
   searchMemoryDebug: MemorySearchDebug;
+  previewMemorySearch: MemorySearchDebug;
   readMemoryLink: MemoryLink;
   listThemeChoices: import("./selection-application").ThemeChoice[];
   listCharacters: Card[];

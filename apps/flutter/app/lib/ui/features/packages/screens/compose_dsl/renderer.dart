@@ -38,6 +38,7 @@ Widget buildComposeProgramLayoutForTest({
   required core_proxy.ToolPkgComposeDslTransaction update,
   required ComposeDslWebViewHostContext hostContext,
   required void Function(VoidCallback dispose) registerDispose,
+  ComposeDslWebViewActionDispatcher? onAction,
   void Function(void Function(core_proxy.ToolPkgComposeDslTransaction) apply)?
   registerApply,
 }) {
@@ -59,7 +60,7 @@ Widget buildComposeProgramLayoutForTest({
   );
   return _ComposeProgramExecutor(
     node: store.root,
-    onAction: dispatch,
+    onAction: onAction ?? dispatch,
     onTextInput: (id, text) async => null,
     webViewHostContext: resolvedHost,
     splitMarkdownContent: (_) async => [],
@@ -119,6 +120,20 @@ class _ComposeProgramExecutorState extends State<_ComposeProgramExecutor> {
     final target = _eventTargets[id];
     if (target == null) throw StateError('Unknown Compose event slot: $id');
     return widget.onAction(target, payload);
+  }
+
+  /// Resolves browser callbacks through the dispatcher that defers result delivery.
+  Future<Object?> _dispatchWebViewEvent(String id, [Object? payload]) {
+    if (!id.startsWith('@program:')) {
+      return widget.webViewHostContext.dispatchAction(id, payload);
+    }
+    if (!mounted || node.isDisposed) return Future<Object?>.value();
+    props;
+    final target = _eventTargets[id];
+    if (target == null) throw StateError('Unknown Compose event slot: $id');
+    // RPC results are delivered after the browser receives its response. The
+    // native-control dispatcher also notifies immediately and would attach twice.
+    return widget.webViewHostContext.dispatchAction(target, payload);
   }
 
   /// Binds callback addresses to this Flutter occurrence while sharing all callback-free values.
@@ -230,14 +245,17 @@ class _ComposeProgramExecutorState extends State<_ComposeProgramExecutor> {
   Widget build(BuildContext context) {
     _clearDependencies();
     return _trackBuild(() {
-      final content = _withModifier(
-        context,
-        _executeInstruction(context),
-        props,
-        onAction,
-        nodeType: node.type,
-        modifierScope: modifierScope,
-      );
+      final instruction = _executeInstruction(context);
+      final content = _isControlledDropdown(node.type, props)
+          ? instruction
+          : _withModifier(
+              context,
+              instruction,
+              props,
+              onAction,
+              nodeType: node.type,
+              modifierScope: modifierScope,
+            );
       _dispatchOnLoad();
       return operitDesignBridgeEnabled
           ? OperitDesignSource(source: {
@@ -296,6 +314,29 @@ class _ComposeProgramExecutorState extends State<_ComposeProgramExecutor> {
         );
       case 'ActivityDots':
         return _ComposeActivityDots(props: props);
+      case 'GlowBorder':
+        final colors = (props['colors'] as List? ?? const [])
+            .map((value) => _color(context, value))
+            .whereType<Color>()
+            .toList();
+        return ComposeGlowBorder(
+          colors: colors.length < 2
+              ? [
+                  Theme.of(context).colorScheme.primary,
+                  Theme.of(context).colorScheme.tertiary,
+                ]
+              : colors,
+          cornerRadius: (_number(props['cornerRadius']) ?? 0).clamp(0, 200),
+          strokeWidth: (_number(props['strokeWidth']) ?? 3).clamp(0.5, 12),
+          glowWidth: (_number(props['glowWidth']) ?? 56).clamp(1, 80),
+          duration: Duration(
+            milliseconds: (_int(props['durationMillis']) ?? 6000).clamp(
+              1000,
+              60000,
+            ),
+          ),
+          running: _boolOrDefault(props['running'], true),
+        );
       case 'Draggable':
         return _ComposeDraggable(
           props: props,
@@ -437,18 +478,19 @@ class _ComposeProgramExecutorState extends State<_ComposeProgramExecutor> {
         return _dialog(context, type == 'AlertDialog');
       case 'Row':
         final contentNodes = _slotNodes('content', useChildren: true);
+        final arrangement =
+            props['horizontalArrangement'] ?? props['mainAxisAlignment'];
         return _ComposeFlex(
           direction: Axis.horizontal,
           nodes: contentNodes,
-          mainAxisSize: _nodesRequireRowFlex(contentNodes)
+          mainAxisSize:
+              props['mainAxisSize'] == 'max' ||
+                  _nodesRequireRowFlex(contentNodes)
               ? MainAxisSize.max
               : MainAxisSize.min,
           crossAxisAlignment: _crossAxis(props['verticalAlignment']),
-          mainAxisAlignment: _mainAxis(props['horizontalArrangement']),
-          spacing: _flexSpacing(
-            props['horizontalArrangement'],
-            props['spacing'],
-          ),
+          mainAxisAlignment: _mainAxis(arrangement),
+          spacing: _flexSpacing(arrangement, props['spacing']),
           children: _buildRowChildren(
             contentNodes,
             pathPrefix: '$nodePath:content',
@@ -528,6 +570,7 @@ class _ComposeProgramExecutorState extends State<_ComposeProgramExecutor> {
       case 'RichText':
       case 'CodeText':
       case 'Tooltip':
+      case 'CodeEditor':
       case 'ScrollArea':
       case 'MenuAnchor':
       case 'InkWell':
@@ -719,7 +762,7 @@ class _ComposeProgramExecutorState extends State<_ComposeProgramExecutor> {
       case 'PullToRefreshBox':
         return _pullToRefreshBox(context);
       case 'DropdownMenu':
-        return _dropdownMenu(context);
+        return _dropdownMenu();
       case 'TimePickerDialog':
         return _timePickerDialog(context);
       case 'VerticalDragHandle':
@@ -735,7 +778,7 @@ class _ComposeProgramExecutorState extends State<_ComposeProgramExecutor> {
           ),
           props: props,
           onAction: onAction,
-          hostContext: webViewHostContext.withActionDispatcher(onAction),
+          hostContext: webViewHostContext.withActionDispatcher(_dispatchWebViewEvent),
         );
       case 'Image':
       case 'AsyncImage':

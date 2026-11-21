@@ -1,5 +1,6 @@
 /* METADATA
 {
+    "api_version": "2.0.0",
     "name": "operit_editor",
     "display_name": {
         "zh": "Operit 平台编辑器",
@@ -9,7 +10,7 @@
         "zh": "通过真实的 core command 执行入口管理 Operit2 的包、Skill、MCP、模型、偏好设置、聊天与工作区，返回实际执行结果。",
         "en": "Manage Operit2 packages, skills, MCP, models, preferences, chats, and workspaces through the real core command executor."
     },
-    "enabledByDefault": false,
+    "enabledByDefault": true,
     "category": "System",
     "tools": [
         {

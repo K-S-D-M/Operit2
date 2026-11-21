@@ -5,6 +5,8 @@ use operit_store::NetworkControlStore::NetworkControlStore;
 use tokio::sync::oneshot;
 
 const DISCOVERY_INTERVAL_MS: u64 = 3_000;
+/// One shared active query recovers missed announcements without scanning for healthy peers.
+const DISCOVERY_REFRESH_INTERVAL_MS: u64 = 15_000;
 const MAX_CONNECTING_PEERS: usize = 4;
 /// Policy rejections (`PEER_CONNECTION_REVOKED`) are deterministic until an admin
 /// admits the peer again, so probing them at the discovery interval is pure waste.
@@ -16,11 +18,40 @@ pub(super) struct AvailabilityWorker {
 }
 
 impl HostRuntimePeerService {
+    /// Reuses a known protocol rejection without opening another transport connection.
+    pub(super) fn requirePeerProtocolAllowed(&self, node: &str) -> Result<(), CoreLinkError> {
+        match self.state.protocolFailures.lock().unwrap_or_else(|p| p.into_inner()).get(node) {
+            Some(failure) => Err(failure.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Retains only outbound negotiation failures; live authenticated channels remain authoritative.
+    pub(super) fn recordPeerProtocolFailure(&self, node: &str, failure: &CoreLinkError) {
+        if !crate::PeerProtocol::PeerProtocol::rejectsConnection(failure) { return; }
+        let mut failures = self.state.protocolFailures.lock().unwrap_or_else(|p| p.into_inner());
+        if self.hasLiveChannel(node) { return; }
+        failures.insert(node.to_owned(), failure.clone());
+        drop(failures);
+        self.changed();
+    }
+
+    /// Allows a new negotiation after an explicit retry or a successful incoming handshake.
+    pub(super) fn clearPeerProtocolFailure(&self, node: &str) {
+        let removed = self.state.protocolFailures.lock().unwrap_or_else(|p| p.into_inner()).remove(node);
+        if removed.is_some() { self.changed(); }
+    }
+
     /// Rejects transport use forbidden by the current shared Space policy.
     pub(super) fn requirePeerConnectionAllowed(&self, node: &str) -> Result<(), CoreLinkError> {
         let storage = self.state.host.runtimeStorageHost.clone()
             .ok_or_else(|| error("Runtime storage Host is not installed"))?;
-        if NetworkControlStore::new(storage).map_err(error)?.nodeIsDisconnected(node).map_err(error)? {
+        let control = if self.router()?.nodeLocalControlProjection() {
+            NetworkControlStore::newNodeLocal(storage)
+        } else {
+            NetworkControlStore::new(storage)
+        }.map_err(error)?;
+        if control.nodeIsDisconnected(node).map_err(error)? {
             return Err(CoreLinkError::new("PEER_CONNECTION_REVOKED", "Peer is disconnected by current Space policy"));
         }
         Ok(())
@@ -38,8 +69,10 @@ impl HostRuntimePeerService {
         let (done, finished) = oneshot::channel();
         scheduler.scheduleHostRuntimeAsyncTask("peer-availability", Box::new(move || Box::pin(async move {
             // The subscription shares the Host browser with manual scans and lives only as long as this worker.
-            let _discovery = state.upgrade().and_then(|state| HostRuntimePeerService { state }.subscribeDiscovery());
+            let mut discovery = state.upgrade().and_then(|state| HostRuntimePeerService { state }.subscribeDiscovery());
             let mut pending = FuturesUnordered::<LocalBoxFuture<'static, (String, Result<(), CoreLinkError>)>>::new();
+            let mut discoveryRefresh = FuturesUnordered::<LocalBoxFuture<'static, discovery::DiscoveryRefresh>>::new();
+            let mut nextDiscoveryRefresh = 0;
             let mut connecting = BTreeSet::new();
             let mut policyRevokedUntil = BTreeMap::<String, u64>::new();
             let mut tick = tasks.waitForHostRuntimeDelay(0);
@@ -48,6 +81,19 @@ impl HostRuntimePeerService {
                 tokio::select! {
                     biased;
                     _ = &mut stopped => break,
+                    result = discoveryRefresh.next(), if !discoveryRefresh.is_empty() => {
+                        let failure = match result {
+                            Some(refresh) => {
+                                if let Some(subscription) = refresh.subscription { discovery = Some(subscription); }
+                                refresh.scan.err()
+                            }
+                            None => None,
+                        };
+                        if let Some(failure) = failure {
+                            operit_util::AppLogger::AppLogger::w("RuntimePeerService", &format!(
+                                "Background LAN discovery refresh failed: {failure}"));
+                        }
+                    }
                     result = pending.next(), if !pending.is_empty() => {
                         if let Some((node, result)) = result {
                             connecting.remove(&node);
@@ -80,15 +126,19 @@ impl HostRuntimePeerService {
                         peers.sort_by(|left, right| left.nodeId.cmp(&right.nodeId));
                         let split = peers.partition_point(|peer| lastPeer.as_ref().is_some_and(|last| &peer.nodeId <= last));
                         peers.rotate_left(split);
+                        let mut needsDiscovery = service.needsDirectoryRefresh();
                         for peer in peers {
                             if policyRevokedUntil.contains_key(&peer.nodeId) { continue; }
                             if service.requirePeerConnectionAllowed(&peer.nodeId).is_err() {
                                 service.refreshPeerAvailability(&peer.nodeId);
                                 continue;
                             }
-                            if connecting.contains(&peer.nodeId) || service.hasLiveChannel(&peer.nodeId) { continue; }
-                            if !peer.outbound { continue; }
-                            if connecting.len() >= MAX_CONNECTING_PEERS.min(service.state.limits.concurrentProbes) { break; }
+                            if !peer.outbound || service.hasLiveChannel(&peer.nodeId) { continue; }
+                            if service.requirePeerProtocolAllowed(&peer.nodeId).is_err() { continue; }
+                            if service.outbound(&peer.nodeId).ok().and_then(|record| parseTransport(&record.transport).ok())
+                                .is_some_and(isNetworkTransport) { needsDiscovery = true; }
+                            if connecting.contains(&peer.nodeId) { continue; }
+                            if connecting.len() >= MAX_CONNECTING_PEERS.min(service.state.limits.concurrentProbes) { continue; }
                             let node = peer.nodeId;
                             lastPeer = Some(node.clone());
                             connecting.insert(node.clone());
@@ -101,9 +151,20 @@ impl HostRuntimePeerService {
                                 (node, result)
                             }));
                         }
+                        // Manual direct-link scans already restart this same browser. Do that
+                        // automatically for offline network pairings, with one bounded scan for all peers.
+                        if needsDiscovery && (service.state.host.serviceDiscoveryHost.is_some() || service.needsDirectoryRefresh())
+                            && discoveryRefresh.is_empty() && now >= nextDiscoveryRefresh {
+                            nextDiscoveryRefresh = now.saturating_add(DISCOVERY_REFRESH_INTERVAL_MS);
+                            let retrySubscription = discovery.is_none();
+                            discoveryRefresh.push(Box::pin(async move {
+                                service.refreshDiscovery(3_000, retrySubscription).await
+                            }));
+                        }
                     }
                 }
             }
+            drop(discoveryRefresh);
             drop(pending);
             let _ = done.send(());
         }))).map_err(|e| error(e.to_string()))?;

@@ -5,8 +5,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'SpaceJoinWidgets.dart';
 import 'PeerQrCodeDialog.dart';
+import 'PairingErrorText.dart';
 import 'package:flutter/services.dart';
 
+import '../../core/logging/ClientLogger.dart';
 import '../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../core/proxy/generated/CoreProxyModels.g.dart' as generated;
 import '../../core/runtime/PeerEndpointTransport.dart';
@@ -206,9 +208,10 @@ class _AddDeviceDialog extends StatefulWidget {
 }
 
 class _AddDeviceDialogState extends State<_AddDeviceDialog> {
+  Timer? _refresh;
   bool _busy = false;
   bool _scanning = false;
-  String? _error;
+  Object? _error;
   String? _discoveryError;
   List<generated.DiscoveredPeer> _peers = [];
 
@@ -223,6 +226,12 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
     }
   }
 
+  @override
+  void dispose() {
+    _refresh?.cancel();
+    super.dispose();
+  }
+
   /// Updates action availability and the explicit discovery status.
   void _setBusy(bool busy) {
     if (!mounted) return;
@@ -233,15 +242,18 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
   }
 
   /// Refreshes nearby devices without displaying a progress bar.
-  Future<void> _scan() async {
+  Future<void> _scan({bool background = false}) async {
     if (_busy || _scanning) return;
+    _refresh ??= Timer.periodic(const Duration(seconds: 5), (_) {
+      if (mounted) unawaited(_scan(background: true));
+    });
     setState(() {
       _scanning = true;
-      _discoveryError = null;
+      if (!background) _discoveryError = null;
     });
     try {
       final peers = await widget.clients.server.runtimeRemoteLinkService
-          .discoverPeers(timeoutMs: 5000);
+          .discoverPeers(timeoutMs: background ? 3000 : 5000);
       final onlyNodeId = widget.onlyNodeId;
       if (mounted) {
         setState(() {
@@ -254,7 +266,12 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
         });
       }
     } catch (error) {
-      if (mounted) setState(() => _discoveryError = error.toString());
+      if (mounted) {
+        setState(() {
+          _peers = [];
+          _discoveryError = error.toString();
+        });
+      }
     } finally {
       if (mounted) setState(() => _scanning = false);
     }
@@ -328,8 +345,20 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
           if (mounted) Navigator.pop(context);
         }
       }
-    } catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+    } catch (error, stackTrace) {
+      if (ClientLogger.isInitialized) {
+        ClientLogger.w(
+          'Pairing failed source=${connectionCode != null
+              ? 'qr'
+              : peer != null
+              ? 'discovery'
+              : 'address'} target=${peer?.nodeId ?? 'from-input'}',
+          tag: 'DeviceSpacePairing',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+      if (mounted) setState(() => _error = error);
     } finally {
       _setBusy(false);
     }
@@ -550,7 +579,7 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
   }
 
   /// Keeps discovery errors readable inside the scrollable device content.
-  Widget _buildError(BuildContext context, String error) {
+  Widget _buildError(BuildContext context, Object error) {
     final colors = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
@@ -567,8 +596,8 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
               Icon(Icons.error_outline_rounded, color: colors.onErrorContainer),
               const SizedBox(width: 10),
               Expanded(
-                child: Text(
-                  error,
+                child: PairingErrorText(
+                  error: error,
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: colors.onErrorContainer,
                   ),
@@ -627,6 +656,23 @@ class _AddDeviceDialogState extends State<_AddDeviceDialog> {
             ),
           ),
           SliverToBoxAdapter(child: _qrActions(l10n)),
+          if (_busy && (ModalRoute.of(context)?.isCurrent ?? true))
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 16),
+                child: Row(
+                  children: [
+                    const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(child: Text(l10n.backgroundWorkConnecting)),
+                  ],
+                ),
+              ),
+            ),
           if (_error != null)
             SliverToBoxAdapter(child: _buildError(context, _error!)),
           if (_discoveryError != null)
@@ -742,7 +788,7 @@ class _RemotePairDialogState extends State<_RemotePairDialog> {
   generated.PeerTransport? _transport;
   generated.PendingPairing? _pairing;
   bool _busy = false;
-  String? _error;
+  Object? _error;
 
   /// Releases all dialog-owned text controllers.
   @override
@@ -774,7 +820,7 @@ class _RemotePairDialogState extends State<_RemotePairDialog> {
       }
     } catch (error) {
       if (mounted) {
-        setState(() => _error = error.toString());
+        setState(() => _error = error);
       }
     } finally {
       if (mounted) {
@@ -812,7 +858,7 @@ class _RemotePairDialogState extends State<_RemotePairDialog> {
       }
     } catch (error) {
       if (mounted) {
-        setState(() => _error = error.toString());
+        setState(() => _error = error);
       }
     } finally {
       if (mounted) {
@@ -875,8 +921,8 @@ class _RemotePairDialogState extends State<_RemotePairDialog> {
               const SizedBox(height: 10),
               Align(
                 alignment: Alignment.centerLeft,
-                child: Text(
-                  _error!,
+                child: PairingErrorText(
+                  error: _error!,
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),
@@ -929,7 +975,7 @@ class _RemotePairCodeDialog extends StatefulWidget {
 class _RemotePairCodeDialogState extends State<_RemotePairCodeDialog> {
   final TextEditingController _codeController = TextEditingController();
   bool _busy = false;
-  String? _error;
+  Object? _error;
 
   /// Releases the one-time pairing code controller.
   @override
@@ -963,7 +1009,7 @@ class _RemotePairCodeDialogState extends State<_RemotePairCodeDialog> {
       }
     } catch (error) {
       if (mounted) {
-        setState(() => _error = error.toString());
+        setState(() => _error = error);
       }
     } finally {
       if (mounted) {
@@ -1002,8 +1048,8 @@ class _RemotePairCodeDialogState extends State<_RemotePairCodeDialog> {
               const SizedBox(height: 10),
               Align(
                 alignment: Alignment.centerLeft,
-                child: Text(
-                  _error!,
+                child: PairingErrorText(
+                  error: _error!,
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),

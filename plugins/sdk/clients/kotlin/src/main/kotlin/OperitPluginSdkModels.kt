@@ -152,6 +152,7 @@ fun PackageToolParameter.toMessagePackValue(): Map<String, Any?> = mapOf(
 
 data class ToolPackage(
     val name: String,
+    val api_version: String,
     val description: LocalizedText,
     val tools: List<PackageTool>,
     val states: List<ToolPackageState>,
@@ -167,6 +168,7 @@ fun decodeToolPackage(value: Any?): ToolPackage {
     val input = value as Map<*, *>
     return ToolPackage(
         name = input["name"] as String as String,
+        api_version = input["api_version"] as String as String,
         description = decodeLocalizedText(input["description"]) as LocalizedText,
         tools = (input["tools"] as List<*>).map { item -> decodePackageTool(item) } as List<PackageTool>,
         states = (input["states"] as List<*>).map { item -> decodeToolPackageState(item) } as List<ToolPackageState>,
@@ -182,6 +184,7 @@ fun decodeToolPackage(value: Any?): ToolPackage {
 /** Encodes a typed SDK model into its Link argument representation. */
 fun ToolPackage.toMessagePackValue(): Map<String, Any?> = mapOf(
     "name" to this.name,
+    "api_version" to this.api_version,
     "description" to this.description.toMessagePackValue(),
     "tools" to this.tools.map { item -> item.toMessagePackValue() },
     "states" to this.states.map { item -> item.toMessagePackValue() },
@@ -592,6 +595,7 @@ data class ToolPkgContainerRuntime(
     val publicApi: String?,
     val publicApis: List<ToolPkgRegisteredFunctionHook>,
     val requires: List<ToolPkgManifestRequirement>,
+    val optionalRequires: List<ToolPkgManifestRequirement>,
     val dependencyIssues: List<ToolPkgDependencyIssue>,
     val manifestExtensions: Map<String, Any?>,
     val author: List<String>,
@@ -617,6 +621,8 @@ data class ToolPkgContainerRuntime(
     val chatInputHooks: List<ToolPkgFunctionHookRuntime>,
     val chatViewHooks: List<ToolPkgFunctionHookRuntime>,
     val chatMessageHooks: List<ToolPkgFunctionHookRuntime>,
+    val messageTransformHooks: List<ToolPkgFunctionHookRuntime>,
+    val messageStreamTransforms: List<ToolPkgFunctionHookRuntime>,
     val chatLifecycleHooks: List<ToolPkgFunctionHookRuntime>,
     val chatMessageMenuItems: List<ToolPkgChatMessageMenuItemRuntime>,
     val chatRuntimeHooks: List<ToolPkgFunctionHookRuntime>,
@@ -649,6 +655,7 @@ fun decodeToolPkgContainerRuntime(value: Any?): ToolPkgContainerRuntime {
         publicApi = input["publicApi"]?.let { it as String } as String?,
         publicApis = (input["publicApis"] as List<*>).map { item -> decodeToolPkgRegisteredFunctionHook(item) } as List<ToolPkgRegisteredFunctionHook>,
         requires = (input["requires"] as List<*>).map { item -> decodeToolPkgManifestRequirement(item) } as List<ToolPkgManifestRequirement>,
+        optionalRequires = (input["optional_requires"] as List<*>).map { item -> decodeToolPkgManifestRequirement(item) } as List<ToolPkgManifestRequirement>,
         dependencyIssues = (input["dependencyIssues"] as List<*>).map { item -> decodeToolPkgDependencyIssue(item) } as List<ToolPkgDependencyIssue>,
         manifestExtensions = (input["manifestExtensions"] as Map<*, *>).entries.associate { entry -> entry.key as String to entry.value } as Map<String, Any?>,
         author = (input["author"] as List<*>).map { item -> item as String } as List<String>,
@@ -674,6 +681,8 @@ fun decodeToolPkgContainerRuntime(value: Any?): ToolPkgContainerRuntime {
         chatInputHooks = (input["chatInputHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         chatViewHooks = (input["chatViewHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         chatMessageHooks = (input["chatMessageHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
+        messageTransformHooks = (input["messageTransformHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
+        messageStreamTransforms = (input["messageStreamTransforms"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         chatLifecycleHooks = (input["chatLifecycleHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
         chatMessageMenuItems = (input["chatMessageMenuItems"] as List<*>).map { item -> decodeToolPkgChatMessageMenuItemRuntime(item) } as List<ToolPkgChatMessageMenuItemRuntime>,
         chatRuntimeHooks = (input["chatRuntimeHooks"] as List<*>).map { item -> decodeToolPkgFunctionHookRuntime(item) } as List<ToolPkgFunctionHookRuntime>,
@@ -706,6 +715,7 @@ fun ToolPkgContainerRuntime.toMessagePackValue(): Map<String, Any?> = mapOf(
     "publicApi" to this.publicApi?.let { it },
     "publicApis" to this.publicApis.map { item -> item.toMessagePackValue() },
     "requires" to this.requires.map { item -> item.toMessagePackValue() },
+    "optional_requires" to this.optionalRequires.map { item -> item.toMessagePackValue() },
     "dependencyIssues" to this.dependencyIssues.map { item -> item.toMessagePackValue() },
     "manifestExtensions" to this.manifestExtensions.entries.associate { entry -> entry.key to entry.value },
     "author" to this.author.map { item -> item },
@@ -731,6 +741,8 @@ fun ToolPkgContainerRuntime.toMessagePackValue(): Map<String, Any?> = mapOf(
     "chatInputHooks" to this.chatInputHooks.map { item -> item.toMessagePackValue() },
     "chatViewHooks" to this.chatViewHooks.map { item -> item.toMessagePackValue() },
     "chatMessageHooks" to this.chatMessageHooks.map { item -> item.toMessagePackValue() },
+    "messageTransformHooks" to this.messageTransformHooks.map { item -> item.toMessagePackValue() },
+    "messageStreamTransforms" to this.messageStreamTransforms.map { item -> item.toMessagePackValue() },
     "chatLifecycleHooks" to this.chatLifecycleHooks.map { item -> item.toMessagePackValue() },
     "chatMessageMenuItems" to this.chatMessageMenuItems.map { item -> item.toMessagePackValue() },
     "chatRuntimeHooks" to this.chatRuntimeHooks.map { item -> item.toMessagePackValue() },

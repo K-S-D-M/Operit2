@@ -2,6 +2,85 @@ use super::*;
 use std::io::Cursor;
 use crate::data::backup::Operit1RoomSchemaMigration::tests::TestSqliteConnection;
 
+/// Retires Android grants while preserving archive-backed documents and propagating invalid archive paths.
+#[test]
+fn memory_attachments_do_not_import_source_app_document_grants() {
+    let plan = SnapshotFileImportPlan::new();
+    assert_eq!(plan.rewriteMemoryAttachmentPath(None).unwrap(), None);
+    assert_eq!(plan.rewriteMemoryAttachmentPath(Some("content://com.android.providers.media.documents/document/document%3A122474")).unwrap(), None);
+    let document = "/data/user/0/com.ai.assistance.operit/files/documents/source.txt";
+    assert_eq!(plan.rewriteMemoryAttachmentPath(Some(document)).unwrap(), Some(plan.rewritePath(document).unwrap()));
+    assert!(plan.rewriteMemoryAttachmentPath(Some("/data/user/0/com.ai.assistance.operit/files/../outside.txt")).is_err());
+}
+
+/// Configures real isolated hosts and the executing CoreNode identity for import acceptance checks.
+fn snapshotImportManager(root: &std::path::Path) -> (Operit1SnapshotImportManager, Arc<operit_host_native_storage::NativeRuntimeStorageHost>) {
+    use operit_host_native_storage::NativeRuntimeStorageHost;
+    operit_host_api::HostManager::setDefaultHostRuntimeTaskSchedulerHost(Arc::new(
+        operit_host_native_scheduler::NativeHostRuntimeTaskSchedulerHost::new(),
+    ));
+    let paths = RuntimeStorePaths::default();
+    let host = Arc::new(NativeRuntimeStorageHost::new(root.join("runtime"), root.join("workspaces")));
+
+    operit_store::RuntimeStorageHost::setDefaultRuntimeStorageHost(host.clone());
+    operit_store::RuntimeStorageHost::setDefaultRuntimeSqliteHost(host.clone());
+    operit_store::RuntimeStorageHost::setDefaultHostSecretStore(Arc::new(
+        operit_host_native_storage::NativeFileSecretStore(root.join("secrets")),
+    ));
+    operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(host.clone()).initialize().unwrap();
+    (Operit1SnapshotImportManager::new(paths, host.clone(), host.clone(), host.clone()), host)
+}
+
+/// Runs a supplied snapshot through the full importer and retains isolated output for plugin diagnostics.
+#[test]
+#[ignore]
+fn diagnose_external_operit1_snapshot() {
+    let source = std::env::var("OPERIT1_IMPORT_SNAPSHOT").unwrap();
+    let root = std::env::temp_dir().join(format!("operit1-diagnostic-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let databasePath = root.join("fixture.db");
+    std::fs::write(&databasePath, []).unwrap();
+    let fixture = Arc::new(SnapshotFixture { bytes: std::fs::read(source).unwrap(), databasePath });
+    let (manager, host) = snapshotImportManager(&root);
+    let expected = ParsedOperit1Snapshot::fromSource(fixture.clone()).unwrap();
+    let themes = crate::data::preferences::ThemeConfigManager::ThemeConfigManager::new(host.clone());
+    let initial = serde_json::from_str(include_str!("../../preferences/theme_snapshot_fixture.json")).unwrap();
+    let saved = themes.create("Existing target theme".to_string(), initial).unwrap();
+    themes.apply(saved.id).unwrap();
+    let preview = manager.inspectSnapshotSource(fixture.clone()).expect("snapshot inspection");
+    let imported = manager.importSnapshotSource(fixture).expect("full snapshot import");
+    assert_eq!(preview.modelConfig.chatModelId.as_deref(), Some(imported.modelConfig.modelId.as_str()));
+    themes.watch().first().expect("imported appearance and saved theme selection must be consistent");
+    let providers = ModelConfigManager::default().getProviderProfiles().unwrap();
+    for config in &expected.configs {
+        let provider = providers.iter().find(|provider| provider.id == operit1ProviderId(&config.id)).expect("every source API configuration must be imported");
+        assert!(provider.apiKey == config.apiKey, "Imported API key differs from source");
+        assert_eq!(provider.name, config.name);
+        assert_eq!(provider.apiKeyPool.len(), config.apiKeyPool.len());
+    }
+    assert_eq!(imported.importedChats, preview.chatCount);
+    assert_eq!(imported.importedMessages, preview.messageCount);
+    let writer = crate::data::backup::CharacterPluginMigration::CharacterPluginWriter::open(host.clone(), host.clone()).unwrap();
+    assert_eq!(writer.get("meta", "state").unwrap().unwrap()["value"]["active"], buildOperit1ActivePrompt(&expected).unwrap());
+    assert!(writer.get("meta", "state").unwrap().unwrap()["value"].get("legacyImportPending").is_none(), "Fresh imports must be ready without a second plugin migration");
+    for owner in writer.list("owners").unwrap() {
+        assert_eq!(owner["key"], owner["value"]["ownerKey"], "memory owner identity mismatch");
+    }
+    for memory in writer.list("memories").unwrap() {
+        assert_eq!(memory["value"]["record"]["chunkIndexFilePath"], Value::Null);
+        if let Some(path) = memory["value"]["record"]["documentPath"].as_str() {
+            assert!(!path.starts_with("content://"), "Source-app document grant survived import");
+        }
+    }
+    assert!(writer.list("chat_drafts").unwrap().is_empty());
+    let node = operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(host.clone()).identity().unwrap().nodeId;
+    for candidate in writer.list("candidates").unwrap() {
+        assert_eq!(candidate["value"]["record"]["producerNodeId"], node, "Imported memory tasks must belong to the importing CoreNode");
+    }
+    eprintln!("Full import chats={} messages={} memories={} links={} usage={} bindings={} models={} chatModel={}", imported.importedChats, imported.importedMessages, imported.importedMemories, imported.importedMemoryLinks, imported.importedTokenUsageRecords, writer.list("chat_bindings").unwrap().len(), imported.modelConfig.importedModelCount, imported.modelConfig.modelId);
+    eprintln!("Diagnostic storage: {}", root.display());
+}
+
 // These fixtures preserve the source schema; Rust tests exercise actual readers and projections when run.
 const ROOM_V10_SQL: &str = r#"
 CREATE TABLE chats (
@@ -138,6 +217,11 @@ fn completeSnapshotFixture(version: i32) -> Arc<SnapshotFixture> {
         ("payload/shared_prefs/cloud_embedding_settings_default.xml", br#"<map><boolean name="enabled" value="true"/><string name="endpoint">https://embedding.invalid</string><string name="api_key">actual-source-key</string><string name="model">source-model</string></map>"#.to_vec()),
         (ENTRY_DATABASE, std::fs::read(&databasePath).expect("real SQLite bytes must be readable")),
         (ENTRY_OBJECTBOX_DEFAULT_DATA, b"opaque source memory database: not decoded or adopted".to_vec()),
+        ("payload/files/objectbox_profile_1784617683731/data.mdb", b"unlisted database must not be opened".to_vec()),
+        ("payload/files/objectbox_profile_1784617717534/data.mdb", b"another unlisted database must not be opened".to_vec()),
+        ("payload/files/.vector_index/doc_index_default_25_1024.hnsw", b"Retired vector index".to_vec()),
+        ("payload/files/doc_index_default_25_1024.hnsw", b"Retired top-level document index".to_vec()),
+        ("payload/files/memory_hnsw_default_1024.idx", b"Retired top-level memory index".to_vec()),
         ("payload/files/memory-space-profiles/default/user.md", b"Legacy user document".to_vec()),
         ("payload/files/workspace/demo/USER.md", b"Workspace-owned USER.md remains a normal file".to_vec()),
         ("payload/files/attachment.txt", b"Preserved attachment".to_vec()),
@@ -150,6 +234,350 @@ fn completeSnapshotFixture(version: i32) -> Arc<SnapshotFixture> {
         writer.write_all(&bytes).unwrap();
     }
     Arc::new(SnapshotFixture { bytes: writer.finish().unwrap().into_inner(), databasePath })
+}
+
+/// Ignores unreferenced databases and adopts an active database whose registry entry was lost.
+#[test]
+fn memory_space_validation_uses_metadata_instead_of_raw_database_directories() {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    validateOperit1MemorySpaces(&parsed).unwrap();
+    let spaces = buildOperit1MemorySpaces(&parsed).unwrap();
+    assert_eq!(spaces.keys().map(String::as_str).collect::<Vec<_>>(), vec!["default"]);
+    let plan = buildSnapshotFileCopyPlan(&parsed).unwrap();
+    assert!(plan.items.iter().all(|item| !isOperit1LegacyMemoryEntry(&item.sourceEntry)));
+
+    parsed.archive.datastorePreferences.get_mut(ENTRY_USER_PREFERENCES).unwrap().insert(
+        KEY_ACTIVE_MEMORY_SPACE_ID.to_string(),
+        Operit1PreferenceValue::String("profile_1784617683731".to_string()),
+    );
+    validateOperit1MemorySpaces(&parsed).unwrap();
+    assert_eq!(buildOperit1MemorySpaces(&parsed).unwrap().len(), 2);
+    parsed.archive.datastorePreferences.get_mut(ENTRY_USER_PREFERENCES).unwrap().insert(
+        KEY_ACTIVE_MEMORY_SPACE_ID.to_string(), Operit1PreferenceValue::String("default".to_string()),
+    );
+    let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    cards.insert("character_card_card-1_memory_profile_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_PROFILE".to_string()));
+    cards.insert("character_card_card-1_memory_profile_id".to_string(), Operit1PreferenceValue::String("missing-profile".to_string()));
+    assert!(validateOperit1MemorySpaces(&parsed).unwrap_err().starts_with("Operit1 引用的记忆库缺少注册信息和数据库：missing-profile"));
+}
+
+/// Preserves three fixed bindings to one surviving database without requiring its deleted user document.
+#[test]
+fn memory_space_import_preserves_fixed_bindings_without_registry_metadata() {
+    let fixture = completeSnapshotFixture(21);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(fixture.clone()).unwrap();
+    let profile = "profile_1784617683731";
+    let preferences = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    preferences.insert("character_card_list".to_string(), Operit1PreferenceValue::StringSet(
+        vec!["card-1".to_string(), "card-2".to_string(), "card-3".to_string()],
+    ));
+    for id in ["card-1", "card-2", "card-3"] {
+        for (field, value) in [("name", id), ("memory_profile_binding_mode", "FIXED_PROFILE"), ("memory_profile_id", profile)] {
+            preferences.insert(format!("character_card_{id}_{field}"), Operit1PreferenceValue::String(value.to_string()));
+        }
+    }
+    validateOperit1MemorySpaces(&parsed).unwrap();
+    let spaces = buildOperit1MemorySpaces(&parsed).unwrap();
+    assert_eq!(spaces.len(), 2, "unreferenced stale databases must remain excluded");
+    let recovered = &spaces[profile];
+    assert_eq!(recovered.id, profile);
+    assert_eq!(recovered.name, profile);
+    assert!(recovered.profileAutoUpdateEnabled);
+    assert!(!recovered.profileAutoUpdateLocked);
+    assert!(readOperit1UserMarkdown(&parsed, recovered).unwrap().is_empty());
+    for card in buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap() {
+        assert_eq!(card.memoryBindingMode, CharacterCardMemoryBindingMode::SHARED.to_string());
+        assert_eq!(card.sharedMemoryId, Some(operit1SharedMemoryStoreId(profile)));
+    }
+    // A surviving filename is not proof that its contents are readable; adoption must still run the LMDB decoder.
+    let root = std::env::temp_dir().join(format!("operit1-orphan-database-{}", Uuid::new_v4()));
+    let (_manager, host) = snapshotImportManager(&root);
+    let entry = operit1ObjectBoxEntryForProfile(profile);
+    writeArchiveEntryToStorage(host.as_ref(), &parsed, &entry, "runtime/orphan.mdb").unwrap();
+    let mut connection = TestSqliteConnection::open(&fixture.databasePath);
+    let bridge = prepareOperit1RoomImport(&mut connection).unwrap();
+    let archive = buildChatArchiveFromOperit1ToOperit2DatabaseBridge(bridge, &mut connection,
+        &SnapshotFileImportPlan::new(), &mut |_| {}).unwrap();
+    assert!(buildOperit1PluginMemoryRecords(host.as_ref(), "runtime/orphan.mdb",
+        parsed.archive.entries[&entry].uncompressedSize, "shared:orphan", &SnapshotFileImportPlan::new(),
+        &archive, "test-node").is_err());
+}
+
+/// Requires registered documents while retaining and validating documents of unregistered live databases.
+#[test]
+fn memory_space_documents_follow_registration_and_source_presence() {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    let entry = operit1UserMarkdownEntry("default");
+    let metadata = parsed.archive.entries.remove(&entry).unwrap();
+    assert!(validateOperit1MemorySpaces(&parsed).unwrap_err().starts_with("快照缺少记忆库用户文档："));
+    parsed.archive.datastorePreferences.get_mut(ENTRY_USER_PREFERENCES).unwrap().insert(
+        KEY_MEMORY_SPACE_LIST.to_string(), Operit1PreferenceValue::String("[]".to_string()),
+    );
+    validateOperit1MemorySpaces(&parsed).unwrap();
+    parsed.archive.entries.insert(entry.clone(), metadata);
+    let spaces = buildOperit1MemorySpaces(&parsed).unwrap();
+    assert_eq!(readOperit1UserMarkdown(&parsed, &spaces["default"]).unwrap(), b"Legacy user document");
+    parsed.archive.entries.get_mut(&entry).unwrap().uncompressedSize = 48_001;
+    assert!(validateOperit1MemorySpaces(&parsed).unwrap_err().starts_with("Operit1 记忆库用户文档超过大小限制："));
+}
+
+/// Preserves Kotlin's implicit default, whitespace handling and group precedence without rewriting IDs.
+#[test]
+fn active_prompt_import_matches_kotlin_selection_semantics() {
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    for (group, card, expected) in [
+        (None, None, serde_json::json!({"CharacterCard":{"id":OPERIT1_SOURCE_DEFAULT_CHARACTER_CARD_ID}})),
+        (Some(" \t"), Some("\n"), serde_json::json!({"CharacterCard":{"id":OPERIT1_SOURCE_DEFAULT_CHARACTER_CARD_ID}})),
+        (Some(""), Some("card-1"), serde_json::json!({"CharacterCard":{"id":"card-1"}})),
+        (Some("group-1"), None, serde_json::json!({"CharacterGroup":{"id":"group-1"}})),
+        (Some("group-1"), Some("card-1"), serde_json::json!({"CharacterGroup":{"id":"group-1"}})),
+        (None, Some("deleted-card"), serde_json::json!({"CharacterCard":{"id":"deleted-card"}})),
+    ] {
+        for (entry, key, value) in [
+            (ENTRY_CHARACTER_GROUPS, "active_character_group_id", group),
+            (ENTRY_CHARACTER_CARDS, "active_character_card_id", card),
+        ] {
+            let preferences = parsed.archive.datastorePreferences.get_mut(entry).unwrap();
+            preferences.remove(key);
+            if let Some(id) = value {
+                preferences.insert(key.to_string(), Operit1PreferenceValue::String(id.to_string()));
+            }
+        }
+        assert_eq!(buildOperit1ActivePrompt(&parsed).unwrap(), expected);
+    }
+    parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap().insert(
+        "active_character_card_id".to_string(), Operit1PreferenceValue::Boolean(true),
+    );
+    assert!(buildOperit1ActivePrompt(&parsed).is_err());
+}
+
+/// Persists all API credentials, empty draft providers, model indices and fixed character provider bindings.
+#[test]
+fn full_model_import_preserves_all_providers_and_function_bindings() {
+    let root = std::env::temp_dir().join(format!("operit1-model-import-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    parsed.configs = serde_json::from_value(serde_json::json!([
+        {"id":"default","name":"Source main","apiEndpoint":"https://main.invalid/v1","apiKey":"main-secret","modelName":"first,second","useMultipleApiKeys":true,"apiKeyPool":[{"id":"key-1","key":"pool-secret"}]},
+        {"id":"vision-provider","name":"Source vision","apiProviderType":"ANTHROPIC_GENERIC","apiEndpoint":"https://vision.invalid/v1","apiKey":"vision-secret","modelName":"vision"},
+        {"id":"empty-provider","name":"Source draft","apiProviderType":"OTHER","apiEndpoint":"https://draft.invalid/v1","apiKey":"draft-secret"}
+    ])).unwrap();
+    let mut mapping = serde_json::Map::new();
+    for function in ["CHAT", "SUMMARY", "TITLE_GENERATION", "MEMORY", "UI_CONTROLLER", "TRANSLATION", "GREP", "ROLE_RESPONSE_PLANNER", "IMAGE_RECOGNITION", "AUDIO_RECOGNITION", "VIDEO_RECOGNITION"] {
+        mapping.insert(function.to_string(), serde_json::json!({"configId":"default","modelIndex":1}));
+    }
+    mapping.insert("IMAGE_RECOGNITION".to_string(), serde_json::json!({"configId":"vision-provider"}));
+    parsed.archive.datastorePreferences.get_mut(ENTRY_FUNCTIONAL_CONFIGS).unwrap().insert(
+        KEY_FUNCTION_CONFIG_MAPPING.to_string(), Operit1PreferenceValue::String(Value::Object(mapping).to_string()),
+    );
+    let result = manager.importAllModelConfigsFromParsed(&parsed).unwrap();
+    assert_eq!(result.importedModelCount, 3);
+    assert_eq!(result.modelId, "second");
+    let providers = ModelConfigManager::default().getProviderProfiles().unwrap();
+    assert_eq!(providers.len(), 3);
+    for config in &parsed.configs {
+        let provider = providers.iter().find(|provider| provider.id == operit1ProviderId(&config.id)).unwrap();
+        assert_eq!(provider.name, config.name);
+        assert!(provider.apiKey == config.apiKey, "Source API credential was not preserved");
+        assert_eq!(provider.apiKeyPool.len(), config.apiKeyPool.len());
+        assert_eq!(provider.models.iter().map(|model| model.id.clone()).collect::<Vec<_>>(), splitModelIds(&config.modelName));
+    }
+    let bindings = FunctionalConfigManager::default().functionModelBindingFlow().unwrap().first().unwrap();
+    assert_eq!(bindings[&FunctionType::CHAT].modelId, "second");
+    assert_eq!(bindings[&FunctionType::IMAGE_RECOGNITION].providerId, "vision-provider");
+    let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+    cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String("vision-provider".to_string()));
+    let card = &buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap()[0];
+    assert_eq!(card.chatProviderId.as_deref(), Some("vision-provider"));
+    assert_eq!(card.chatModelId.as_deref(), Some("vision"));
+}
+
+/// Imports repeated source names and a target collision while retaining exact function and card identities.
+#[test]
+fn full_model_import_renames_duplicate_provider_names_without_changing_bindings() {
+    let root = std::env::temp_dir().join(format!("operit1-duplicate-names-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let configs = ModelConfigManager::default();
+    let retainedId = configs.createProvider(
+        "Same name".to_string(), "OPENAI".to_string(), "https://retained.invalid/v1".to_string(),
+    ).unwrap();
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    parsed.configs = serde_json::from_value(serde_json::json!([
+        {"id":"default","name":"Same name","modelName":"chat-model","apiKey":"chat-secret","apiProviderType":"OPENAI"},
+        {"id":"vision","name":"Same name","modelName":"vision-model","apiKey":"vision-secret","apiProviderType":"OPENAI"}
+    ])).unwrap();
+    parsed.archive.datastorePreferences.get_mut(ENTRY_FUNCTIONAL_CONFIGS).unwrap().insert(
+        KEY_FUNCTION_CONFIG_MAPPING.to_string(), Operit1PreferenceValue::String(serde_json::json!({
+            "CHAT":{}, "IMAGE_RECOGNITION":{"configId":"vision"}
+        }).to_string()),
+    );
+    let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+    cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String("vision".to_string()));
+
+    let result = manager.importAllModelConfigsFromParsed(&parsed).unwrap();
+    assert_eq!(result.providerName, "Same name1");
+    assert_eq!(result.modelId, "chat-model");
+    assert_eq!(result.importedModelCount, 2);
+    assert_eq!(configs.getProviderProfile(&retainedId).unwrap().name, "Same name");
+    for (source, expectedName) in parsed.configs.iter().zip(["Same name1", "Same name2"]) {
+        let provider = configs.getProviderProfile(&operit1ProviderId(&source.id)).unwrap();
+        assert_eq!(provider.name, expectedName);
+        assert_eq!(provider.apiKey, source.apiKey);
+        assert_eq!(provider.models[0].id, source.modelName);
+    }
+    let bindings = FunctionalConfigManager::default().functionModelBindingFlow().unwrap().first().unwrap();
+    assert_eq!(bindings[&FunctionType::CHAT].providerId, ModelConfigDefaults::DEFAULT_PROVIDER_ID);
+    assert_eq!(bindings[&FunctionType::CHAT].modelId, "chat-model");
+    assert_eq!(bindings[&FunctionType::IMAGE_RECOGNITION].providerId, "vision");
+    let card = &buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap()[0];
+    assert_eq!(card.chatProviderId.as_deref(), Some("vision"));
+    assert_eq!(card.chatModelId.as_deref(), Some("vision-model"));
+    assert_eq!(manager.importAllModelConfigsFromParsed(&parsed).unwrap().providerName, "Same name1");
+}
+
+/// Migrates stale source indices with Kotlin's selection semantics across preview, functions and cards.
+#[test]
+fn model_index_migration_matches_kotlin_for_all_binding_paths() {
+    let root = std::env::temp_dir().join(format!("operit1-model-indices-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    parsed.configs = serde_json::from_value(serde_json::json!([
+        {"id":"default","name":"Source main","modelName":" gemini-3.8-flash, ,opus5.5, x-deepseek-v4.1-flash, ","apiProviderType":"OPENAI_GENERIC"},
+        {"id":"controller","name":"Source controller","modelName":"controller-model","apiProviderType":"OPENAI_GENERIC"}
+    ])).unwrap();
+    for (requestedIndex, expectedIndex, expectedModel) in [
+        (3, 0, "gemini-3.8-flash"),
+        (-1, 0, "gemini-3.8-flash"),
+        (i32::MIN, 0, "gemini-3.8-flash"),
+        (i32::MAX, 0, "gemini-3.8-flash"),
+        (0, 0, "gemini-3.8-flash"),
+        (1, 1, "opus5.5"),
+        (2, 2, "x-deepseek-v4.1-flash"),
+    ] {
+        let mapping = serde_json::json!({"modelIndex":requestedIndex});
+        parsed.chatMapping = decodeFunctionMapping(mapping.clone()).unwrap();
+        let mut mappings = serde_json::Map::new();
+        for function in ["CHAT", "SUMMARY", "TITLE_GENERATION", "MEMORY", "TRANSLATION", "GREP", "ROLE_RESPONSE_PLANNER", "IMAGE_RECOGNITION", "AUDIO_RECOGNITION", "VIDEO_RECOGNITION"] {
+            mappings.insert(function.to_string(), mapping.clone());
+        }
+        mappings.insert("UI_CONTROLLER".to_string(), serde_json::json!({"configId":"controller"}));
+        parsed.archive.datastorePreferences.get_mut(ENTRY_FUNCTIONAL_CONFIGS).unwrap().insert(
+            KEY_FUNCTION_CONFIG_MAPPING.to_string(), Operit1PreferenceValue::String(Value::Object(mappings).to_string()),
+        );
+        let preview = parsed.modelConfigPreview().unwrap();
+        assert_eq!(preview.chatModelId.as_deref(), Some(expectedModel));
+        assert_eq!(preview.chatModelIndex, Some(expectedIndex));
+        assert_eq!(preview.configs[0].selectedModelId.as_deref(), Some(expectedModel));
+        assert_eq!(preview.configs[0].selectedModelIndex, Some(expectedIndex));
+        assert_eq!(preview.configs[1].selectedModelId, None);
+        assert_eq!(parsed.chatMapping.modelIndex, requestedIndex, "Inspection must not rewrite source metadata");
+
+        let result = manager.importAllModelConfigsFromParsed(&parsed).unwrap();
+        assert_eq!(result.modelId, expectedModel);
+        assert_eq!(result.importedModelCount, 4);
+        let bindings = FunctionalConfigManager::default().functionModelBindingFlow().unwrap().first().unwrap();
+        assert_eq!(bindings.len(), 11);
+        for (function, binding) in &bindings {
+            if *function == FunctionType::UI_CONTROLLER {
+                assert_eq!(binding.providerId, "controller");
+                assert_eq!(binding.modelId, "controller-model");
+            } else {
+                assert_eq!(binding.providerId, ModelConfigDefaults::DEFAULT_PROVIDER_ID);
+                assert_eq!(binding.modelId, expectedModel);
+            }
+        }
+        let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+        cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+        cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String("default".to_string()));
+        cards.insert("character_card_card-1_chat_model_index".to_string(), Operit1PreferenceValue::Int(requestedIndex));
+        let card = &buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap()[0];
+        assert_eq!(card.chatProviderId.as_deref(), Some(ModelConfigDefaults::DEFAULT_PROVIDER_ID));
+        assert_eq!(card.chatModelId.as_deref(), Some(expectedModel));
+    }
+}
+
+/// Uses source order for broken function and character bindings without filtering model capabilities.
+#[test]
+fn model_binding_import_uses_first_configured_model_for_missing_and_empty_configs() {
+    let root = std::env::temp_dir().join(format!("operit1-model-rebinding-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    parsed.configs = serde_json::from_value(serde_json::json!([
+        {"id":"draft","name":"Empty draft","modelName":" , , "},
+        {"id":"z-first","name":"First configured","modelName":" first-model,second-model "},
+        {"id":"a-later","name":"Later configured","modelName":"later-first,later-second"}
+    ])).unwrap();
+    let missing = "f815b541-8014-48c8-bd4c-0d135f98426a";
+    parsed.chatMapping = decodeFunctionMapping(serde_json::json!({"configId":missing,"modelIndex":1})).unwrap();
+    parsed.archive.datastorePreferences.get_mut(ENTRY_FUNCTIONAL_CONFIGS).unwrap().insert(
+        KEY_FUNCTION_CONFIG_MAPPING.to_string(), Operit1PreferenceValue::String(serde_json::json!({
+            "CHAT":{"configId":missing,"modelIndex":1},
+            "SUMMARY":{"configId":"draft","modelIndex":1},
+            "IMAGE_RECOGNITION":{"configId":missing},
+            "AUDIO_RECOGNITION":{"configId":missing},
+            "VIDEO_RECOGNITION":{"configId":missing},
+            "MEMORY":{"configId":"a-later","modelIndex":1}
+        }).to_string()),
+    );
+    let preview = parsed.modelConfigPreview().unwrap();
+    assert_eq!(preview.chatConfigId.as_deref(), Some("z-first"));
+    assert_eq!(preview.chatModelId.as_deref(), Some("first-model"));
+    assert_eq!(preview.chatModelIndex, Some(0));
+    assert_eq!(preview.configs[1].selectedModelIndex, Some(0));
+    assert_eq!(parsed.selectedChatConfig().unwrap().configId, "z-first");
+    assert_eq!(parsed.chatMapping.configId, missing, "Resolution must not rewrite source metadata");
+    let result = manager.importAllModelConfigsFromParsed(&parsed).unwrap();
+    assert_eq!(result.providerId, "z-first");
+    assert_eq!(result.modelId, "first-model");
+    assert_eq!(result.importedModelCount, 4);
+    let bindings = FunctionalConfigManager::default().functionModelBindingFlow().unwrap().first().unwrap();
+    for function in [FunctionType::CHAT, FunctionType::SUMMARY, FunctionType::IMAGE_RECOGNITION,
+        FunctionType::AUDIO_RECOGNITION, FunctionType::VIDEO_RECOGNITION, FunctionType::MEMORY] {
+        let binding = &bindings[&function];
+        if function == FunctionType::MEMORY {
+            assert_eq!(binding.providerId, "a-later");
+            assert_eq!(binding.modelId, "later-second");
+        } else {
+            assert_eq!(binding.providerId, "z-first");
+            assert_eq!(binding.modelId, "first-model");
+        }
+    }
+    let providers = ModelConfigManager::default().getProviderProfiles().unwrap();
+    for id in ["draft", "z-first", "a-later"] {
+        assert!(providers.iter().any(|provider| provider.id == id));
+    }
+    for configId in [Some(missing), Some("draft"), None] {
+        let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+        cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+        cards.insert("character_card_card-1_chat_model_index".to_string(), Operit1PreferenceValue::Int(1));
+        cards.remove("character_card_card-1_chat_model_config_id");
+        if let Some(id) = configId {
+            cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String(id.to_string()));
+        }
+        let card = &buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap()[0];
+        assert_eq!(card.chatProviderId.as_deref(), Some("z-first"));
+        assert_eq!(card.chatModelId.as_deref(), Some("first-model"));
+    }
+}
+
+/// Rejects snapshots that have no actual model to bind, including empty draft-only configurations.
+#[test]
+fn model_binding_import_rejects_snapshots_without_any_models() {
+    let root = std::env::temp_dir().join(format!("operit1-invalid-model-binding-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(21)).unwrap();
+    let cards = parsed.archive.datastorePreferences.get_mut(ENTRY_CHARACTER_CARDS).unwrap();
+    cards.insert("character_card_card-1_chat_model_binding_mode".to_string(), Operit1PreferenceValue::String("FIXED_CONFIG".to_string()));
+    cards.insert("character_card_card-1_chat_model_config_id".to_string(), Operit1PreferenceValue::String("test-model".to_string()));
+    parsed.configs[0].modelName = " , , ".to_string();
+    assert!(manager.importAllModelConfigsFromParsed(&parsed).unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
+    assert!(buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
+    parsed.configs.clear();
+    assert!(parsed.modelConfigPreview().unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
+    assert!(manager.importAllModelConfigsFromParsed(&parsed).unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
+    assert!(buildOperit2CharacterCards(&parsed, &SnapshotFileImportPlan::new()).unwrap_err().starts_with("Operit1 快照中没有配置任何模型"));
 }
 
 /// Executes the production source bridge and target projection using the same database bytes retained in the ZIP.
@@ -338,8 +766,8 @@ fn invalid_legacy_workspace_paths_remain_import_errors() {
     }
 }
 
-/// Builds a legacy speech projection with saved credentials and an unrelated generic HTTP preset.
-fn legacyTtsConfig(serviceType: &str, endpoint: &str, voice: &str) -> Result<TtsConfig, String> {
+/// Builds a source snapshot with saved speech fields, including Kotlin's empty HTTP URL state.
+fn legacyTtsSnapshot(serviceType: &str, endpoint: &str, voice: &str) -> ParsedOperit1Snapshot {
     let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(20)).unwrap();
     let httpConfig = serde_json::json!({
         "urlTemplate": endpoint,
@@ -369,7 +797,13 @@ fn legacyTtsConfig(serviceType: &str, endpoint: &str, voice: &str) -> Result<Tts
         "tts_speech_rate".to_string(),
         Operit1PreferenceValue::Float(1.25),
     );
-    buildOperit2TtsConfig(&parsed).map(|config| config.unwrap())
+    parsed
+}
+
+/// Projects a configured legacy speech service into its target provider contract.
+fn legacyTtsConfig(serviceType: &str, endpoint: &str, voice: &str) -> Result<TtsConfig, String> {
+    buildOperit2TtsConfig(&legacyTtsSnapshot(serviceType, endpoint, voice))
+        .map(|config| config.unwrap())
 }
 
 /// Accepts empty legacy URLs for built-in services and restores the complete provider HTTP contract.
@@ -450,7 +884,7 @@ fn tts_import_maps_model_qualified_voice_identifiers() {
     }
 }
 
-/// Preserves actual generic HTTP settings and keeps missing custom endpoints as validation errors.
+/// Preserves actual generic HTTP settings for configured source providers.
 #[test]
 fn custom_http_tts_import_preserves_request_and_validation() {
     let config = legacyTtsConfig(
@@ -469,10 +903,56 @@ fn custom_http_tts_import_preserves_request_and_validation() {
         .headers
         .iter()
         .any(|header| header.name == "authorization" && header.value == "stale-http-auth"));
-    assert_eq!(
-        legacyTtsConfig("HTTP_TTS", "", "saved-voice").unwrap_err(),
-        "导入 Operit1 TTS 配置失败：tts config endpoint is empty"
+}
+
+/// Treats absent and blank Kotlin HTTP presets as unconfigured without changing target profiles.
+#[test]
+fn unconfigured_http_tts_import_preserves_target_speech_configuration() {
+    let root = std::env::temp_dir().join(format!("operit1-empty-tts-{}", Uuid::new_v4()));
+    let (manager, _) = snapshotImportManager(&root);
+    let target = TtsConfigManager::new(RuntimeStorePaths::default());
+    let configured = target
+        .createTtsConfig(
+            legacyTtsConfig("HTTP_TTS", "https://target.invalid/tts?text={text}", "target-voice")
+                .unwrap(),
+        )
+        .unwrap();
+    target.setCurrentTtsConfigId(&configured.id).unwrap();
+    let original = target.getAllTtsConfigs().unwrap();
+
+    for endpoint in [None, Some(""), Some(" \t\n")] {
+        let mut parsed = legacyTtsSnapshot("HTTP_TTS", endpoint.unwrap_or(""), "saved-voice");
+        if endpoint.is_none() {
+            parsed.archive.datastorePreferences
+                .get_mut(ENTRY_SPEECH_SERVICES)
+                .unwrap()
+                .remove("tts_http_config");
+        }
+        assert!(buildOperit2TtsConfig(&parsed).unwrap().is_none());
+        manager.importSpeechPreferences(&parsed)
+            .expect("unconfigured TTS must not interrupt snapshot migration");
+        assert_eq!(target.getAllTtsConfigs().unwrap(), original);
+        assert_eq!(target.getCurrentTtsConfigId().unwrap(), configured.id);
+    }
+}
+
+/// Keeps malformed source data and nonempty invalid endpoints visible as migration errors.
+#[test]
+fn custom_http_tts_import_rejects_malformed_configuration() {
+    assert!(legacyTtsConfig("HTTP_TTS", "not-a-url", "saved-voice").is_err());
+    let mut parsed = legacyTtsSnapshot("HTTP_TTS", "", "saved-voice");
+    let preferences = parsed.archive.datastorePreferences
+        .get_mut(ENTRY_SPEECH_SERVICES).unwrap();
+    preferences.insert(
+        "tts_http_config".to_string(),
+        Operit1PreferenceValue::String("{".to_string()),
     );
+    assert!(buildOperit2TtsConfig(&parsed).unwrap_err()
+        .starts_with("Operit1 TTS HTTP 配置格式不正确："));
+    parsed.archive.datastorePreferences
+        .get_mut(ENTRY_SPEECH_SERVICES).unwrap()
+        .insert("tts_http_config".to_string(), Operit1PreferenceValue::Boolean(false));
+    assert!(buildOperit2TtsConfig(&parsed).is_err());
 }
 
 /// Rejects unsupported source service identities without treating them as generic HTTP providers.
@@ -500,7 +980,7 @@ fn complete_snapshot_keeps_legacy_source_entries_and_preview_domains() {
     assert_eq!((preview.importedFileCount, preview.importedExternalFileCount), (2, 1));
 }
 
-/// Applies the actual resource plan and ZIP streaming copy, retaining workspace USER.md while excluding legacy memory storage.
+/// Streams documents and attachments while excluding legacy memory storage and HNSW indexes.
 #[test]
 fn resource_copy_plan_keeps_normal_files_and_does_not_copy_legacy_domain_storage() {
     let fixture = completeSnapshotFixture(20);
@@ -531,7 +1011,7 @@ fn mixed_preferences_skip_domain_adoption_without_rejecting_or_guessing_source_k
     for key in ["language", "model_name", "tts_http_config", "workspace_state_demo", "memory_usage_display", "custom_character_count", "new_unknown_source_key"] {
         assert!(!isOperit1UnadoptedPreferenceKey(key), "{key}");
     }
-    let paths = RuntimeStorePaths::new(PathBuf::from("test-runtime"), PathBuf::from("test-workspaces"));
+    let paths = RuntimeStorePaths::default();
     let mappings = datastorePreferenceMappings(&paths);
     for entry in [ENTRY_CHARACTER_CARDS, ENTRY_CHARACTER_GROUPS, ENTRY_PROMPT_TAGS, "payload/files/datastore/persona_card_chat_history.preferences_pb"] {
         assert!(!mappings.contains_key(entry));
@@ -665,13 +1145,17 @@ fn user_preference_import_completes_theme_migrations_after_native_values() {
     let root = std::env::temp_dir().join(format!("operit1-theme-import-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     {
-        let paths = RuntimeStorePaths::new(root.join("runtime"), root.join("workspaces"));
+        let paths = RuntimeStorePaths::default();
         let host = Arc::new(NativeRuntimeStorageHost::new(
             root.join("runtime"), root.join("workspaces"),
         ));
         let manager = Operit1SnapshotImportManager::new(
             paths, host.clone(), host.clone(), host.clone(),
         );
+        let themes = crate::data::preferences::ThemeConfigManager::ThemeConfigManager::new(host.clone());
+        let initial = serde_json::from_str(include_str!("../../preferences/theme_snapshot_fixture.json")).unwrap();
+        let saved = themes.create("Existing theme".to_string(), initial).unwrap();
+        themes.apply(saved.id.clone()).unwrap();
         let mut parsed = ParsedOperit1Snapshot::fromSource(completeSnapshotFixture(20)).unwrap();
         parsed.archive.datastorePreferences.clear();
         parsed.archive.datastorePreferences.insert(
@@ -683,9 +1167,12 @@ fn user_preference_import_completes_theme_migrations_after_native_values() {
                 ("theme_mode".to_string(), Operit1PreferenceValue::String("dark".to_string())),
                 ("background_image_opacity".to_string(), Operit1PreferenceValue::Float(0.5)),
                 ("app_language".to_string(), Operit1PreferenceValue::String("zh-CN".to_string())),
+                ("use_custom_colors".to_string(), Operit1PreferenceValue::Boolean(true)),
             ]),
         );
-        assert_eq!(manager.importDataStorePreferences(&parsed, &SnapshotFileImportPlan::new()).unwrap(), (1, 6));
+        assert_eq!(manager.importDataStorePreferences(&parsed, &SnapshotFileImportPlan::new()).unwrap(), (1, 7));
+        assert_eq!(themes.watch().first().unwrap().activeThemeConfigId, None);
+        assert_eq!(themes.get(saved.id.clone()).unwrap(), saved);
         let preferences = UserPreferencesManager::store(host).data().unwrap();
         let initial = serde_json::from_str(include_str!("../../preferences/theme_snapshot_fixture.json")).unwrap();
         let snapshot = readThemePreferenceSnapshot(&preferences, &initial).unwrap();
@@ -693,6 +1180,7 @@ fn user_preference_import_completes_theme_migrations_after_native_values() {
         assert_eq!(snapshot["customSecondaryColor"], serde_json::json!(u32::MAX));
         assert_eq!(snapshot["themeMode"], "dark");
         assert_eq!(snapshot["backgroundImageOpacity"], serde_json::json!(0.5));
+        assert_eq!(snapshot["useCustomColors"], true);
         assert_eq!(preferences.getTyped::<String>(&stringPreferencesKey("app_language")).unwrap().as_deref(), Some("zh-CN"));
     }
     assert_eq!(root.parent().unwrap(), std::env::temp_dir());
@@ -813,11 +1301,11 @@ fn operit1_github_user_info_rejects_invalid_source_types() {
 /// Uses exact source memory directories rather than deleting normal workspace and externally supplied USER.md files.
 #[test]
 fn memory_copy_exclusion_is_scoped_to_declared_legacy_storage_directories() {
-    for entry in [ENTRY_OBJECTBOX_DEFAULT_DATA, "payload/files/objectbox_profile/data.mdb", "payload/files/memory-space-profiles/default/user.md"] {
+    for entry in [ENTRY_OBJECTBOX_DEFAULT_DATA, "payload/files/objectbox_profile/data.mdb", "payload/files/memory-space-profiles/default/user.md", "payload/files/.vector_index/doc_index_default_25_1024.hnsw", "payload/files/.vector_index/nested/index.hnsw", "payload/files/doc_index_default_25_1024.hnsw", "payload/files/memory_hnsw_default_1024.idx"] {
         assert!(isOperit1LegacyMemoryEntry(entry));
         assert!(!entryMatchesCopyPrefix(entry, ENTRY_FILES_PREFIX));
     }
-    for entry in ["payload/files/workspace/demo/USER.md", "payload/external_files/USER.md", "payload/files/objectbox_notes.txt", "payload/files/normal/memory-notes.md"] {
+    for entry in ["payload/files/workspace/demo/USER.md", "payload/external_files/USER.md", "payload/files/objectbox_notes.txt", "payload/files/normal/memory-notes.md", "payload/files/workspace/demo/.vector_index/user.hnsw", "payload/files/.vector_index_notes.txt", "payload/files/doc_index_notes.txt", "payload/files/normal/doc_index_default_25_1024.hnsw"] {
         assert!(!isOperit1LegacyMemoryEntry(entry));
     }
 }
@@ -893,7 +1381,7 @@ fn objectbox_table_preserves_long_ids_and_explicit_scalar_defaults() {
     assert!(broken.scalarI32(0, "chunkIndex").is_err());
 }
 
-/// Imports historical chats without a deleted role and emits draft references only for resolved bindings.
+/// Resolves archive bindings and publishes them through the import's own completion path.
 #[test]
 fn archive_binding_migration_cleans_unresolved_references_without_replacing_them() {
     use crate::data::backup::CharacterPluginMigration::{
@@ -953,18 +1441,38 @@ fn archive_binding_migration_cleans_unresolved_references_without_replacing_them
             assert_eq!(archive, expected);
             let writer = CharacterPluginWriter::open(host.clone(), host.clone()).unwrap();
             let drafts = writer.list("chat_drafts").unwrap();
-            match expected_binding {
+            match &expected_binding {
                 Some(binding) => {
                     assert_eq!(drafts.len(), 1);
-                    assert_eq!(drafts[0]["value"], binding);
+                    assert_eq!(&drafts[0]["value"], binding);
                 }
                 None => assert!(drafts.is_empty()),
             }
             assert!(writer.list("chat_bindings").unwrap().is_empty());
+            publishOperit1ArchiveBindings(&[archive.chats[0].id.clone()], host.clone(), host.clone()).unwrap();
+            assert!(writer.list("chat_drafts").unwrap().is_empty());
+            assert_eq!(writer.get("chat_bindings", &archive.chats[0].id).unwrap().map(|entry| entry["value"].clone()), expected_binding);
+            assert!(!host.exists(operit_util::RuntimeStorageLayout::CHARACTER_CARDS_PREFERENCES_PATH).unwrap());
             assert!(writer.list("cards").unwrap().is_empty());
             assert!(writer.list("groups").unwrap().is_empty());
         }
         assert_eq!(root.parent().unwrap(), std::env::temp_dir());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Preserves unrelated extensions while capturing only an unambiguous historical role.
+#[test]
+fn operit1_message_authors_are_adopted_without_scanning_existing_core_history() {
+    let cards = vec![serde_json::json!({"id":"author-1","name":"Historical role","avatarUri":"/operitapp/data/avatar.png"})];
+    let mut extensions = BTreeMap::from([("other.plugin".into(), serde_json::json!({"keep":true}))]);
+    adoptOperit1MessageIdentity(&mut extensions, "Historical role", &cards).unwrap();
+    assert_eq!(extensions["com.operit.character_cards"], serde_json::json!({"participantId":"author-1"}));
+    assert_eq!(extensions["host.chat.identity"], serde_json::json!({"title":"Historical role","avatarUri":"/operitapp/data/avatar.png"}));
+    assert_eq!(extensions["other.plugin"], serde_json::json!({"keep":true}));
+    for (name, available) in [("Deleted role", cards.clone()), ("Historical role", vec![cards[0].clone(), cards[0].clone()])] {
+        let mut extensions = BTreeMap::new();
+        adoptOperit1MessageIdentity(&mut extensions, name, &available).unwrap();
+        assert!(extensions.is_empty());
     }
 }

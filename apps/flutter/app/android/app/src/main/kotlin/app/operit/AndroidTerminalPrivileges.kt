@@ -4,11 +4,16 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection
 import android.os.Binder
+import android.os.DeadObjectException
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.Parcel
 import android.os.ParcelFileDescriptor
+import android.util.Log
+import app.operit.core.tools.system.AndroidCommandDeadline
+import app.operit.core.tools.system.AndroidCommandProcessRunner
+import app.operit.core.tools.system.AndroidPrivilegedCommandResult
 import app.operit.core.tools.system.AndroidRootShell
 import org.json.JSONArray
 import org.json.JSONObject
@@ -19,7 +24,17 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Bridges only Android authorization and Binder mechanics; Rust chooses the transport. */
-class AndroidTerminalPrivileges(private val context: Context) {
+class AndroidTerminalPrivileges private constructor(private val context: Context) {
+    companion object {
+        @Volatile private var shared: AndroidTerminalPrivileges? = null
+
+        /** One client per process: the privileged service accepts a single owner token. */
+        fun shared(context: Context): AndroidTerminalPrivileges =
+            shared ?: synchronized(this) {
+                shared ?: AndroidTerminalPrivileges(context.applicationContext).also { shared = it }
+            }
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val owner = Binder()
     private data class RemoteSession(val binder: IBinder, val pid: Int)
@@ -70,14 +85,21 @@ class AndroidTerminalPrivileges(private val context: Context) {
         try {
             return ready.get(10, TimeUnit.SECONDS)
         } catch (error: Exception) {
-            mainHandler.post { Shizuku.unbindUserService(args, connection, false) }
+            mainHandler.post {
+                try {
+                    Shizuku.unbindUserService(args, connection, false)
+                } catch (cleanupError: Exception) {
+                    Log.w("OperitTerminal", "Failed to unbind terminal service after binding failed", cleanupError)
+                }
+            }
             throw error
         }
     }
 
     /** Transfers ordinary pipes while keeping the PTY and child owned by Shizuku. */
     private fun remoteOperation(request: JSONObject): JSONObject {
-        val starting = request.getString("operation") == "start"
+        val operation = request.getString("operation")
+        val starting = operation == "start" || operation == "exec"
         if (starting) check(AndroidPrivilegeAuthorization.isShizukuAuthorized()) { "Shizuku authorization is not granted" }
         val handle = if (starting) nextSession.getAndIncrement() else request.getInt("pid")
         check(handle > 0) { "Shizuku terminal handle exhausted" }
@@ -95,20 +117,78 @@ class AndroidTerminalPrivileges(private val context: Context) {
             reply.readException()
             val response = JSONObject(checkNotNull(reply.readString()))
             if (starting && !response.has("error")) {
-                checkNotNull(reply.readTypedObject(ParcelFileDescriptor.CREATOR)).use { reader ->
-                    checkNotNull(reply.readTypedObject(ParcelFileDescriptor.CREATOR)).use { writer ->
+                checkNotNull(reply.readTypedObject(ParcelFileDescriptor.CREATOR)).use { first ->
+                    checkNotNull(reply.readTypedObject(ParcelFileDescriptor.CREATOR)).use { second ->
                         sessions[handle] = RemoteSession(binder, response.getInt("pid"))
                         response.put("pid", handle)
-                        response.put("readFd", reader.detachFd())
-                        response.put("writeFd", writer.detachFd())
+                        if (operation == "exec") {
+                            response.put("stdoutFd", first.detachFd())
+                            response.put("stderrFd", second.detachFd())
+                        } else {
+                            response.put("readFd", first.detachFd())
+                            response.put("writeFd", second.detachFd())
+                        }
                     }
                 }
             }
             return response
+        } catch (error: DeadObjectException) {
+            if (service === binder) service = null
+            // The owning process is gone. Never send this session's PID to a replacement service.
+            return when (operation) {
+                "poll" -> JSONObject().put("exitCode", -1)
+                "close" -> JSONObject()
+                else -> throw error
+            }
         } finally {
-            if (request.getString("operation") == "close") sessions.remove(handle)
+            if (operation == "close") sessions.remove(handle)
             reply.recycle()
             data.recycle()
         }
+    }
+
+    /** Runs one noninteractive command through the same identity-enforcing service as terminals. */
+    fun executePiped(command: String, timeoutMillis: Long): AndroidPrivilegedCommandResult {
+        val deadline = AndroidCommandDeadline(timeoutMillis)
+        val request = JSONObject()
+            .put("operation", "exec")
+            .put("argv", JSONArray(listOf("/system/bin/sh", "-c", command)))
+            .put("env", JSONArray(listOf(
+                "PATH=/system/bin:/system/xbin",
+                "HOME=/sdcard",
+                "TMPDIR=/data/local/tmp",
+            )))
+            .put("cwd", "/")
+        val response = remoteOperation(request)
+        if (response.has("error")) throw IllegalStateException(response.getString("error"))
+        val handle = response.getInt("pid")
+        val stdout = ParcelFileDescriptor.adoptFd(response.getInt("stdoutFd"))
+        val stderr = ParcelFileDescriptor.adoptFd(response.getInt("stderrFd"))
+        try {
+            return AndroidCommandProcessRunner.collect(
+                stdout = ParcelFileDescriptor.AutoCloseInputStream(stdout),
+                stderr = ParcelFileDescriptor.AutoCloseInputStream(stderr),
+                awaitExit = { awaitExit(handle, deadline) },
+                destroy = { closeRemote(handle) },
+                timeoutMillis = deadline.remainingMillis(),
+            )
+        } finally {
+            closeRemote(handle)
+        }
+    }
+
+    /** Polls the privileged service until the child exits or the shared budget expires. */
+    private fun awaitExit(handle: Int, deadline: AndroidCommandDeadline): Int {
+        while (true) {
+            val response = remoteOperation(JSONObject().put("operation", "poll").put("pid", handle))
+            if (response.has("error")) throw IllegalStateException(response.getString("error"))
+            if (!response.isNull("exitCode")) return response.getInt("exitCode")
+            deadline.remainingMillis()
+            Thread.sleep(20)
+        }
+    }
+
+    private fun closeRemote(handle: Int) {
+        runCatching { remoteOperation(JSONObject().put("operation", "close").put("pid", handle)) }
     }
 }

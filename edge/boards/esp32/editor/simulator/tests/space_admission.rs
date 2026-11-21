@@ -252,6 +252,7 @@ fn node_from_storage(
     if configureListener {
         PeerStateStore::new(storage.clone())
             .saveHostConfig(&PeerHostConfig {
+                discovery: None,
                 bindAddress: "127.0.0.1:0".into(),
                 transports: vec![PeerTransport::Tcp],
                 discoveryEnabled: false,
@@ -901,6 +902,10 @@ mod core_edge {
     }
     #[async_trait(?Send)]
     impl PeerRouter for RecordingEdgeRouter {
+        /// Preserves the wrapped Edge's node-local connection-policy owner.
+        fn nodeLocalControlProjection(&self) -> bool {
+            self.inner.nodeLocalControlProjection()
+        }
         fn localNodeId(&self) -> String {
             self.inner.localNodeId()
         }
@@ -989,6 +994,7 @@ mod core_edge {
         {
             PeerStateStore::new(storage.clone())
                 .saveHostConfig(&PeerHostConfig {
+                    discovery: None,
                     bindAddress: "127.0.0.1:0".into(),
 
                     transports: vec![PeerTransport::Tcp],

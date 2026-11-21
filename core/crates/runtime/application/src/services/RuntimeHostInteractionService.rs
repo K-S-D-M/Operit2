@@ -816,6 +816,23 @@ impl Default for ChatToolPermissionBroker {
 
 static CHAT_TOOL_PERMISSIONS: OnceLock<ChatToolPermissionBroker> = OnceLock::new();
 
+/// Retires a pending approval when its awaiting tool future completes or is cancelled.
+struct ChatToolPermissionRequestGuard<'a> {
+    broker: &'a ChatToolPermissionBroker,
+    requestId: String,
+}
+
+impl Drop for ChatToolPermissionRequestGuard<'_> {
+    /// Removes both request and decision so cancellation cannot leave an actionable stale prompt.
+    fn drop(&mut self) {
+        let mut state = self.broker.state.lock().expect("tool permission mutex poisoned");
+        let removed = state.pending.remove(&self.requestId).is_some();
+        state.decisions.remove(&self.requestId);
+        if removed { self.broker.refreshRequests(&state); }
+        self.broker.changed.notify_waiters();
+    }
+}
+
 /// Returns the process-wide chat tool permission broker.
 fn chatToolPermissionBroker() -> &'static ChatToolPermissionBroker {
     CHAT_TOOL_PERMISSIONS.get_or_init(ChatToolPermissionBroker::default)
@@ -836,7 +853,10 @@ impl ChatToolPermissionBroker {
                 .then_with(|| left.requestId.cmp(&right.requestId))
         });
         crate::services::WorkActivityService::permissionsChanged(requests.clone());
-        self.requests.set_value(requests);
+        if self.requests.value() != requests {
+            self.requests.set_value(requests);
+            crate::plugins::toolpkg::ToolPkgToolPermissionBridge::ToolPkgToolPermissionBridge::notify();
+        }
     }
 
     /// Adds one chat-bound request and awaits its decision or deadline.
@@ -852,6 +872,7 @@ impl ChatToolPermissionBroker {
         let requestId = Uuid::new_v4().to_string();
         let requestedAtMillis = i64::try_from(tryCurrentTimeMillisU128()?)
             .map_err(|_| "tool permission timestamp exceeds i64 milliseconds")?;
+        let _guard = ChatToolPermissionRequestGuard { broker: self, requestId: requestId.clone() };
         {
             let mut state = self
                 .state
@@ -893,6 +914,8 @@ impl ChatToolPermissionBroker {
 
         loop {
             let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             {
                 let mut state = self
                     .state
@@ -905,7 +928,7 @@ impl ChatToolPermissionBroker {
                 }
             }
             tokio::select! {
-                _ = changed => {}
+                _ = &mut changed => {}
                 timeout = &mut timeoutReceiver => {
                     timeout.map_err(|_| "tool permission timeout task was cancelled".to_string())?;
                     let mut state = self
@@ -927,6 +950,9 @@ impl ChatToolPermissionBroker {
 
     /// Applies a decision only when the request belongs to the addressed chat.
     fn respond(&self, chatId: &str, requestId: &str, result: String) -> Result<(), String> {
+        if !matches!(result.as_str(), "allow" | "deny" | "allow_session") {
+            return Err(format!("invalid tool permission decision: {result}"));
+        }
         let mut state = self
             .state
             .lock()
@@ -940,6 +966,9 @@ impl ChatToolPermissionBroker {
             return Err(format!(
                 "chat does not own tool permission request: {requestId}"
             ));
+        }
+        if state.decisions.contains_key(requestId) {
+            return Err(format!("tool permission request already resolved: {requestId}"));
         }
         state.decisions.insert(requestId.to_string(), result);
         self.refreshRequests(&state);
@@ -1074,20 +1103,50 @@ mod runtimeImageBufferTests {
 impl RuntimeImageStream {
     /// Resolves image delivery through the host and bounds byte-stream downloads.
     async fn load(&self) -> Result<RuntimeImageData, String> {
+        if let Some(data) = self.url.strip_prefix("data:") {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let (metadata, payload) = data.split_once(',').ok_or("Invalid image data URI")?;
+            if !metadata.split(';').any(|part| part == "base64") {
+                return Err("Image data URI must use base64 encoding".to_string());
+            }
+            if payload.len() > (16 * 1024 * 1024 + 2) / 3 * 4 {
+                return Err("Image exceeded 16 MiB size limit".to_string());
+            }
+            let bytes = STANDARD.decode(payload).map_err(|error| error.to_string())?;
+            let mimeType = metadata.split(';').next().ok_or("Image data URI must declare its MIME type")?;
+            if !mimeType.starts_with("image/") {
+                return Err("Image data URI must declare an image MIME type".to_string());
+            }
+            let bytes = match mimeType {
+                "image/heic" | "image/heif" | "image/heic-sequence" | "image/heif-sequence" => {
+                    crate::services::media::images::heif_display_bytes(&bytes)?
+                }
+                _ => bytes,
+            };
+            return Ok(RuntimeImageData {
+                bytes,
+                displayUrl: None,
+                error: None,
+            });
+        }
         let url = url::Url::parse(&self.url).map_err(|error| error.to_string())?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err("Image URL must use HTTP or HTTPS".to_string());
         }
         let host = self.host.clone().ok_or("HTTP host is not registered")?;
+        let requiresDecode = matches!(
+            url.path().rsplit('.').next().map(str::to_ascii_lowercase).as_deref(),
+            Some("heic" | "heif")
+        );
         match host.imageDelivery() {
-            operit_host_api::HttpImageDelivery::DisplayUrl => {
+            operit_host_api::HttpImageDelivery::DisplayUrl if !requiresDecode => {
                 return Ok(RuntimeImageData {
                     bytes: Vec::new(),
                     displayUrl: Some(url.to_string()),
                     error: None,
                 });
             }
-            operit_host_api::HttpImageDelivery::Bytes => {}
+            _ => {}
         }
         let request = RuntimeImageRequest {
             id: format!("markdown-image-{}", Uuid::new_v4()),
@@ -1128,6 +1187,11 @@ impl RuntimeImageStream {
             result = receiver => result.map_err(|error| error.to_string())?,
             _ = timeout => Err("Image download timed out after 30 seconds".to_string()),
         }?;
+        let bytes = if requiresDecode {
+            crate::services::media::images::heif_display_bytes(&bytes)?
+        } else {
+            bytes
+        };
         Ok(RuntimeImageData {
             bytes,
             displayUrl: None,
@@ -1469,6 +1533,19 @@ pub fn requestOwnerSystemOperation(
         .ok_or_else(|| "system operation response payload is missing".to_string())
 }
 
+/// Awaits a system operation on the owner event loop, including single-threaded hosts.
+pub async fn requestOwnerSystemOperationAsync(
+    payload: RuntimeHostInteractionSystemOperationPayload,
+    timeout: Duration,
+) -> Result<RuntimeHostInteractionSystemOperationResponse, String> {
+    let response = runtimeHostInteractionBroker().requestAsync(
+        RuntimeHostInteractionTarget::OwnerHost,
+        RuntimeHostInteractionRequest::systemOperation(payload),
+        timeout,
+    ).await?;
+    response.systemOperation.ok_or_else(|| "system operation response payload is missing".to_string())
+}
+
 /// Requests file opening from the owner host.
 pub fn requestOwnerFileOpen(
     payload: RuntimeHostInteractionFileOpenPayload,
@@ -1587,6 +1664,16 @@ pub fn requestOwnerLocalInference(
     response
         .localInference
         .ok_or_else(|| "local inference response payload is missing".to_string())
+}
+
+/// Returns unresolved public requests for plugin approval presenters across chats.
+pub fn pendingToolPermissions() -> Vec<RuntimeHostInteractionToolPermissionRequest> {
+    let mut requests = chatToolPermissionBroker().requests.value();
+    for request in &mut requests {
+        request.tool.parameters.retain(|parameter| !matches!(parameter.name.as_str(),
+            "__operit_package_caller_name" | "__operit_package_chat_id" | "__operit_package_caller_card_id"));
+    }
+    requests
 }
 
 /// Returns the permission requests currently pending for one chat.
@@ -1798,6 +1885,7 @@ impl RuntimeHostInteractionBroker {
         }
     }
 
+    /// Retires a pending operation atomically before making its result available.
     fn respond(
         &self,
         requestId: &str,
@@ -1816,6 +1904,7 @@ impl RuntimeHostInteractionBroker {
             ));
         }
         state.responses.insert(requestId.to_string(), response);
+        state.pending.remove(requestId);
         self.notifyChanged();
         Ok(())
     }
@@ -1864,12 +1953,83 @@ impl RuntimeHostInteractionBroker {
 mod tests {
     use super::*;
 
+    /// Creates an isolated broker snapshot with requests in two different chats.
+    fn permissionBroker() -> ChatToolPermissionBroker {
+        let broker = ChatToolPermissionBroker::default();
+        let mut state = broker.state.lock().unwrap();
+        for (id, chat, time) in [("first", "chat-a", 1), ("second", "chat-b", 2)] {
+            state.pending.insert(id.into(), RuntimeHostInteractionToolPermissionRequest {
+                requestId: id.into(), chatId: chat.into(),
+                tool: RuntimeHostInteractionToolPermissionTool { name: "write_file".into(), parameters: vec![] },
+                description: "Write a file".into(), requestedAtMillis: time,
+            });
+        }
+        broker.refreshRequests(&state);
+        drop(state);
+        broker
+    }
+
+    /// Rejects forged scope, invalid decisions and conflicting answers from another approval surface.
+    #[test]
+    fn permissionDecisionsResolveOnlyOnceWithinTheirChat() {
+        let broker = permissionBroker();
+        assert!(broker.respond("chat-b", "first", "allow".into()).is_err());
+        assert!(broker.respond("chat-a", "first", "always_allow".into()).is_err());
+        assert_eq!(broker.requests.value().len(), 2);
+        broker.respond("chat-a", "first", "allow_session".into()).unwrap();
+        assert!(broker.respond("chat-a", "first", "deny".into()).is_err());
+        assert_eq!(broker.state.lock().unwrap().decisions["first"], "allow_session");
+        let pending = broker.requests.value();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].requestId, "second");
+    }
+
+    /// Removes the cancelled tool's request and an unconsumed decision while retaining other chats.
+    #[test]
+    fn permissionWaiterCleanupPublishesRemainingRequests() {
+        let broker = permissionBroker();
+        drop(ChatToolPermissionRequestGuard { broker: &broker, requestId: "first".into() });
+        assert!(broker.respond("chat-a", "first", "allow".into()).is_err());
+        assert_eq!(broker.requests.value()[0].requestId, "second");
+        broker.respond("chat-b", "second", "deny".into()).unwrap();
+        drop(ChatToolPermissionRequestGuard { broker: &broker, requestId: "second".into() });
+        let state = broker.state.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.decisions.is_empty());
+        assert!(broker.requests.value().is_empty());
+    }
+
+    /// Verifies a real HEIC image becomes a Flutter-readable, nonempty PNG.
+    #[tokio::test]
+    async fn heifImagesDecodeToPng() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let service = RuntimeHostInteractionService::getInstance(&HostManager::new());
+        let source = include_bytes!("../../tests/fixtures/heif-checker-64.heic");
+        let data = service.imageBytes(format!("data:image/heic;base64,{}", STANDARD.encode(source)))
+            .load().await.expect("decode HEIC fixture through image delivery");
+        let png = data.bytes;
+        let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("display bytes must be valid PNG");
+        assert_eq!((image.width(), image.height()), (64, 64));
+        let rgba = image.to_rgba8();
+        assert!(rgba.pixels().any(|pixel| pixel != rgba.get_pixel(0, 0)));
+        let unchanged = service.imageBytes(format!("data:image/png;base64,{}", STANDARD.encode(&png)))
+            .load().await.expect("read ordinary PNG");
+        assert_eq!(unchanged.bytes, png);
+        let mut invalid = source.to_vec();
+        invalid.truncate(32);
+        assert!(crate::services::media::images::heif_display_bytes(&invalid).is_err());
+    }
+
     /// Verifies image and audio/video pool entries are returned by pool id.
     #[test]
     fn mediaPoolDataIsReadByIdWithTypeValidation() {
         let service = RuntimeHostInteractionService::getInstance(&HostManager::new());
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png).unwrap();
         let imageId = ImagePoolManager::add_image_bytes(
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01",
+            png.get_ref(),
             Some("image/png"),
             None,
         );
@@ -1900,9 +2060,50 @@ mod tests {
         MediaPoolManager::remove_media(&audioId);
         MediaPoolManager::remove_media(&videoId);
         MediaPoolManager::remove_media(&invalidAudioId);
+        ImagePoolManager::remove_image(&imageId);
     }
 
 
+
+    /// Verifies reconnects cannot replay an answered operation before its waiter resumes.
+    #[test]
+    fn brokerRetiresRespondedRequestsBeforeReplay() {
+        let broker = RuntimeHostInteractionBroker::default();
+        let request = RuntimeHostInteractionRequest::fileOpen(
+            RuntimeHostInteractionFileOpenPayload {
+                path: "/tmp/file".to_string(),
+            },
+        );
+        let requestId = request.requestId.clone();
+        broker.state.lock().unwrap().pending.insert(
+            requestId.clone(),
+            RuntimeHostInteractionPending {
+                target: RuntimeHostInteractionTarget::OwnerHost,
+                request,
+                sequence: 0,
+                awaitsResponse: true,
+            },
+        );
+        let mut response = RuntimeHostInteractionResponse::empty();
+        response.error = Some("native open failed".to_string());
+
+        broker.respond(&requestId, response).unwrap();
+
+        {
+            let state = broker.state.lock().unwrap();
+            assert!(!state.pending.contains_key(&requestId));
+            assert_eq!(
+                state.responses[&requestId].error.as_deref(),
+                Some("native open failed"),
+            );
+        }
+        assert_eq!(
+            broker
+                .respond(&requestId, RuntimeHostInteractionResponse::empty())
+                .unwrap_err(),
+            format!("host interaction request not found: {requestId}"),
+        );
+    }
 
     /// Verifies that a structured owner error returns without waiting for timeout.
     #[test]

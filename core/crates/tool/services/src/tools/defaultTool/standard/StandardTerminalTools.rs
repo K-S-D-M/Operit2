@@ -7,7 +7,7 @@ use operit_host_api::{
 
 use operit_tools::tools::ToolResultDataClasses::{
     HiddenTerminalCommandResultData, JsOptional, StringResultData, TerminalCommandResultData,
-    TerminalImplementation, TerminalInfoResultData, TerminalSessionCloseResultData,
+    TerminalImplementation, TerminalInfoResultData, TerminalProfileInfoData, TerminalSessionCloseResultData,
     TerminalSessionCreationResultData, TerminalSessionScreenResultData,
     TerminalType, TerminalTypeInfoData, ToolResultData,
 };
@@ -15,7 +15,7 @@ use operit_tools::ConversationMarkupManager::ToolResult;
 use operit_tools::ToolExecutionManager::{
     AITool, ToolExecutionManager, ToolAccessSpec, ToolBoundary, ToolEffect, ToolExecutor, ToolValidationResult,
 };
-use operit_tools::files::PathMapper::PathMapper;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 use operit_host_api::TerminalWorkingDirectory::{directoryChangeCommand, enterTerminalDirectory};
 
 const HIDDEN_TERMINAL_TIMEOUT_MS: u64 = 120000;
@@ -24,7 +24,7 @@ const HIDDEN_TERMINAL_TIMEOUT_MS: u64 = 120000;
 /// Terminal tool facade backed by the host terminal API.
 pub struct StandardTerminalTools {
     pub terminalHost: Option<Arc<dyn TerminalHost>>,
-    pathMapper: Option<PathMapper>,
+    filesystem: Option<VisualFileSystem>,
     storage: Option<Arc<dyn operit_host_api::RuntimeStorageHost>>,
 }
 
@@ -48,35 +48,116 @@ pub struct TerminalToolExecutor {
 
 impl StandardTerminalTools {
     /// Acquires the newest idle generation without submitting directory commands to a busy shell.
-    pub(crate) fn availableSession(&self, name: &str, terminalType: &str, reserved: &std::collections::BTreeSet<String>) -> HostResult<TerminalSessionInfo> {
+    pub(crate) fn availableSession(
+        &self,
+        name: &str,
+        terminalType: &str,
+        reserved: &std::collections::BTreeSet<String>,
+    ) -> HostResult<TerminalSessionInfo> {
+        self.availableSelectedSession(name, Some(terminalType), None, reserved)
+    }
+
+    /// Acquires a session in an exact saved profile or explicitly requested legacy interpreter.
+    pub(crate) fn availableSelectedSession(
+        &self,
+        name: &str,
+        requestedType: Option<&str>,
+        requestedProfile: Option<&str>,
+        reserved: &std::collections::BTreeSet<String>,
+    ) -> HostResult<TerminalSessionInfo> {
         let host = self.host()?;
-        let prefix = format!("{name}_generation_");
-        let sessions = host.listSessions()?;
-        let latest = sessions.iter().filter(|session| session.terminalType == terminalType)
-            .filter_map(|session| {
-                let generation = if session.sessionName == name { 0 }
-                    else { session.sessionName.strip_prefix(&prefix)?.parse::<u64>().ok()? };
-                Some((generation, session.commandRunning || reserved.contains(&session.sessionId)))
-            }).max_by_key(|(generation, _)| *generation);
-        let generation = match latest {
-            Some((generation, true)) => generation.checked_add(1).ok_or_else(|| HostError::new("Terminal session generation exhausted"))?,
-            Some((generation, false)) => generation,
-            None => 0,
-        };
-        let sessionName = if generation == 0 { name.to_string() } else { format!("{prefix}{generation}") };
-        let directory = self.fileDirectory()?.map(|workspace| {
-            operit_host_api::TerminalWorkingDirectory::resolveSessionDirectory(
-                host, Some(terminalType), &workspace, &|path| {
-                    self.pathMapper.as_ref()
-                        .ok_or_else(|| HostError::new("Workspace VFS is not configured for terminal tools"))?
-                        .resolve(path).and_then(|path| path.nativePath()).map_err(HostError::new)
-                },
+        if requestedType.is_some() && requestedProfile.is_some() {
+            return Err(HostError::new(
+                "Specify profileId or terminalType, not both",
+            ));
+        }
+        let profile = if requestedType.is_none() {
+            let settings = host.terminalProfileSettings()?;
+            let id = requestedProfile.unwrap_or(&settings.defaultProfileId);
+            Some(
+                settings
+                    .profiles
+                    .into_iter()
+                    .find(|profile| profile.id == id)
+                    .ok_or_else(|| {
+                        HostError::new(format!("Terminal profile is not registered: {id}"))
+                    })?,
             )
-        }).transpose()?;
-        let session = host.createOrGetTypedSession(&sessionName, terminalType)?;
+        } else {
+            None
+        };
+        let info = host.terminalInfo()?;
+        let terminalType = match &profile {
+            Some(profile) => profile.terminalType.as_str(),
+            None => requestedType.ok_or_else(|| HostError::new("Terminal selection is missing"))?,
+        };
+        let terminal = match &profile {
+            Some(profile) => format!("profile:{}", profile.id),
+            None => info
+                .types
+                .iter()
+                .find(|entry| entry.terminalType == terminalType)
+                .ok_or_else(|| HostError::new("Terminal interpreter is not registered"))?
+                .terminal
+                .clone(),
+        };
+        let scopedName = match &profile {
+            Some(profile) => format!("{name}_profile_{}", profile.id),
+            None => name.to_string(),
+        };
+        let prefix = format!("{scopedName}_generation_");
+        let sessions = host.listSessions()?;
+        let candidates = sessions
+            .iter()
+            .filter(|session| session.terminalType == terminalType)
+            .filter_map(|session| {
+                let generation = if session.sessionName == scopedName {
+                    0
+                } else {
+                    session
+                        .sessionName
+                        .strip_prefix(&prefix)?
+                        .parse::<u64>()
+                        .ok()?
+                };
+                Some((
+                    generation,
+                    session.commandRunning || reserved.contains(&session.sessionId),
+                ))
+            });
+        let generation = match candidates
+            .clone()
+            .filter(|(_, busy)| !busy)
+            .max_by_key(|(generation, _)| *generation)
+        {
+            Some((generation, _)) => generation,
+            None => match candidates.max_by_key(|(generation, _)| *generation) {
+                Some((generation, _)) => generation
+                    .checked_add(1)
+                    .ok_or_else(|| HostError::new("Terminal session generation exhausted"))?,
+                None => 0,
+            },
+        };
+        let sessionName = if generation == 0 {
+            scopedName
+        } else {
+            format!("{prefix}{generation}")
+        };
+        let directory = self
+            .fileDirectory()?
+            .map(|workspace| self.resolveFileDirectory(host, &terminal, terminalType, &workspace))
+            .transpose()?;
+        let session = match &profile {
+            Some(profile) => host.createOrGetProfileSession(&sessionName, &profile.id)?,
+            None => host.createOrGetTypedSession(&sessionName, terminalType)?,
+        };
         if let Some(directory) = directory {
-            if let Err(error) = enterTerminalDirectory(host, &session.sessionId, terminalType, &directory) {
-                if session.isNewSession { let _ = host.closeSession(&session.sessionId); }
+            if let Err(error) =
+                enterTerminalDirectory(host, &session.sessionId, terminalType, &directory)
+            {
+                if session.isNewSession {
+                    let _ = host.closeSession(&session.sessionId);
+                }
                 return Err(error);
             }
         }
@@ -85,12 +166,12 @@ impl StandardTerminalTools {
 
     /// Creates terminal tools from an optional host implementation.
     pub fn new(terminalHost: Option<Arc<dyn TerminalHost>>) -> Self {
-        Self { terminalHost, pathMapper: None, storage: None }
+        Self { terminalHost, filesystem: None, storage: None }
     }
 
     /// Supplies the runtime VFS for the current chat file directory.
-    pub fn withPathMapper(mut self, mapper: PathMapper) -> Self {
-        self.pathMapper = Some(mapper);
+    pub fn withVfs(mut self, filesystem: VisualFileSystem) -> Self {
+        self.filesystem = Some(filesystem);
         self
     }
 
@@ -118,10 +199,9 @@ impl StandardTerminalTools {
         &self, host: &dyn TerminalHost, terminal: &str, terminalType: &str, path: &str,
     ) -> HostResult<String> {
         host.resolveWorkingDirectory(terminal, terminalType, path, &|path| {
-            self.pathMapper.as_ref()
+            self.filesystem.as_ref()
                 .ok_or_else(|| HostError::new("Workspace VFS is not configured for terminal tools"))?
-                .resolve(path)
-                .and_then(|path| path.nativePath())
+                .terminalDirectory(host, path)
                 .map_err(HostError::new)
         })
     }
@@ -132,7 +212,19 @@ impl StandardTerminalTools {
         match self
             .host()
             .and_then(|host| host.terminalInfo())
-            .and_then(|data| terminalInfoResultData(&data))
+            .and_then(|data| {
+                let mut result = terminalInfoResultData(&data)?;
+                let settings = self.host()?.terminalProfileSettings()?;
+                result.defaultProfileId = settings.defaultProfileId;
+                result.profiles = settings.profiles.into_iter().map(|profile| {
+                    Ok(TerminalProfileInfoData {
+                        available: !profile.options.is_empty() || data.types.iter().any(|entry| entry.terminal == profile.terminal && entry.terminalType == profile.terminalType && entry.available),
+                        terminal: terminalImplementation(&profile.terminal)?, terminalType: terminalType(&profile.terminalType)?,
+                        id: profile.id, name: profile.name,
+                    })
+                }).collect::<HostResult<Vec<_>>>()?;
+                Ok(result)
+            })
         {
             Ok(data) => toolSuccessData(tool, ToolResultData::TerminalInfoResultData(data)),
             Err(error) => toolError(
@@ -147,11 +239,9 @@ impl StandardTerminalTools {
     pub fn createOrGetSession(&self, tool: &AITool) -> ToolResult {
         let sessionName = parameterValue(tool, "session_name");
         let requestedType = optionalParameterValue(tool, "type");
-        let result = self.host().and_then(|host| {
-            let terminalType = match requestedType { Some(value) => value, None => host.terminalInfo()?.terminalType };
-            self.availableSession(&sessionName, &terminalType, &Default::default())
-                .and_then(|session| terminalSessionCreationResultData(&session))
-        });
+        let requestedProfile = optionalParameterValue(tool, "profile_id");
+        let result = self.availableSelectedSession(&sessionName, requestedType.as_deref(), requestedProfile.as_deref(), &Default::default())
+            .and_then(|session| terminalSessionCreationResultData(&session));
         match result
         {
             Ok(data) => toolSuccessData(
@@ -253,7 +343,12 @@ impl StandardTerminalTools {
     /// Closes an interactive terminal session.
     pub fn closeSession(&self, tool: &AITool) -> ToolResult {
         let sessionId = parameterValue(tool, "session_id");
-        match self.host().and_then(|host| host.closeSession(&sessionId)) {
+        let idleOnly = optionalParameterValue(tool, "if_idle").as_deref() == Some("true");
+        let sessionName = parameterValue(tool, "session_name");
+        match self.host().and_then(|host| {
+            if idleOnly { host.closeSessionIfIdle(&sessionId, &sessionName) }
+            else { host.closeSession(&sessionId) }
+        }) {
             Ok(data) => toolSuccessData(
                 tool,
                 ToolResultData::TerminalSessionCloseResultData(terminalSessionCloseResultData(
@@ -317,7 +412,8 @@ impl ToolExecutor for TerminalToolExecutor {
         })
     }
 
-    fn invokeAndStream(&mut self, tool: &AITool) -> Vec<ToolResult> {
+    /// Executes an independent request through the owning resource services.
+    fn invokeAndStream(&self, tool: &AITool) -> Vec<ToolResult> {
         match self.operation {
             TerminalToolOperation::GetTerminalInfo => vec![self.tools.getTerminalInfo(tool)],
             TerminalToolOperation::CreateSession => vec![self.tools.createOrGetSession(tool)],
@@ -355,6 +451,13 @@ fn validateTerminalTool(operation: TerminalToolOperation, tool: &AITool) -> Tool
         TerminalToolOperation::CloseSession | TerminalToolOperation::GetSessionScreen => {
             if parameterValue(tool, "session_id").is_empty() {
                 return invalid("session_id is required.");
+            }
+            if matches!(operation, TerminalToolOperation::CloseSession) {
+                match optionalParameterValue(tool, "if_idle").as_deref() {
+                    Some("true") if parameterValue(tool, "session_name").is_empty() => return invalid("session_name is required for idle close."),
+                    Some(value) if value != "true" && value != "false" => return invalid("if_idle must be true or false."),
+                    _ => {}
+                }
             }
         }
         TerminalToolOperation::GetTerminalInfo => {}
@@ -474,6 +577,7 @@ fn terminalInfoResultData(data: &TerminalInfo) -> HostResult<TerminalInfoResultD
         })
         .collect::<HostResult<Vec<_>>>()?;
     Ok(TerminalInfoResultData {
+        defaultProfileId: String::new(), profiles: Vec::new(),
         platform: data.platform.clone(),
         terminal: terminalImplementation(&data.terminal)?,
         terminalType: terminalType(&data.terminalType)?,
@@ -580,6 +684,7 @@ mod tests {
             terminal: "native".into(),
             terminalType: "zsh".into(),
             types: vec![TerminalTypeInfo {
+                nameKey: None,
                 terminal: "native".into(),
                 terminalType: "zsh".into(),
                 available: true,
@@ -750,14 +855,12 @@ mod tests {
         let output = operit_store::ChatOutputStore::ChatOutputStore::new(storage.clone())
             .bind("chat", 1793740800123, None)
             .unwrap();
-        let mapper = PathMapper::new(
-            root.join("runtime"),
-            root.join("workspaces"),
-            storage.clone(),
-        );
+        let filesystem = VisualFileSystem::fromStorage(
+            Arc::new(operit_host_native_filesystem::PosixFileSystemHost::new()), storage.clone(),
+        ).unwrap();
         let host = Arc::new(NativePtyTerminalHost::loginShell("/bin/bash", "bash", "/").unwrap());
         let tools = StandardTerminalTools::new(Some(host.clone()))
-            .withPathMapper(mapper.clone())
+            .withVfs(filesystem.clone())
             .withStorage(storage.clone());
         let tool = |name: &str, params: &[(&str, &str)]| AITool {
             name: name.into(),
@@ -775,6 +878,7 @@ mod tests {
             Some("/operitapp/workspaces/missing"),
         ] {
             let context = ToolRuntimeContext {
+                callerName: None,
                 callerChatId: Some("chat".into()),
                 callerParticipantId: None,
                 workspacePath: workspace.map(str::to_string),
@@ -803,7 +907,7 @@ mod tests {
                 };
                 let base = workspace.unwrap_or(&output);
                 let pwd_command = "printf '__operit_pwd__%s__operit_pwd_end__\\n' \"$PWD\"";
-                let expected = mapper.resolve(base).unwrap().nativePath().unwrap();
+                let expected = operit_host_api::FileSource::nativePath(&filesystem.file(base).unwrap()).unwrap();
                 let command = host.executeInSession(&session.sessionId, pwd_command, 5000).unwrap();
                 assert_eq!(command.exitCode, 0);
                 assert!(

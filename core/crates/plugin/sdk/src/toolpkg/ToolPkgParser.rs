@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 
-use operit_host_api::FileSystemHost;
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -470,6 +470,12 @@ pub struct ToolPkgMainRegistration {
     pub chatViewHooks: Vec<ToolPkgRegisteredFunctionHook>,
     #[serde(rename = "chatMessageHooks", default)]
     pub chatMessageHooks: Vec<ToolPkgRegisteredFunctionHook>,
+    /// Declares awaited message text transformations.
+    #[serde(rename = "messageTransformHooks", default)]
+    pub messageTransformHooks: Vec<ToolPkgRegisteredFunctionHook>,
+    /// Declares native display-program preparation handlers.
+    #[serde(default)]
+    pub messageStreamTransforms: Vec<ToolPkgRegisteredFunctionHook>,
     /// Declares one lifecycle initializer for the package-owned conversation namespace.
     #[serde(rename = "chatLifecycleHooks", default)]
     pub chatLifecycleHooks: Vec<ToolPkgRegisteredFunctionHook>,
@@ -483,6 +489,8 @@ pub struct ToolPkgMainRegistration {
     pub hostEventHooks: Vec<ToolPkgRegisteredHostEventHook>,
     #[serde(rename = "toolLifecycleHooks", default)]
     pub toolLifecycleHooks: Vec<ToolPkgRegisteredFunctionHook>,
+    #[serde(default)]
+    pub toolPermissionHooks: Vec<ToolPkgRegisteredFunctionHook>,
     #[serde(rename = "promptInputHooks", default)]
     pub promptInputHooks: Vec<ToolPkgRegisteredFunctionHook>,
     #[serde(rename = "promptHistoryHooks", default)]
@@ -534,6 +542,9 @@ pub struct ToolPkgContainerRuntime {
     #[serde(rename = "publicApis", default)]
     pub publicApis: Vec<ToolPkgRegisteredFunctionHook>,
     pub requires: Vec<ToolPkgManifestRequirement>,
+    /// Public API providers that may be absent or disabled without blocking this package.
+    #[serde(rename = "optional_requires", default)]
+    pub optionalRequires: Vec<ToolPkgManifestRequirement>,
     #[serde(rename = "dependencyIssues", default)]
     pub dependencyIssues: Vec<ToolPkgDependencyIssue>,
     #[serde(rename = "manifestExtensions", default)]
@@ -584,6 +595,12 @@ pub struct ToolPkgContainerRuntime {
     pub chatViewHooks: Vec<ToolPkgFunctionHookRuntime>,
     #[serde(rename = "chatMessageHooks")]
     pub chatMessageHooks: Vec<ToolPkgFunctionHookRuntime>,
+    /// Contains validated text transformation handlers in registration order.
+    #[serde(rename = "messageTransformHooks")]
+    pub messageTransformHooks: Vec<ToolPkgFunctionHookRuntime>,
+    /// Contains validated native display-program preparation handlers.
+    #[serde(default)]
+    pub messageStreamTransforms: Vec<ToolPkgFunctionHookRuntime>,
     /// Retains the actual exported creation handler validated at package registration.
     #[serde(rename = "chatLifecycleHooks")]
     pub chatLifecycleHooks: Vec<ToolPkgFunctionHookRuntime>,
@@ -597,6 +614,8 @@ pub struct ToolPkgContainerRuntime {
     pub hostEventHooks: Vec<ToolPkgHostEventHookRuntime>,
     #[serde(rename = "toolLifecycleHooks")]
     pub toolLifecycleHooks: Vec<ToolPkgFunctionHookRuntime>,
+    #[serde(default)]
+    pub toolPermissionHooks: Vec<ToolPkgFunctionHookRuntime>,
     #[serde(rename = "promptInputHooks")]
     pub promptInputHooks: Vec<ToolPkgFunctionHookRuntime>,
     #[serde(rename = "promptHistoryHooks")]
@@ -652,6 +671,9 @@ pub struct ToolPkgManifest {
     pub publicApi: Option<String>,
     #[serde(default)]
     pub requires: Vec<ToolPkgManifestRequirement>,
+    /// Public API providers that may be absent or disabled without blocking this package.
+    #[serde(rename = "optional_requires", default)]
+    pub optionalRequires: Vec<ToolPkgManifestRequirement>,
     #[serde(default)]
     pub main: String,
     #[serde(rename = "display_name", default)]
@@ -797,6 +819,148 @@ pub struct ToolPkgParser;
 pub struct ToolPkgArchiveParser;
 
 impl ToolPkgArchiveParser {
+    /// Reads activation metadata before touching executable entries or their resource payloads.
+    #[allow(non_snake_case)]
+    pub fn readToolPkgManifest(archiveBytes: &[u8]) -> Result<ToolPkgManifest, String> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(archiveBytes))
+            .map_err(|error| error.to_string())?;
+        let index = Self::buildZipEntryIndex(&mut archive);
+        let entry = findManifestEntry(&index.entryNames).ok_or("ToolPkg manifest is missing")?;
+        let text = Self::readZipEntryText(&mut archive, &index, &entry)
+            .ok_or("Cannot read ToolPkg manifest")?;
+        let manifest = parseToolPkgManifest(&text, &entry)?;
+        if manifest.toolpkgId.trim().is_empty() {
+            return Err("manifest.toolpkg_id is required".into());
+        }
+        Ok(manifest)
+    }
+
+    /// Reads installed-package metadata without evaluating scripts or inflating unrelated resources.
+    #[allow(non_snake_case)]
+    pub fn readToolPkgCatalog(
+        archiveBytes: &[u8],
+        sourceType: ToolPkgSourceType,
+        sourcePath: &str,
+        isBuiltIn: bool,
+    ) -> Result<ToolPkgLoadResult, String> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(archiveBytes))
+            .map_err(|error| error.to_string())?;
+        let index = Self::buildZipEntryIndex(&mut archive);
+        let entry = findManifestEntry(&index.entryNames).ok_or("ToolPkg manifest is missing")?;
+        let text = Self::readZipEntryText(&mut archive, &index, &entry)
+            .ok_or("Cannot read ToolPkg manifest")?;
+        let manifest = parseIndexedToolPkgManifest(&text, &entry, &index)?;
+        if manifest.toolpkgId.trim().is_empty() {
+            return Err("manifest.toolpkg_id is required".into());
+        }
+        let apiVersion = requireSupportedToolPkgApiVersion(&manifest.apiVersion)?;
+        let mut requires = normalizeRequirements("manifest.requires", &manifest.requires)?;
+        let optionalRequires = normalizeRequirements("manifest.optional_requires", &manifest.optionalRequires)?;
+        if optionalRequires.iter().any(|optional| requires.iter().any(|required| required.id.eq_ignore_ascii_case(&optional.id))) {
+            return Err("A dependency cannot appear in both requires and optional_requires".to_string());
+        }
+        applyCompatibilityRequirements(apiVersion, &manifest.toolpkgId, &mut requires)?;
+        let base = entry.rsplit_once('/').map(|(base, _)| base).unwrap_or("");
+        let mut subpackagePackages = Vec::new();
+        let mut subpackages = Vec::new();
+        for child in &manifest.subpackages {
+            if child.id.trim().is_empty() || child.entry.trim().is_empty() {
+                return Err("ToolPkg subpackage id and entry are required".into());
+            }
+            let path = Self::resolveManifestRelativeZipEntryPath(base, &child.entry)
+                .ok_or("Invalid subpackage entry")?;
+            let source = Self::readZipEntryText(&mut archive, &index, &path)
+                .ok_or_else(|| format!("Cannot read subpackage entry: {}", child.entry))?;
+            let metadata = crate::JsPackageLoader::JsPackageLoader::extract_metadata(&source);
+            let package = crate::JsPackageLoader::JsPackageLoader::parse_metadata_with_default_api_version(&metadata, "", &apiVersion.to_string())?;
+            let displayName = if hasLocalizedTextContent(&package.display_name) {
+                package.display_name.clone()
+            } else {
+                localizedTextOf(&package.name)
+            };
+            subpackages.push(ToolPkgSubpackageRuntime {
+                packageName: child.id.trim().into(),
+                containerPackageName: manifest.toolpkgId.clone(),
+                subpackageId: child.id.trim().into(),
+                entryPath: path,
+                displayName,
+                description: package.description.clone(),
+                enabledByDefault: package.enabled_by_default,
+                toolCount: package.tools.len(),
+            });
+            subpackagePackages.push(ToolPackage {
+                name: child.id.trim().into(), api_version: apiVersion.to_string(), is_built_in: isBuiltIn, ..package
+            });
+        }
+        let resources = manifest.resources.iter().map(|resource| {
+            Ok(ToolPkgResourceRuntime {
+                key: resource.key.clone(),
+                path: Self::resolveManifestRelativeResourcePath(base, &resource.path)
+                    .ok_or("Invalid resource path")?,
+                mime: resource.mime.clone(),
+            })
+        }).collect::<Result<Vec<_>, String>>()?;
+        let logoResource = resolveLogoResource(manifest.logo.as_deref(), &resources)?;
+        let displayName = if hasLocalizedTextContent(&manifest.displayName) {
+            manifest.displayName.clone()
+        } else {
+            localizedTextOf(&manifest.toolpkgId)
+        };
+        let description = if hasLocalizedTextContent(&manifest.description) {
+            manifest.description.clone()
+        } else {
+            displayName.clone()
+        };
+        let mut manifestExtensions = manifest.extensionFields.clone();
+        if let Some(scope) = manifest.installationScope {
+            manifestExtensions.insert("installation_scope".into(),
+                serde_json::to_value(scope).map_err(|error| error.to_string())?);
+        }
+        let mainEntry = if manifest.main.is_empty() {
+            String::new()
+        } else {
+            Self::resolveManifestRelativeZipEntryPath(base, &manifest.main)
+                .ok_or("Invalid manifest.main path")?
+        };
+        let marketOrigin = if manifest.main.is_empty() {
+            manifest.extensionFields.get("market_origin")
+                .map(|value| serde_json::from_value::<ToolPkgMarketOrigin>(value.clone()))
+                .transpose().map_err(|error| error.to_string())?
+        } else if sourceType == ToolPkgSourceType::MARKET {
+            let source = Self::readZipEntryText(&mut archive, &index, &mainEntry)
+                .ok_or("Cannot read marketplace provenance from main entry")?;
+            crate::toolpkg::ToolPkgProtection::readMainScriptMarketOrigin(&source, &manifest.toolpkgId)?
+        } else {
+            None
+        };
+        if manifest.main.is_empty() {
+            if let Some(origin) = &marketOrigin {
+                if origin.toolpkgId != manifest.toolpkgId || origin.version != manifest.version || origin.author != manifest.author {
+                    return Err("ToolPkg market origin differs from its manifest".into());
+                }
+            }
+        }
+        Ok(ToolPkgLoadResult {
+            containerPackage: ToolPackage {
+                api_version: apiVersion.to_string(),
+                name: manifest.toolpkgId.clone(), display_name: displayName.clone(),
+                description: description.clone(), author: manifest.author.clone(),
+                enabled_by_default: manifest.enabledByDefault, is_built_in: isBuiltIn,
+                category: "ToolPkg".into(), ..Default::default()
+            },
+            subpackagePackages,
+            containerRuntime: ToolPkgContainerRuntime {
+                packageName: manifest.toolpkgId, displayName, description,
+                version: manifest.version, apiVersion: apiVersion.to_string(), requires, optionalRequires,
+                author: manifest.author, sourceType, sourcePath: sourcePath.into(),
+                mainEntry, subpackages, resources, logoResource, manifestExtensions,
+                themes: manifest.themes, license: manifest.license,
+                marketOrigin: marketOrigin.clone(), ..Default::default()
+            },
+            marketOrigin,
+        })
+    }
+
     /// Reads installation restrictions before any registration script can create scoped data.
     #[allow(non_snake_case)]
     pub fn readInstallationScope(archiveBytes: &[u8]) -> Result<Option<crate::javascript::ToolPkgConfigScope>, String> {
@@ -842,7 +1006,7 @@ impl ToolPkgArchiveParser {
     where
         FReadEntryText: FnMut(&str) -> Option<String>,
         FReadEntryProtectionHeader: FnMut(&str) -> Option<Vec<u8>>,
-        FParseJsPackage: FnMut(&str, &mut dyn FnMut(String, String)) -> Option<ToolPackage>,
+        FParseJsPackage: FnMut(&str, &str, &mut dyn FnMut(String, String)) -> Option<ToolPackage>,
         FParseMainRegistration: FnMut(&str, &str, &str, &str, &[String]) -> ToolPkgMainRegistrationParseResult,
         FReportPackageLoadError: FnMut(String, String),
     {
@@ -850,10 +1014,14 @@ impl ToolPkgArchiveParser {
             .ok_or_else(|| "manifest.hjson or manifest.json not found".to_string())?;
         let manifestText = readEntryText(&manifestEntryName)
             .ok_or_else(|| "Failed to read manifest entry".to_string())?;
-        let manifest = parseToolPkgManifest(&manifestText, &manifestEntryName)?;
+        let manifest = parseIndexedToolPkgManifest(&manifestText, &manifestEntryName, entryIndex)?;
         let apiVersion = requireSupportedToolPkgApiVersion(&manifest.apiVersion)?;
         let apiVersionText = apiVersion.to_string();
         let mut requires = normalizeRequirements("manifest.requires", &manifest.requires)?;
+        let optionalRequires = normalizeRequirements("manifest.optional_requires", &manifest.optionalRequires)?;
+        if optionalRequires.iter().any(|optional| requires.iter().any(|required| required.id.eq_ignore_ascii_case(&optional.id))) {
+            return Err("A dependency cannot appear in both requires and optional_requires".to_string());
+        }
         applyCompatibilityRequirements(apiVersion, &manifest.toolpkgId, &mut requires)?;
         validateProtectedEntryPolicy(
             &manifest,
@@ -889,14 +1057,6 @@ impl ToolPkgArchiveParser {
             }
             None => None,
         };
-        if let Some(license) = &manifest.license {
-            validateDeclaredPackagePath(license)?;
-            let entry = Self::resolveManifestRelativeZipEntryPath(&manifestBasePath, license)
-                .ok_or_else(|| "manifest.license must reference a safe package path".to_string())?;
-            if !entryIndex.containsEntry(&entry) {
-                return Err(format!("Cannot find manifest.license entry '{license}'"));
-            }
-        }
         let mut themeIds = BTreeSet::new();
         for theme in &manifest.themes {
             if theme.id.trim().is_empty() || theme.id.contains(':') || !themeIds.insert(theme.id.clone()) {
@@ -969,7 +1129,7 @@ impl ToolPkgArchiveParser {
                         format!("{sourcePath}:{}: {error}", subpackage.entry),
                     );
                 };
-                let parsedPackage = parseJsPackage(&jsContent, &mut parserErrorReporter)
+                let parsedPackage = parseJsPackage(&jsContent, &apiVersionText, &mut parserErrorReporter)
                     .ok_or_else(|| {
                         format!("Failed to parse subpackage script '{}'", subpackage.entry)
                     })?;
@@ -980,6 +1140,7 @@ impl ToolPkgArchiveParser {
                     localizedTextOf(&parsedPackage.name)
                 };
                 let normalizedPackage = ToolPackage {
+                    api_version: apiVersionText.clone(),
                     name: packageName.clone(),
                     is_built_in: isBuiltIn,
                     ..parsedPackage
@@ -1440,6 +1601,14 @@ impl ToolPkgArchiveParser {
             &mainRegistration.chatMessageHooks,
             TOOLPKG_REGISTRATION_CHAT_MESSAGE_HOOK,
         )?;
+        let messageTransformHooks = validateFunctionHooks(
+            &mainRegistration.messageTransformHooks,
+            TOOLPKG_REGISTRATION_MESSAGE_TRANSFORM_HOOK,
+        )?;
+        let messageStreamTransforms = validateFunctionHooks(
+            &mainRegistration.messageStreamTransforms,
+            TOOLPKG_REGISTRATION_MESSAGE_STREAM_TRANSFORM,
+        )?;
         let chatMessageMenuItems =
             validateChatMessageMenuItems(&mainRegistration.chatMessageMenuItems, entryIndex)?;
         let chatRuntimeHooks = validateFunctionHooks(
@@ -1457,6 +1626,10 @@ impl ToolPkgArchiveParser {
         let toolLifecycleHooks = validateFunctionHooks(
             &mainRegistration.toolLifecycleHooks,
             TOOLPKG_REGISTRATION_TOOL_LIFECYCLE_HOOK,
+        )?;
+        let toolPermissionHooks = validateFunctionHooks(
+            &mainRegistration.toolPermissionHooks,
+            TOOLPKG_REGISTRATION_TOOL_PERMISSION_HOOK,
         )?;
         let promptInputHooks = validateFunctionHooks(
             &mainRegistration.promptInputHooks,
@@ -1501,6 +1674,7 @@ impl ToolPkgArchiveParser {
             localizedTextOf(&manifest.toolpkgId)
         };
         let containerPackage = ToolPackage {
+            api_version: apiVersionText.clone(),
             name: manifest.toolpkgId.clone(),
             description: containerDescription.clone(),
             tools: Vec::new(),
@@ -1520,6 +1694,7 @@ impl ToolPkgArchiveParser {
             publicApi,
             publicApis: mainRegistration.publicApis.clone(),
             requires,
+            optionalRequires,
             dependencyIssues: Vec::new(),
             manifestExtensions,
             author: manifest.author.clone(),
@@ -1545,12 +1720,15 @@ impl ToolPkgArchiveParser {
             chatInputHooks,
             chatViewHooks,
             chatMessageHooks,
+            messageTransformHooks,
+            messageStreamTransforms,
             chatLifecycleHooks,
             chatMessageMenuItems,
             chatRuntimeHooks,
             chatResponseHooks,
             hostEventHooks,
             toolLifecycleHooks,
+            toolPermissionHooks,
             promptInputHooks,
             promptHistoryHooks,
             promptEstimateHistoryHooks,
@@ -1605,19 +1783,19 @@ impl ToolPkgArchiveParser {
     /// Builds a normalized entry index from an extracted ToolPkg directory.
     #[allow(non_snake_case)]
     pub fn buildDirectoryEntryIndex(
-        fileSystemHost: &dyn FileSystemHost,
+        filesystem: &VisualFileSystem,
         rootDir: &str,
     ) -> ToolPkgEntryIndex {
         let mut normalizedEntryNames = BTreeSet::new();
         let mut entryNamesByNormalizedLowercase = BTreeMap::new();
-        let Ok(rootInfo) = fileSystemHost.fileExists(rootDir) else {
+        let Ok(rootInfo) = filesystem.fileExists(rootDir) else {
             return ToolPkgEntryIndex::default();
         };
         if !rootInfo.exists || !rootInfo.isDirectory {
             return ToolPkgEntryIndex::default();
         }
         collectDirectoryEntryIndex(
-            fileSystemHost,
+            filesystem,
             rootDir,
             rootDir,
             &mut normalizedEntryNames,
@@ -1737,7 +1915,7 @@ impl ToolPkgArchiveParser {
     ) -> Option<ToolPkgManifestPreview> {
         let entryName = findManifestEntry(&entryIndex.entryNames)?;
         let manifestText = Self::readZipEntryText(archive, entryIndex, &entryName)?;
-        let manifest = parseToolPkgManifest(&manifestText, &entryName).ok()?;
+        let manifest = parseIndexedToolPkgManifest(&manifestText, &entryName, entryIndex).ok()?;
         Some(ToolPkgManifestPreview {
             entryName,
             manifest,
@@ -1747,13 +1925,13 @@ impl ToolPkgArchiveParser {
     /// Reads one indexed directory entry as UTF-8 text.
     #[allow(non_snake_case)]
     pub fn readDirectoryEntryText(
-        fileSystemHost: &dyn FileSystemHost,
+        filesystem: &VisualFileSystem,
         rootDir: &str,
         entryIndex: &ToolPkgEntryIndex,
         rawPath: &str,
     ) -> Option<String> {
         let relativePath = entryIndex.resolveEntryName(rawPath)?;
-        let bytes = fileSystemHost
+        let bytes = filesystem
             .readFileBytes(&joinToolPkgHostPath(rootDir, &relativePath))
             .ok()?;
         crate::toolpkg::ToolPkgProtection::decodeUtf8(&bytes).ok()
@@ -1762,31 +1940,31 @@ impl ToolPkgArchiveParser {
     /// Extracts normalized ToolPkg entries from an external ZIP file.
     #[allow(non_snake_case)]
     pub fn extractZipEntriesFromExternal(
-        fileSystemHost: &dyn FileSystemHost,
+        filesystem: &VisualFileSystem,
         zipFilePath: &str,
         destinationDir: &str,
     ) -> bool {
-        let Ok(bytes) = fileSystemHost.readFileBytes(zipFilePath) else {
+        let Ok(bytes) = filesystem.readFileBytes(zipFilePath) else {
             return false;
         };
-        Self::extractZipEntriesFromReader(Cursor::new(bytes), fileSystemHost, destinationDir)
+        Self::extractZipEntriesFromReader(Cursor::new(bytes), filesystem, destinationDir)
     }
 
     /// Extracts normalized ToolPkg entries from embedded archive bytes.
     #[allow(non_snake_case)]
     pub fn extractZipEntriesFromAssetBytes(
         bytes: &'static [u8],
-        fileSystemHost: &dyn FileSystemHost,
+        filesystem: &VisualFileSystem,
         destinationDir: &str,
     ) -> bool {
-        Self::extractZipEntriesFromReader(Cursor::new(bytes), fileSystemHost, destinationDir)
+        Self::extractZipEntriesFromReader(Cursor::new(bytes), filesystem, destinationDir)
     }
 
     /// Extracts normalized ToolPkg entries from a generic seekable reader.
     #[allow(non_snake_case)]
     fn extractZipEntriesFromReader<R: std::io::Read + std::io::Seek>(
         reader: R,
-        fileSystemHost: &dyn FileSystemHost,
+        filesystem: &VisualFileSystem,
         destinationDir: &str,
     ) -> bool {
         let Ok(mut archive) = zip::ZipArchive::new(reader) else {
@@ -1806,7 +1984,7 @@ impl ToolPkgArchiveParser {
             if std::io::Read::read_to_end(&mut entry, &mut content).is_err() {
                 return false;
             }
-            if fileSystemHost
+            if filesystem
                 .writeFileBytes(
                     &joinToolPkgHostPath(destinationDir, &normalizedEntry),
                     &content,
@@ -2455,20 +2633,20 @@ fn duplicateLabel(registryName: &str) -> &'static str {
 #[allow(non_snake_case)]
 /// Recursively adds directory entries to a normalized ToolPkg entry index.
 fn collectDirectoryEntryIndex(
-    fileSystemHost: &dyn FileSystemHost,
+    filesystem: &VisualFileSystem,
     rootDir: &str,
     currentDir: &str,
     normalizedEntryNames: &mut BTreeSet<String>,
     entryNamesByNormalizedLowercase: &mut BTreeMap<String, String>,
 ) {
-    let Ok(entries) = fileSystemHost.listFiles(currentDir) else {
+    let Ok(entries) = filesystem.listFiles(currentDir) else {
         return;
     };
     for entry in entries {
         let path = joinToolPkgHostPath(currentDir, &entry.name);
         if entry.isDirectory {
             collectDirectoryEntryIndex(
-                fileSystemHost,
+                filesystem,
                 rootDir,
                 &path,
                 normalizedEntryNames,
@@ -2543,9 +2721,27 @@ fn validateDeclaredPackagePath(path: &str) -> Result<(), String> {
 }
 
 #[allow(non_snake_case)]
-/// Parses one ToolPkg manifest and records its source entry path.
+/// Parses the manifest as declared by the author.
 fn parseToolPkgManifest(content: &str, manifestEntryName: &str) -> Result<ToolPkgManifest, String> {
-    serde_json::from_value(parseToolPkgManifestValue(content, manifestEntryName)?).map_err(|error| error.to_string())
+    serde_json::from_value(parseToolPkgManifestValue(content, manifestEntryName)?)
+        .map_err(|error| error.to_string())
+}
+
+#[allow(non_snake_case)]
+/// Exposes optional agreement metadata only when it names a safe file in the package.
+fn parseIndexedToolPkgManifest(
+    content: &str,
+    manifestEntryName: &str,
+    entryIndex: &ToolPkgEntryIndex,
+) -> Result<ToolPkgManifest, String> {
+    let mut manifest = parseToolPkgManifest(content, manifestEntryName)?;
+    let base = manifestEntryName.rsplit_once('/').map_or("", |(base, _)| base);
+    manifest.license = manifest.license.filter(|path| {
+        validateDeclaredPackagePath(path).is_ok()
+            && ToolPkgArchiveParser::resolveManifestRelativeZipEntryPath(base, path)
+                .is_some_and(|entry| entryIndex.containsEntry(&entry))
+    });
+    Ok(manifest)
 }
 
 /// Parses the ordinary manifest syntax while retaining all declared extension fields.
@@ -2670,7 +2866,7 @@ mod module_export_tests {
         let loaded = ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| entries.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "exports_fixture.toolpkg", false,
-            |_, _| panic!("fixture does not contain subpackages"),
+            |_, _, _| panic!("fixture does not contain subpackages"),
             |_, _, _, _, _| ToolPkgMainRegistrationParseResult::Success {
                 registration: serde_json::from_value(serde_json::json!({
                     "chatComposerSlots": [{"id": "composer", "slot": "above_input", "screen": "screen.ui.js", "screenExport": "Composer"}],
@@ -2704,7 +2900,8 @@ mod api_compatibility_tests {
             let mut manifest = serde_json::json!({
                 "schema_version": 1,
                 "toolpkg_id": "compat_fixture",
-                "main": "main.js"
+                "main": "main.js",
+                "subpackages": [{"id": "child", "entry": "sub.js"}]
             });
             if let Some(declared) = declared {
                 manifest["api_version"] = serde_json::json!(declared);
@@ -2713,6 +2910,7 @@ mod api_compatibility_tests {
             let entries = BTreeMap::from([
                 ("manifest.json".to_string(), manifest),
                 ("main.js".to_string(), "exports.registerToolPkg = function() {};".to_string()),
+                ("sub.js".to_string(), "/* METADATA {name: child, tools: [{name: run}]} */ exports.run = function() {};".to_string()),
             ]);
             let index = ToolPkgEntryIndex {
                 entryNames: entries.keys().cloned().collect(),
@@ -2725,7 +2923,12 @@ mod api_compatibility_tests {
                 ToolPkgSourceType::EXTERNAL,
                 "compat_fixture.toolpkg",
                 false,
-                |_, _| panic!("fixture does not contain subpackages"),
+                |script, inherited, _| {
+                    assert_eq!(inherited, version);
+                    let package = crate::JsPackageLoader::JsPackageLoader::parse_with_default_api_version(script, inherited).unwrap();
+                    assert_eq!(package.api_version, version);
+                    Some(package)
+                },
                 |_, id, path, declared, _environment| {
                     assert_eq!(id, "compat_fixture");
                     assert_eq!(path, "main.js");
@@ -2738,6 +2941,18 @@ mod api_compatibility_tests {
             )
             .expect("supported manifest must load");
             assert_eq!(loaded.containerRuntime.apiVersion, version);
+            assert_eq!(loaded.containerPackage.api_version, version);
+            assert_eq!(loaded.subpackagePackages[0].api_version, version);
+            // The catalog path parses metadata without executing registration.
+            use std::io::Write;
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            for (name, source) in &entries {
+                writer.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                writer.write_all(source.as_bytes()).unwrap();
+            }
+            let archive = writer.finish().unwrap().into_inner();
+            let catalog = ToolPkgArchiveParser::readToolPkgCatalog(&archive, ToolPkgSourceType::EXTERNAL, "compat_fixture.toolpkg", false).unwrap();
+            assert_eq!(catalog.subpackagePackages[0].api_version, version);
             let requirements = &loaded.containerRuntime.requires;
             if version == "2.0.0" {
                 assert!(requirements.is_empty());
@@ -2809,12 +3024,21 @@ mod api_compatibility_tests {
     /// Loads declarative theme and agreement references without invoking a JavaScript registration callback.
     #[test]
     fn loads_declarative_theme_and_agreement_without_main() {
-        let manifest = serde_json::json!({
+        let mut manifest = serde_json::json!({
             "schema_version": 1, "toolpkg_id": "theme_fixture", "version": "1",
             "license": "licenses/agreement.txt",
             "themes": [{"id":"default", "path":"theme.json", "preview":"preview.png"}]
         });
-        for missing in [None, Some("theme.json"), Some("preview.png"), Some("licenses/agreement.txt")] {
+        for (api, missing, expected_license) in [
+            ("1.0.0", None, Ok(Some("licenses/agreement.txt"))),
+            ("1.0.0", Some("licenses/agreement.txt"), Ok(None)),
+            ("1.0.1", Some("licenses/agreement.txt"), Ok(None)),
+            ("2.0.0", None, Ok(Some("licenses/agreement.txt"))),
+            ("2.0.0", Some("licenses/agreement.txt"), Ok(None)),
+            ("1.0.0", Some("theme.json"), Err("theme.json")),
+            ("1.0.0", Some("preview.png"), Err("preview.png")),
+        ] {
+            manifest["api_version"] = serde_json::json!(api);
             let mut entries = BTreeMap::from([
                 ("manifest.json".to_string(), manifest.to_string()),
                 ("theme.json".to_string(), "{}".to_string()),
@@ -2829,20 +3053,20 @@ mod api_compatibility_tests {
             let loaded = ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
                 &index, |name| entries.get(name).cloned(), |_| None,
                 ToolPkgSourceType::EXTERNAL, "theme_fixture.toolpkg", false,
-                |_, _| panic!("declarative theme has no scripts"),
+                |_, _, _| panic!("declarative theme has no scripts"),
                 |_, _, _, _, _| panic!("declarative theme must not execute registration"),
                 |_, _| panic!("declarative theme has no subpackages"),
             );
-            match missing {
-                None => {
+            match expected_license {
+                Ok(license) => {
                     let loaded = loaded.unwrap();
                     assert!(loaded.containerRuntime.mainEntry.is_empty());
                     assert!(loaded.containerPackage.tools.is_empty());
                     assert_eq!(loaded.containerRuntime.version, "1");
                     assert_eq!(loaded.containerRuntime.themes[0].id, "default");
-                    assert_eq!(loaded.containerRuntime.license.as_deref(), Some("licenses/agreement.txt"));
+                    assert_eq!(loaded.containerRuntime.license.as_deref(), license);
                 }
-                Some(_) => assert!(loaded.is_err()),
+                Err(message) => assert!(loaded.unwrap_err().contains(message)),
             }
         }
     }
@@ -2863,7 +3087,7 @@ mod api_compatibility_tests {
         let loaded = ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| entries.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "resource_fixture.toolpkg", false,
-            |_, _| panic!("no executable declarations"), |_, _, _, _, _| panic!("no main entry"),
+            |_, _, _| panic!("no executable declarations"), |_, _, _, _, _| panic!("no main entry"),
             |_, _| panic!("resource declarations must load"),
         ).unwrap();
         assert!(loaded.containerRuntime.mainEntry.is_empty());
@@ -2954,7 +3178,7 @@ mod public_api_tests {
         ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| entries.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "public_fixture.toolpkg", false,
-            |_, _| panic!("fixture has no subpackages"),
+            |_, _, _| panic!("fixture has no subpackages"),
             |_, _, _, _, _| ToolPkgMainRegistrationParseResult::Success {
                 registration: ToolPkgMainRegistration {
                     publicApis: (0..methods).map(|_| ToolPkgRegisteredFunctionHook {
@@ -3020,7 +3244,7 @@ mod navigation_registration_tests {
         ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| sources.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "arbitrary_package.toolpkg", false,
-            |_, _| panic!("navigation unit input has no subpackages"),
+            |_, _, _| panic!("navigation unit input has no subpackages"),
             |_, _, _, _, _| ToolPkgMainRegistrationParseResult::Success { registration: registration.clone() },
             |name, message| panic!("unexpected package error {name}: {message}"),
         )
@@ -3084,7 +3308,7 @@ mod navigation_registration_tests {
         ToolPkgArchiveParser::parseToolPkgFromIndexedEntries(
             &index, |name| sources.get(name).cloned(), |_| None,
             ToolPkgSourceType::EXTERNAL, "arbitrary_package.toolpkg", false,
-            |_, _| panic!("sidebar archive input declares no subpackages"),
+            |_, _, _| panic!("sidebar archive input declares no subpackages"),
             |_, _, _, _, _| ToolPkgMainRegistrationParseResult::Success { registration: registration.clone() },
             |name, message| panic!("unexpected package error {name}: {message}"),
         )

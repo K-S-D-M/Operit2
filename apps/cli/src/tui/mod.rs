@@ -65,7 +65,7 @@ use operit_tools::tools::AIToolHandler::AIToolHandler;
 use operit_tools::tools::ToolPermissionSystem::PermissionRequestResult;
 use operit_tools::ToolExecutionManager::AITool;
 use operit_util::AppLogger::AppLogger;
-use operit_util::GithubReleaseUtil::{FullUpdateStatus, FullUpdateTarget, GithubReleaseUtil};
+use operit_util::GithubReleaseUtil::{FullUpdateStatus, GithubReleaseUtil};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -178,7 +178,7 @@ pub(crate) async fn run_tui_command(args: &[String]) -> Result<(), String> {
     // booting a second owner for the same identity.
     owner.refresh_log_path()?;
     let control_server =
-        crate::daemon::ControlServer::bind(&mut owner, core_application.localClient())?;
+        crate::daemon::ControlServer::bind(&mut owner, &core_application)?;
     // Runtime peer/proxy futures are not Send. Keep the monitor and the
     // control server on the local executor, independently of the terminal
     // loop, and drop their in-flight operations before shutting down the Core.
@@ -333,7 +333,7 @@ async fn start_tui_listeners(
         let capabilities = services.listenerCapabilities()?;
         saved_listener_transports(&config.transports, &capabilities.transports)
     };
-    if transports.is_empty() {
+    if transports.is_empty() && services.localHostConfig()?.is_none_or(|config| config.discovery.is_none()) {
         return Ok(());
     }
     match services.startListening(transports).await {
@@ -421,7 +421,7 @@ pub(crate) fn mark_startup_install_prompt_declined() -> Result<(), String> {
 async fn build_startup_update_prompt(
     current_version_override: Option<&str>,
 ) -> Result<Option<StartupUpdatePrompt>, String> {
-    let target = FullUpdateTarget::cliForCurrentHost()?;
+    let target = crate::cli::host_ops::cli_update_target()?;
     let current_version = current_version_override.unwrap_or(env!("CARGO_PKG_VERSION"));
     let status = match GithubReleaseUtil::checkForFullUpdate(current_version, target).await {
         Ok(status) => status,

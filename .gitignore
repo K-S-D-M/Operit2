@@ -96,6 +96,11 @@ apps/flutter/app/ios/Runner/python/
 # Rust
 target/
 
+# Compiled WebAssembly and object files
+*.wasm
+!plugins/packages/external/wechat/resources/silk-decoder.wasm
+*.o
+
 # ESP32 / ESP-IDF build outputs
 edge/boards/esp32/.embuild/
 **/.embuild/
@@ -133,14 +138,6 @@ coverage.out
 node_modules/
 **/node_modules/
 **/dist/
-!plugins/buildin/**/dist/
-!plugins/buildin/**/dist/**
-!plugins/external/**/dist/
-!plugins/external/**/dist/**
-!plugins/packages/buildin/*/dist/
-!plugins/packages/buildin/*/dist/**
-!plugins/packages/external/*/dist/
-!plugins/packages/external/*/dist/**
 **/.turbo/
 **/.vite/
 **/.rollup.cache/
@@ -186,12 +183,18 @@ apps/flutter/app/ohos/entry/hnp/
 apps/flutter/app/ohos/entry/src/main/resources/rawfile/ohos-vroot/
 
 # Plugin packaging outputs
+plugins/packages/buildin/character_cards/resources/character-memory.html
+plugins/packages/buildin/workflow/resources/workflow.html
+plugins/packages/external/music_studio/resources/studio.html
+plugins/packages/external/project_maintenance/resources/control.html
+plugins/packages/external/music_studio/web/audio/generated/
 plugins/**/*.toolpkg
 core/crates/runtime/application/assets/plugins/buildin/**/*.toolpkg
 core/crates/runtime/application/assets/plugins/external/*.toolpkg
 core/crates/runtime/application/assets/plugins/buildin/**/*.js
 core/crates/runtime/application/assets/plugins/buildin/
 core/crates/runtime/application/assets/plugins/external/
+core/crates/runtime/application/assets/models_dev/
 plugins/**/build/
 plugins/**/out/
 plugins/**/.cache/
@@ -209,6 +212,7 @@ plugins/**/.sync_hot_reload_state.json
 
 # Local build tool caches
 .ci-tools/
+tools/release/bases/
 
 
 AGENTS.md

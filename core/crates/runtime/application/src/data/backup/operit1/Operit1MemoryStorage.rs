@@ -61,17 +61,19 @@ fn buildSnapshotFileCopyPlan(
     Ok(plan)
 }
 
-/// Recognizes declared Operit1 memory directories without treating user workspace documents as memory storage.
+/// Recognizes legacy memory storage and vector indexes without excluding user workspace documents.
 #[allow(non_snake_case)]
 fn isOperit1LegacyMemoryEntry(entry: &str) -> bool {
     let Some(relative) = entry.strip_prefix(ENTRY_FILES_PREFIX) else {
         return false;
     };
     let Some((directory, file)) = relative.split_once('/') else {
-        return false;
+        // RawSnapshotBackupManager also excludes the former top-level index filenames.
+        return relative.starts_with("memory_hnsw_") && relative.ends_with(".idx")
+            || relative.starts_with("doc_index_") && relative.ends_with(".hnsw");
     };
     (directory == "objectbox" || directory.starts_with("objectbox_")) && matches!(file, "data.mdb" | "lock.mdb")
-        || directory == "memory-space-profiles"
+        || matches!(directory, "memory-space-profiles" | ".vector_index")
 }
 
 /// Returns whether an entry is an adopted non-workspace resource, leaving legacy preferences and memory source data unmodified.
@@ -164,6 +166,7 @@ fn buildOperit1PluginMemoryRecords(
     owner: &str,
     plan: &SnapshotFileImportPlan,
     archive: &OperitChatArchive,
+    producerNodeId: &str,
 ) -> Result<(Vec<(String, String, Value)>, i32, i32), String> {
     use crate::data::backup::CharacterPluginMigration::{
         migrateCandidateTrigger, ownerRecord, CandidateSourceState,
@@ -184,21 +187,15 @@ fn buildOperit1PluginMemoryRecords(
             (6, 4) if !bytes.is_empty() => {
                 let table = FlatObjectBoxTable::new(bytes)?;
                 let id = table.requiredI64(0, "Memory.id")?;
-                let document = table
-                    .optionalString(12)?
-                    .map(|path| plan.rewritePath(&path))
-                    .transpose()?;
-                let index = table
-                    .optionalString(14)?
-                    .map(|path| plan.rewritePath(&path))
-                    .transpose()?;
+                let document = plan.rewriteMemoryAttachmentPath(table.optionalString(12)?.as_deref())?;
+                // Operit1 excludes generated HNSW files from raw snapshots; retire their references.
                 let value = serde_json::json!({"id":id,"uuid":table.requiredString(1,"Memory.uuid")?,
                     "title":table.requiredString(2,"Memory.title")?,"content":table.requiredString(3,"Memory.content")?,
                     "contentType":table.requiredString(4,"Memory.contentType")?,"source":table.requiredString(5,"Memory.source")?,
                     "credibility":table.scalarF32(6,"Memory.credibility")?,"importance":table.scalarF32(7,"Memory.importance")?,
                     "folderPath":table.optionalString(17)?,"createdAt":table.requiredI64(8,"Memory.createdAt")?,
                     "updatedAt":table.requiredI64(9,"Memory.updatedAt")?,"lastAccessedAt":table.requiredI64(10,"Memory.lastAccessedAt")?,
-                    "documentPath":document,"isDocumentNode":table.scalarBool(13)?,"chunkIndexFilePath":index,"tags":[],"properties":[]});
+                    "documentPath":document,"isDocumentNode":table.scalarBool(13)?,"chunkIndexFilePath":null,"tags":[],"properties":[]});
                 if memories.insert(id, value).is_some() {
                     return Err("Duplicate Operit1 memory identity".to_string());
                 }
@@ -242,7 +239,7 @@ fn buildOperit1PluginMemoryRecords(
                         message.baseMessage.sender.clone(),
                     ))
                     .collect::<Vec<_>>();
-                let mut candidate = serde_json::json!({"id":table.requiredI64(0,"MemoryAutoSaveCandidate.id")?,"chatId":chat,"triggerMessageTimestamp":timestamp,
+                let mut candidate = serde_json::json!({"id":table.requiredI64(0,"MemoryAutoSaveCandidate.id")?,"producerNodeId":producerNodeId,"chatId":chat,"triggerMessageTimestamp":timestamp,
                     "createdAt":table.requiredI64(3,"MemoryAutoSaveCandidate.createdAt")?,"updatedAt":table.requiredI64(4,"MemoryAutoSaveCandidate.updatedAt")?,"status":table.requiredString(5,"MemoryAutoSaveCandidate.status")?,"attemptCount":table.scalarI32(6,"MemoryAutoSaveCandidate.attemptCount")?,"lastError":table.requiredString(7,"MemoryAutoSaveCandidate.lastError")?,"sourceType":table.requiredString(8,"MemoryAutoSaveCandidate.sourceType")?});
                 // The retired app deleted chats without clearing their queued extractions, and the
                 // plugin requires a resolvable source revision, so stale queue records are dropped.

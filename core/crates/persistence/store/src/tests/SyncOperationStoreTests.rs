@@ -23,6 +23,8 @@ struct MemoryStorageHost {
     forbidControlHistoryReads: Arc<AtomicBool>,
     forbidWholePolicyReads: Arc<AtomicBool>,
     failAtomic: Arc<AtomicUsize>,
+    failDelete: Arc<AtomicUsize>,
+    journalOpenCount: Arc<AtomicUsize>,
 }
 
 impl MemoryStorageHost {
@@ -34,6 +36,7 @@ impl MemoryStorageHost {
 
 impl RuntimeStorageHost for MemoryStorageHost {
     fn openTransactionDatabase(&self, path: &str) -> operit_host_api::HostResult<Box<dyn operit_host_api::RuntimeSqliteConnection>> {
+        self.journalOpenCount.fetch_add(1, Ordering::SeqCst);
         self.journalHost.open(path)
     }
 
@@ -145,6 +148,7 @@ impl RuntimeStorageHost for MemoryStorageHost {
     }
 
     fn delete(&self, path: &str, _recursive: bool) -> operit_host_api::HostResult<()> {
+        if self.failDelete.swap(0, Ordering::SeqCst) > 0 { return Err(HostError::new("injected delete failure")); }
         let mut files = self
             .files
             .lock()
@@ -176,6 +180,28 @@ impl RuntimeStorageHost for MemoryStorageHost {
             })
             .collect())
     }
+}
+
+/// Endpoint reads and recovery stay projection-only; a later Core explicitly loads its journal.
+#[test]
+fn endpoint_control_reads_do_not_open_sql_and_core_can_load_afterwards() {
+    use crate::NetworkControlStore::NetworkControlStore;
+    use operit_util::RuntimeStorageLayout::RUNTIME_SYNC_DIR_PATH;
+    let host = Arc::new(MemoryStorageHost::default());
+    let endpoint = NetworkControlStore::newNodeLocal(host.clone()).unwrap();
+    let expected = endpoint.initializeCurrentSpace().unwrap();
+    assert!(expected.initialized);
+    assert_eq!(endpoint.currentState().unwrap(), expected);
+    endpoint.currentSpaceOperations().unwrap();
+    let journal = SyncOperationStore::new(host.clone(), RUNTIME_SYNC_DIR_PATH);
+    journal.reloadNetworkControlState().unwrap();
+    assert_eq!(endpoint.currentState().unwrap(), expected);
+    assert_eq!(host.journalOpenCount.load(Ordering::SeqCst), 0);
+    let core = NetworkControlStore::new(host.clone()).unwrap();
+    assert_eq!(core.currentState().unwrap(), expected);
+    assert!(host.journalOpenCount.load(Ordering::SeqCst) > 0);
+    core.admitMember("other-node".into()).unwrap();
+    assert!(core.currentState().unwrap().memberNodeIds.contains("other-node"));
 }
 
 /// Builds one sync operation fixture with explicit compaction semantics.
@@ -334,7 +360,7 @@ fn network_control_acknowledgement_preserves_business_sequences() {
     for operation in [&earlier, &control, &later] {
         store.appendUnobservedOperation(operation).unwrap();
     }
-    store.observeNetworkControlOperation(&control).unwrap();
+    store.observeNetworkControlOperations(std::slice::from_ref(&control)).unwrap();
     // The acknowledged control page no longer exports, while both business
     // operations on either side of its sequence still do.
     let clock = store.localClock().unwrap();
@@ -342,14 +368,14 @@ fn network_control_acknowledgement_preserves_business_sequences() {
         .operationsSince(&clock, &domains, usize::MAX)
         .unwrap();
     assert_eq!(sequences(&pending), vec![5, 7]);
-    store.observeOperation(&earlier).unwrap();
+    store.observeOperations([&earlier]).unwrap();
     let clock = store.localClock().unwrap();
     let pending = store
         .operationsSince(&clock, &domains, usize::MAX)
         .unwrap();
     assert_eq!(pending, vec![later.clone()]);
     // Replaying the same control page stays idempotent.
-    store.observeNetworkControlOperation(&control).unwrap();
+    store.observeNetworkControlOperations(std::slice::from_ref(&control)).unwrap();
     let clock = store.localClock().unwrap();
     assert_eq!(
         store
@@ -358,7 +384,7 @@ fn network_control_acknowledgement_preserves_business_sequences() {
         vec![later]
     );
     // The acknowledgement is restricted to the control domain.
-    assert!(store.observeNetworkControlOperation(&earlier).is_err());
+    assert!(store.observeNetworkControlOperations(std::slice::from_ref(&earlier)).is_err());
 }
 
 /// Verifies cached policy reads immediately apply revocation and match a fresh replay.
@@ -1358,9 +1384,9 @@ fn compaction_does_not_infer_coverage_from_matching_key_sets() {
 }
 
 
-/// A failed legacy import resets the ledger while raw diagnostics remain available.
+/// Raw diagnostics work before opening; a committed reset removes retired inputs.
 #[test]
-fn corrupt_legacy_ledger_resets_without_disabling_raw_diagnostics() {
+fn corrupt_legacy_ledger_is_diagnosable_before_committed_reset_cleanup() {
     let storage = Arc::new(MemoryStorageHost::default());
     let store = SyncOperationStore::new(storage.clone(), "corrupt-journal");
     // Legacy files are compatibility input; current writes use SQLite.
@@ -1377,14 +1403,8 @@ fn corrupt_legacy_ledger_resets_without_disabling_raw_diagnostics() {
     corrupted.extend_from_slice(lines[2]);
     storage.writeBytes(path, &corrupted).unwrap();
 
-    // Close the journal owner before simulating offline file damage. Reopening
-    // must rebuild from disk rather than keeping a process-pinned cache alive.
-    drop(store);
-    let reopened = SyncOperationStore::new(storage.clone(), "corrupt-journal");
-    assert!(reopened.operationsSince(&SyncClock::empty(), &[], 100).unwrap().is_empty());
-
     // The raw scan classifies every line instead of failing on the bad one.
-    let scan = reopened.scanOperationLog("device-a").unwrap();
+    let scan = store.scanOperationLog("device-a").unwrap();
     assert!(scan.exists);
     assert_eq!(scan.totalLines, 3);
     assert_eq!(scan.decodedLines, 2);
@@ -1394,10 +1414,12 @@ fn corrupt_legacy_ledger_resets_without_disabling_raw_diagnostics() {
     assert_eq!(scan.findings[0].byteOffset, lines[0].len() as u64);
     assert_eq!(scan.findings[0].byteLength, "{ this is not json\n".len() as u64);
 
-    reopened.quarantineOperationLines("device-a", &[scan.findings[0].byteOffset]).unwrap();
-    let repaired = reopened.operationsSince(&SyncClock::empty(), &["chat".into()], 100).unwrap();
-    // Repairing retired input does not import old transactions after a committed reset.
-    assert!(repaired.is_empty());
+    drop(store);
+    let reopened = SyncOperationStore::new(storage.clone(), "corrupt-journal");
+    assert!(reopened.operationsSince(&SyncClock::empty(), &[], 100).unwrap().is_empty());
+    assert!(!reopened.scanOperationLog("device-a").unwrap().exists);
+    assert!(reopened.quarantineOperationLines("device-a", &[scan.findings[0].byteOffset]).unwrap().is_empty());
+    assert!(reopened.operationsSince(&SyncClock::empty(), &["chat".into()], 100).unwrap().is_empty());
 }
 
 /// A missing journal scans as absent rather than as an error.
@@ -1447,9 +1469,7 @@ fn quarantine_moves_damaged_lines_to_a_reversible_sidecar() {
     assert!(rescan.findings.is_empty());
     assert_eq!(rescan.decodedLines, 2);
     assert_eq!(rescan.highestSequence, 2);
-    let reopened = SyncOperationStore::new(storage.clone(), "quarantine-journal");
-    assert!(reopened.operationsSince(&SyncClock::empty(), &[], 100).unwrap().is_empty());
-    // The repair preserves the valid legacy lines for diagnostics, not automatic re-import.
+    // The repair preserves valid lines until committed migration cleanup.
     assert_eq!(storage.readBytes(path).unwrap(), original);
 
     // The sidecar preserves the removed bytes verbatim for manual recovery.
@@ -1462,6 +1482,10 @@ fn quarantine_moves_damaged_lines_to_a_reversible_sidecar() {
     // Quarantining offsets that no longer match any line is a no-op.
     let empty = store.quarantineOperationLines("device-a", &[999_999]).unwrap();
     assert!(empty.is_empty());
+    let reopened = SyncOperationStore::new(storage.clone(), "quarantine-journal");
+    assert!(reopened.operationsSince(&SyncClock::empty(), &[], 100).unwrap().is_empty());
+    assert!(!storage.exists(path).unwrap());
+    assert!(!storage.exists("quarantine-journal/operations/device-a.jsonl.quarantine").unwrap());
 }
 
 /// Independent devices sharing a relative sync root must never deduplicate
@@ -2067,11 +2091,11 @@ fn archived_control_replay_is_bounded_and_does_not_publish_preference_outboxes()
     host.forbidWholeJournalReads.store(true, Ordering::SeqCst);
     let reopened = SyncOperationStore::new(host.clone(), RUNTIME_SYNC_DIR_PATH);
     let before = host.readBytes(path).unwrap();
-    assert_eq!(reopened.archivedControlOperations().unwrap(), vec![archived, pending.clone()]);
+    assert_eq!(reopened.archivedControlOperations(false).unwrap(), vec![archived, pending.clone()]);
     assert_eq!(host.readBytes(path).unwrap(), before);
 
     reopened.setExportFloor("device-a", 1).unwrap();
-    assert_eq!(reopened.archivedControlOperations().unwrap(), vec![pending]);
+    assert_eq!(reopened.archivedControlOperations(false).unwrap(), vec![pending]);
     assert_eq!(host.readBytes(path).unwrap(), before);
     // The fixture has a real pending outbox: an explicit export still publishes it.
     assert!(reopened.publishPreferenceOutboxes().unwrap().is_empty());
@@ -2575,7 +2599,7 @@ fn preference_replay_reads_only_its_completed_sql_target() {
     store.receiveOperations(std::slice::from_ref(&pending)).unwrap();
     // An all-history scan would try to parse these unrelated headers and fail.
     store.withJournal(|journal| journal.transaction(|tx| {
-        tx.execute("UPDATE originals SET header='not a JSON header' WHERE target<>?1", vec![crate::SqliteStore::SqliteValue::Text(path.into())])?;
+        tx.execute("UPDATE originals SET header='not a JSON header' WHERE target<>?1", vec![operit_host_api::SqliteValue::Text(path.into())])?;
         Ok(())
     })).unwrap();
     for _ in 0..3 {
@@ -2590,7 +2614,8 @@ fn empty_preference_preparation_only_initializes_requested_owners() {
     use crate::{PreferenceMerge::{self, PreferenceMergeSchema, PreferenceMergeStore},
         PreferencesDataStore::{stringPreferencesKey, CoreNodeStateStore, PreferencesDataStore}};
     let storage = Arc::new(MemoryStorageHost::default());
-    PreferencesDataStore::newWithStorage(storage.clone(), "runtime/plugin_data/space/com.operit.test/existing.preferences.json")
+    let other = "runtime/plugin_data/space/com.operit.test/existing.preferences.json";
+    CoreNodeStateStore::newWithStorage(storage.clone(), other)
         .edit(|values| values.set(&stringPreferencesKey("value"), json!("existing"))).unwrap();
     let path = "runtime/config/preferences/requested.preferences.json";
     CoreNodeStateStore::newWithStorage(storage.clone(), path)
@@ -2598,9 +2623,12 @@ fn empty_preference_preparation_only_initializes_requested_owners() {
     let schema = PreferenceMergeSchema { stores: vec![PreferenceMergeStore::values(path, false,
         |storage, path| PreferencesDataStore::newWithStorage(storage, path))] };
     let outcomes = PreferenceMerge::applyIndependentOperations(storage.clone(), &schema, &[], &[], |_, _| true);
-    assert_eq!(outcomes.len(), 1);
-    assert_eq!(outcomes[0].paths, BTreeSet::from([path.into()]));
-    assert!(outcomes[0].result.is_ok(), "{:?}", outcomes[0].result);
+    assert!(outcomes.iter().all(|o| o.paths == BTreeSet::from([path.into()]) && o.result.is_ok()));
+    assert!(PreferencesDataStore::newWithStorage(storage.clone(), path).isSyncPrepared().unwrap());
+    assert!(!PreferencesDataStore::newWithStorage(storage.clone(), other).isSyncPrepared().unwrap());
+    let history = SyncOperationStore::new(storage.clone(), "runtime/sync").preferenceHistory().unwrap();
+    assert!(!history.is_empty());
+    assert!(history.iter().all(|op| crate::PreferencesDataStore::PreferencesSyncedEntry::operationPath(op).unwrap() == path));
     let writes = storage.writeCount();
     assert!(PreferenceMerge::applyIndependentOperations(storage.clone(), &schema, &[], &[], |_, _| true).is_empty());
     assert_eq!(storage.writeCount(), writes);
@@ -2669,4 +2697,68 @@ fn direct_allocator_skips_reserved_preference_id() {
     assert_eq!(direct.sequence, 2);
     let next = journal.withJournal(|j|j.reserve("allocator-test:preferences", mutation())).unwrap();
     assert_eq!(next.sequence, 3);
+}
+
+/// Blob fingerprints and header checks must also work in builds without SQL owner features.
+#[test]
+fn initialization_blob_identity_and_header_checks_are_shared_by_lightweight_builds() {
+    let host=Arc::new(MemoryStorageHost::default());
+    let store=SyncOperationStore::new(host.clone(),"blob-compat");
+    let original=operation(1,"initialization","runtime/config/test.json","initialize",SyncOperationSemantics::Transaction,json!({"data":"中文\\\""}));
+    let bytes=serde_json::to_vec(&original).unwrap();
+    let hash=crate::Transaction::digest(&original).unwrap();
+    host.writeBytes(&format!("blob-compat/blobs/{hash}"),&bytes).unwrap();
+    let wire=original.with_payload(json!({"transactionBlob":{"contentHash":hash,"size":bytes.len()}}));
+    assert_eq!(crate::Transaction::operation_digest(&original).unwrap(),crate::Transaction::operation_digest(&wire).unwrap());
+    let mut forged=wire.clone();forged.entityId="runtime/other.json".into();
+    assert!(store.receiveOperations(&[forged]).is_err());
+    store.receiveOperations(&[wire.clone()]).unwrap();
+    assert_eq!(store.pendingOperations().unwrap(),vec![wire]);
+}
+
+/// A failed unlink does not roll back an imported ledger; the next open retries cleanup.
+#[test]
+fn legacy_cleanup_retries_after_a_committed_import() {
+    let host = Arc::new(MemoryStorageHost::default());
+    let root = "legacy-cleanup-retry";
+    let path = format!("{root}/operations/old.jsonl");
+    let operation = SyncOperation { opId: "old:1".into(), originDeviceId: "old".into(), sequence: 1,
+        domain: "preferences".into(), entityType: "preference".into(), entityId: "test".into(),
+        operation: "set".into(), semantics: SyncOperationSemantics::Transaction,
+        payload: json!({}), createdAt: 1, schemaVersion: 1 };
+    host.writeBytes(&path, &serde_json::to_vec(&operation).unwrap()).unwrap();
+    host.failDelete.store(1, Ordering::SeqCst);
+    {
+        let store = SyncOperationStore::new(host.clone(), root);
+        assert_eq!(store.operationsSince(&SyncClock::empty(), &[], 10).unwrap(), vec![operation.clone()]);
+        assert!(host.exists(&path).unwrap());
+    }
+    let store = SyncOperationStore::new(host.clone(), root);
+    assert_eq!(store.operationsSince(&SyncClock::empty(), &[], 10).unwrap(), vec![operation]);
+    assert!(!host.exists(&path).unwrap());
+}
+
+/// Upgrade cleanup also runs when an older release already committed the SQL import.
+#[test]
+fn already_migrated_journal_deletes_leftovers_without_reimporting() {
+    let host = Arc::new(MemoryStorageHost::default());
+    let root = "already-migrated";
+    SyncOperationStore::new(host.clone(), root).receipt().unwrap();
+    let paths = ["operations/old.jsonl", "operations/old.jsonl.quarantine", "pending/old.json", "receive_state.json", "devices.json", "preference_outboxes.json"];
+    for path in paths { host.writeBytes(&format!("{root}/{path}"), b"obsolete bytes must not be decoded").unwrap(); }
+    let store = SyncOperationStore::new(host.clone(), root);
+    assert!(store.operationsSince(&SyncClock::empty(), &[], 10).unwrap().is_empty());
+    assert!(paths.iter().all(|path| !host.exists(&format!("{root}/{path}")).unwrap()));
+}
+
+
+#[test]
+fn owned_wire_envelope_preserves_fields_and_moves_large_payloads() {
+    let original = operation(1, "chat", "probe", "upsert", SyncOperationSemantics::Transaction,
+        json!({"text":"x".repeat(1024 * 1024),"nested":[null,true,1,-2,1.5]}));
+    let expected = serde_json::to_value(&original).unwrap();
+    let pointer = original.payload["text"].as_str().unwrap().as_ptr();
+    let moved = original.intoValue().unwrap();
+    assert_eq!(moved, expected);
+    assert_eq!(moved["payload"]["text"].as_str().unwrap().as_ptr(), pointer);
 }

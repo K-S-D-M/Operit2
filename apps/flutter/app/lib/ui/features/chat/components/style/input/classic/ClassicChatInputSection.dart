@@ -21,6 +21,7 @@ import '../common/ChatAttachmentMenuPopup.dart';
 import '../common/ChatComposerSendActionMenu.dart';
 import '../common/ChatComposerSlotHost.dart';
 import '../common/ChatInputEnterShortcuts.dart';
+import '../common/ChatMentionSuggestionPopup.dart';
 import '../common/ChatPendingMessageQueuePanel.dart';
 import '../common/ChatPastedImageHandler.dart';
 import '../common/InputProcessingStatusLane.dart';
@@ -55,7 +56,7 @@ class ClassicChatInputSection extends StatefulWidget {
     this.onGuidePendingQueueMessage,
     this.attachments = const <AttachmentInfo>[],
     this.onRemoveAttachment,
-    this.onInsertAttachment,
+    this.onPreviewAttachment,
     this.onAttachImage,
     this.onTakePhoto,
     this.onPluginAttachment,
@@ -94,7 +95,7 @@ class ClassicChatInputSection extends StatefulWidget {
   final ValueChanged<int>? onGuidePendingQueueMessage;
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
   final VoidCallback? onAttachImage;
   final VoidCallback? onTakePhoto;
   final ChatAttachmentCompletion? onPluginAttachment;
@@ -115,11 +116,9 @@ class ClassicChatInputSection extends StatefulWidget {
 class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
     with WidgetsBindingObserver {
   final GlobalKey _inputMenuPopupTargetKey = GlobalKey();
-  final GlobalKey _mentionPopupTargetKey = GlobalKey();
   final GlobalKey _attachmentPopupTargetKey = GlobalKey();
   OverlayEntry? _inputMenuPopupEntry;
   int _inputMenuContextGeneration = 0;
-  OverlayEntry? _mentionPopupEntry;
   OverlayEntry? _attachmentPopupEntry;
   bool _draggingFiles = false;
   bool _inputExpanded = false;
@@ -130,9 +129,6 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     widget.controller.addListener(_handleInputChanged);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _syncMentionSuggestionPopup();
-    });
   }
 
   /// Rebinds input listeners and expires menu requests when their chat changes.
@@ -148,9 +144,6 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
       oldWidget.controller.removeListener(_handleInputChanged);
       widget.controller.addListener(_handleInputChanged);
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _syncMentionSuggestionPopup();
-    });
   }
 
   /// Refreshes action button state after text changes.
@@ -171,48 +164,7 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
   /// Invalidates the placement of every open input popup.
   void _markOpenPopupsForBuild() {
     _inputMenuPopupEntry?.markNeedsBuild();
-    _mentionPopupEntry?.markNeedsBuild();
     _attachmentPopupEntry?.markNeedsBuild();
-  }
-
-  /// Synchronizes the mention suggestion overlay with the active input token.
-  void _syncMentionSuggestionPopup() {
-    if (!mounted) {
-      return;
-    }
-    if (widget.mentionSuggestionPanel == null) {
-      _dismissMentionSuggestionPopup();
-      return;
-    }
-    if (_mentionPopupEntry == null) {
-      _showMentionSuggestionPopup();
-    } else {
-      _mentionPopupEntry!.markNeedsBuild();
-    }
-  }
-
-  /// Shows the mention suggestion panel above the rendered input surface.
-  void _showMentionSuggestionPopup() {
-    final overlay = Overlay.of(context);
-    _mentionPopupEntry = OverlayEntry(
-      builder: (context) {
-        final placement = _popupPlacement(
-          context,
-          targetKey: _mentionPopupTargetKey,
-          alignEnd: false,
-          maxWidth: 700,
-        );
-        return _ClassicPopupShell(
-          left: placement.left,
-          bottom: placement.bottom,
-          width: placement.width,
-          maxHeight: placement.maxHeight,
-          onDismiss: _dismissMentionSuggestionPopup,
-          child: widget.mentionSuggestionPanel!,
-        );
-      },
-    );
-    overlay.insert(_mentionPopupEntry!);
   }
 
   /// Toggles the input height while preserving the active draft and focus.
@@ -283,7 +235,8 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
             showNativeStatistics: false,
             leadingChildren: <Widget>[
               AgentModelMenuSection(
-                viewModel: widget.viewModel,
+                viewModel: viewModel,
+                currentChatId: chatId,
                 onDismiss: _dismissInputMenuPopup,
               ),
               const Divider(height: 1),
@@ -418,12 +371,6 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
     _inputMenuPopupEntry = null;
   }
 
-  /// Removes the mention suggestion popup.
-  void _dismissMentionSuggestionPopup() {
-    _mentionPopupEntry?.remove();
-    _mentionPopupEntry = null;
-  }
-
   /// Removes the attachment popup.
   void _dismissAttachmentPopup() {
     _attachmentPopupEntry?.remove();
@@ -437,7 +384,6 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
     WidgetsBinding.instance.removeObserver(this);
     widget.controller.removeListener(_handleInputChanged);
     _dismissInputMenuPopup();
-    _dismissMentionSuggestionPopup();
     _dismissAttachmentPopup();
     super.dispose();
   }
@@ -482,8 +428,8 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
                   onGuideMessage: widget.onGuidePendingQueueMessage,
                   canGuide: processing,
                 ),
-              KeyedSubtree(
-                key: _mentionPopupTargetKey,
+              ChatMentionSuggestionPopup(
+                panel: widget.mentionSuggestionPanel,
                 child: ThemeComposerCard(
                   inputStyle: ThemePreferenceDefaults.INPUT_STYLE_CLASSIC,
                   floating: snapshot.chatInputFloating,
@@ -502,7 +448,7 @@ class _ClassicChatInputSectionState extends State<ClassicChatInputSection>
                           child: _ClassicAttachmentStrip(
                             attachments: widget.attachments,
                             onRemoveAttachment: widget.onRemoveAttachment,
-                            onInsertAttachment: widget.onInsertAttachment,
+                            onPreviewAttachment: widget.onPreviewAttachment,
                           ),
                         ),
                       _ClassicInputBody(
@@ -1063,12 +1009,12 @@ class _ClassicAttachmentStrip extends StatelessWidget {
   const _ClassicAttachmentStrip({
     required this.attachments,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
   });
 
   final List<AttachmentInfo> attachments;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
 
   /// Builds the horizontal attachment chip strip.
   @override
@@ -1089,7 +1035,7 @@ class _ClassicAttachmentStrip extends StatelessWidget {
             attachment: attachment,
             colorScheme: colorScheme,
             onRemoveAttachment: onRemoveAttachment,
-            onInsertAttachment: onInsertAttachment,
+            onPreviewAttachment: onPreviewAttachment,
           );
         },
       ),
@@ -1102,13 +1048,13 @@ class _ClassicAttachmentChip extends StatelessWidget {
     required this.attachment,
     required this.colorScheme,
     required this.onRemoveAttachment,
-    required this.onInsertAttachment,
+    required this.onPreviewAttachment,
   });
 
   final AttachmentInfo attachment;
   final ColorScheme colorScheme;
   final ValueChanged<String>? onRemoveAttachment;
-  final ValueChanged<AttachmentInfo>? onInsertAttachment;
+  final ValueChanged<AttachmentInfo>? onPreviewAttachment;
 
   /// Builds one attachment chip.
   @override
@@ -1129,9 +1075,9 @@ class _ClassicAttachmentChip extends StatelessWidget {
                   borderRadius: BorderRadius.circular(12),
                   clipBehavior: Clip.antiAlias,
                   child: InkWell(
-                    onTap: onInsertAttachment == null
+                    onTap: onPreviewAttachment == null
                         ? null
-                        : () => onInsertAttachment!(attachment),
+                        : () => onPreviewAttachment!(attachment),
                     child: ChatAttachmentImagePreview(
                       attachmentPath: attachment.filePath,
                       fileName: attachment.fileName,
@@ -1165,9 +1111,9 @@ class _ClassicAttachmentChip extends StatelessWidget {
         ),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: onInsertAttachment == null
+          onTap: onPreviewAttachment == null
               ? null
-              : () => onInsertAttachment!(attachment),
+              : () => onPreviewAttachment!(attachment),
           child: SizedBox(
             height: 26,
             child: Row(

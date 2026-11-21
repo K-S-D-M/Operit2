@@ -7,6 +7,21 @@ use std::time::Duration;
 const CHAT_ID: &str = "chat-variants";
 const MESSAGE_TIMESTAMP: i64 = 123;
 
+/// Depth lookup preserves request order and counts unselected messages, unsaved snapshots and new inserts correctly.
+#[test]
+fn display_depth_lookup_reads_only_ordered_message_identities() {
+    let _guard = DATABASE_MUTEX.lock().unwrap();
+    let (manager, _) = chatOrderFixture("display-depth-identities");
+    for timestamp in [10, 20, 30] {
+        manager.addMessage("recent".into(), ChatMessage::new_with_markdown_timestamp("ai".into(), "body".into(), timestamp)).unwrap();
+    }
+    manager.addMessage("older".into(), ChatMessage::new_with_markdown_timestamp("ai".into(), "other chat".into(), 100)).unwrap();
+    assert_eq!(manager.loadChatMessageDepths("recent", &[30, 10, 15, 40, 0, 20, 20]).unwrap(), [0, 2, 2, 0, 3, 1, 1]);
+    assert!(manager.loadChatMessageDepths("recent", &[]).unwrap().is_empty());
+    manager.addMessage("recent".into(), ChatMessage::new_with_markdown_timestamp("user".into(), "later".into(), 50)).unwrap();
+    assert_eq!(manager.loadChatMessageDepths("recent", &[30, 50]).unwrap(), [1, 0]);
+}
+
 /// Keeps a completed reply's totals when an older asynchronous summary refreshes the window.
 #[test]
 fn summary_context_window_update_preserves_completed_reply_totals() {
@@ -194,7 +209,7 @@ fn missing_workspace_chat_deletion_preserves_lock_policy_and_removes_history() {
     assert!(database.chatDao().getChatById(CHAT_ID).unwrap().is_none());
     assert!(database
         .messageDao()
-        .getMessagesForChat(CHAT_ID)
+        .getMessagesForChatAsc(CHAT_ID, 80)
         .unwrap()
         .is_empty());
     assert!(histories.value().is_empty());
@@ -520,7 +535,7 @@ fn promote_chat_to_root_preserves_contents_and_publishes_metadata() {
     let mut expected = database.chatDao().getChatById("recent").unwrap().unwrap();
     let parent = database.chatDao().getChatById("pinned").unwrap();
     let child = database.chatDao().getChatById("older").unwrap();
-    let messages = manager.loadChatMessages("recent").unwrap();
+    let messages = manager.loadChatMessagesRange("recent".to_string(), "asc".to_string(), 0, 79).unwrap();
     let clock = manager.syncClock().unwrap();
     let histories = manager.chatHistoriesFlow().unwrap();
 
@@ -532,7 +547,7 @@ fn promote_chat_to_root_preserves_contents_and_publishes_metadata() {
     assert_eq!(promoted, expected);
     assert_eq!(database.chatDao().getChatById("pinned").unwrap(), parent);
     assert_eq!(database.chatDao().getChatById("older").unwrap(), child);
-    assert_eq!(manager.loadChatMessages("recent").unwrap(), messages);
+    assert_eq!(manager.loadChatMessagesRange("recent".to_string(), "asc".to_string(), 0, 79).unwrap(), messages);
     assert!(manager.getBranches("pinned".to_string()).unwrap().is_empty());
     assert_eq!(manager.getBranches("recent".to_string()).unwrap()[0].id, "older");
     assert_eq!(histories.value().into_iter().find(|chat| chat.id == "recent").unwrap().parentChatId, None);
@@ -766,7 +781,7 @@ fn failed_message_update_keeps_the_complete_previous_revision() {
     manager
         .addMessage("older".to_string(), message.clone())
         .unwrap();
-    let before = manager.loadChatMessages("older").unwrap();
+    let before = manager.loadChatMessagesRange("older".to_string(), "asc".to_string(), 0, 79).unwrap();
     let clockBefore = manager.syncClock().unwrap();
     database.store().executeBatch(
         "CREATE TRIGGER reject_parts BEFORE INSERT ON message_parts BEGIN SELECT RAISE(ABORT, 'injected part failure'); END;"
@@ -774,7 +789,7 @@ fn failed_message_update_keeps_the_complete_previous_revision() {
     message.provider = "changed-provider".to_string();
     message.replace_with_markdown("changed".to_string());
     assert!(manager.updateMessage("older".to_string(), message).is_err());
-    assert_eq!(manager.loadChatMessages("older").unwrap(), before);
+    assert_eq!(manager.loadChatMessagesRange("older".to_string(), "asc".to_string(), 0, 79).unwrap(), before);
     assert_eq!(manager.syncClock().unwrap(), clockBefore);
 }
 
@@ -812,7 +827,7 @@ fn failed_variant_insert_does_not_leave_an_empty_revision() {
     manager
         .addMessage("older".to_string(), message.clone())
         .unwrap();
-    let before = manager.loadChatMessages("older").unwrap();
+    let before = manager.loadChatMessagesRange("older".to_string(), "asc".to_string(), 0, 79).unwrap();
     let clockBefore = manager.syncClock().unwrap();
     database.store().executeBatch(
         "CREATE TRIGGER reject_variant_parts BEFORE INSERT ON message_parts WHEN NEW.variantIndex > 0 BEGIN SELECT RAISE(ABORT, 'injected variant failure'); END;"
@@ -825,7 +840,7 @@ fn failed_variant_insert_does_not_leave_an_empty_revision() {
         .getVariantsForMessage("older", 100)
         .unwrap()
         .is_empty());
-    assert_eq!(manager.loadChatMessages("older").unwrap(), before);
+    assert_eq!(manager.loadChatMessagesRange("older".to_string(), "asc".to_string(), 0, 79).unwrap(), before);
     assert_eq!(manager.syncClock().unwrap(), clockBefore);
     database
         .store()
@@ -853,7 +868,7 @@ fn failed_message_deletions_preserve_parts_and_variants() {
         manager
             .addMessageVariant("older".to_string(), 100, message)
             .unwrap();
-        let before = manager.loadChatMessages("older").unwrap();
+        let before = manager.loadChatMessagesRange("older".to_string(), "asc".to_string(), 0, 79).unwrap();
         let clockBefore = manager.syncClock().unwrap();
         database.store().executeBatch(
             "CREATE TRIGGER reject_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END;"
@@ -865,7 +880,7 @@ fn failed_message_deletions_preserve_parts_and_variants() {
             _ => unreachable!(),
         };
         assert!(result.is_err());
-        assert_eq!(manager.loadChatMessages("older").unwrap(), before);
+        assert_eq!(manager.loadChatMessagesRange("older".to_string(), "asc".to_string(), 0, 79).unwrap(), before);
         assert_eq!(
             database
                 .messagePartDao()
@@ -963,7 +978,7 @@ fn incomplete_import_cannot_commit_a_message_without_parts() {
     manager
         .addMessage("older".to_string(), message.clone())
         .unwrap();
-    let before = manager.loadChatMessages("older").unwrap();
+    let before = manager.loadChatMessagesRange("older".to_string(), "asc".to_string(), 0, 79).unwrap();
     let clockBefore = manager.syncClock().unwrap();
     let chat = database.chatDao().getChatById("older").unwrap().unwrap();
     let message = MessageEntity::fromChatMessage("older".to_string(), message, 0, 0);
@@ -971,6 +986,6 @@ fn incomplete_import_cannot_commit_a_message_without_parts() {
         .syncStore
         .commitImportedChatRecords(chat, vec![message], Vec::new(), Vec::new())
         .is_err());
-    assert_eq!(manager.loadChatMessages("older").unwrap(), before);
+    assert_eq!(manager.loadChatMessagesRange("older".to_string(), "asc".to_string(), 0, 79).unwrap(), before);
     assert_eq!(manager.syncClock().unwrap(), clockBefore);
 }

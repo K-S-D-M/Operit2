@@ -4,12 +4,12 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
-import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
 import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
+import '../../../../core/runtime/RuntimeFileBytes.dart';
 import '../../../theme/OperitFormStyles.dart';
 import '../../../theme/OperitGlassSurface.dart';
 import '../components/EmptyState.dart';
@@ -515,6 +515,16 @@ class _ArtifactPublishScreenState extends State<ArtifactPublishScreen> {
                       },
               ),
               const SizedBox(height: 12),
+              if (source != null) ...<Widget>[
+                InputDecorator(
+                  decoration: const InputDecoration(
+                    labelText: 'API 版本',
+                    border: OutlineInputBorder(),
+                  ),
+                  child: Text(source.apiVersion ?? '1.0.0'),
+                ),
+                const SizedBox(height: 12),
+              ],
               Text('发布资源来源', style: Theme.of(context).textTheme.titleSmall),
               const SizedBox(height: 8),
               SegmentedButton<_ArtifactPublishAssetSource>(
@@ -591,7 +601,10 @@ class _ArtifactPublishScreenState extends State<ArtifactPublishScreen> {
                   const SizedBox(height: 12),
                   OperitFormStyles.dropdownButtonFormField<String>(
                     context,
-                    key: ValueKey<String?>(_selectedGitHubReleaseTag),
+                    key: ValueKey((
+                      'github-release',
+                      _selectedGitHubReleaseTag,
+                    )),
                     initialValue: _selectedGitHubReleaseTag,
                     isExpanded: true,
                     style: OperitFormStyles.dropdownTextStyle(context),
@@ -626,7 +639,11 @@ class _ArtifactPublishScreenState extends State<ArtifactPublishScreen> {
                   const SizedBox(height: 12),
                   OperitFormStyles.dropdownButtonFormField<String>(
                     context,
-                    key: ValueKey<String?>(_selectedGitHubReleaseAssetName),
+                    key: ValueKey((
+                      'github-release-asset',
+                      _selectedGitHubReleaseTag,
+                      _selectedGitHubReleaseAssetName,
+                    )),
                     initialValue: _selectedGitHubReleaseAssetName,
                     isExpanded: true,
                     style: OperitFormStyles.dropdownTextStyle(context),
@@ -1334,7 +1351,7 @@ Future<_PublishResult> _publishArtifact({
       clients: clients,
       asset: asset,
     );
-    final localBytes = await XFile(source.sourcePath).readAsBytes();
+    final localBytes = await readRuntimeFileBytes(clients, source.sourcePath);
     final remoteSha256 = crypto.sha256.convert(remoteBytes).toString();
     if (remoteSha256 != crypto.sha256.convert(localBytes).toString()) {
       throw StateError('所选 GitHub Release 资产与本地插件文件不一致。');
@@ -1463,17 +1480,41 @@ Future<_ForgeRepoInfo> _ensureForgeRepository({
   );
 }
 
+/// Initializes the README using its current SHA when the file already exists.
 Future<void> _createReadme({
   required GeneratedCoreProxyClients clients,
   required String owner,
   required String repo,
 }) async {
+  final uri = Uri.https(
+    'api.github.com',
+    '/repos/$owner/$repo/contents/README.md',
+  );
+  // Repository size can still be zero after initialization; read the file
+  // before writing so GitHub receives the SHA required for an existing README.
+  final existingResponse = await _githubHttpRequest(
+    clients: clients,
+    method: 'GET',
+    uri: uri,
+  );
+  final String? existingSha;
+  if (_isSuccess(existingResponse.statusCode)) {
+    final existing = jsonDecode(existingResponse.body) as Map<String, Object?>;
+    existingSha = existing['sha'] as String;
+  } else if (existingResponse.statusCode == 404) {
+    existingSha = null;
+  } else {
+    throw StateError(
+      'HTTP ${existingResponse.statusCode}: ${_summarizeHttpBody(existingResponse.body)}',
+    );
+  }
   await _githubJsonRequest(
     clients: clients,
     method: 'PUT',
-    uri: Uri.https('api.github.com', '/repos/$owner/$repo/contents/README.md'),
+    uri: uri,
     body: <String, Object?>{
       'message': 'Initialize OperitForge repository',
+      'sha': ?existingSha,
       'content': base64Encode(
         utf8.encode(
           '# OperitForge\n\nThis repository stores release assets published from Operit.\n',

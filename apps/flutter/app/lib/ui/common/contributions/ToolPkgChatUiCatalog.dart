@@ -2,7 +2,8 @@
 
 import '../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
-import 'ChatUiContributionModels.dart';
+import '../../features/chat/components/workspace/WorkspaceOverviewModels.dart';
+import 'ChatModelSelection.dart';
 
 /// Reads registered display contracts without retaining plugin business records.
 class ToolPkgChatUiCatalog {
@@ -12,12 +13,102 @@ class ToolPkgChatUiCatalog {
   final GeneratedCoreProxyClients clients;
   final bool useEnglish;
 
+  /// Reads model rules from the actual execution configuration owner for this chat.
+  Future<ChatModelSelection> loadModelSelection({
+    required String? chatId,
+  }) async {
+    final global = await clients.preferencesFunctionalConfigManager
+        .getModelBindingForFunction(functionType: core_proxy.FunctionType.chat);
+    final owners = await _owners('chat.configuration.resolve');
+    if (owners.isEmpty) {
+      return ChatModelSelection(globalBinding: global, participants: const []);
+    }
+    if (owners.length != 1) {
+      throw StateError('Multiple chat configuration owners.');
+    }
+    final owner = owners.single;
+    const api = 'chat.model.selection';
+    final apis = await clients.application
+        .packageManager()
+        .getToolPkgPublicApis(packageName: owner);
+    if (!apis.contains(api)) {
+      throw StateError('Chat configuration owner does not publish $api.');
+    }
+    final data = _object(
+      await _invoke(owner, api, <String, Object?>{
+        'chatId': chatId,
+        'defaultModelBinding': <String, Object?>{
+          'providerId': global.providerId,
+          'modelId': global.modelId,
+        },
+      }),
+      'chat model selection',
+    );
+    _fields(data, const {'participants'}, 'chat model selection');
+    final participants = <ChatParticipantModel>[];
+    final ids = <String>{};
+    for (final raw in _list(data['participants'], 'participants')) {
+      final participant = _object(raw, 'participant model');
+      _fields(participant, const {
+        'id',
+        'name',
+        'binding',
+        'followsGlobal',
+      }, 'participant model');
+      final id = _identity(participant['id'], 'participant.id');
+      if (!ids.add(id)) {
+        throw const FormatException('Duplicate model participant.');
+      }
+      final followsGlobal = participant['followsGlobal'];
+      if (followsGlobal is! bool) {
+        throw const FormatException('followsGlobal must be a boolean.');
+      }
+      final binding = _object(participant['binding'], 'model binding');
+      _fields(binding, const {'providerId', 'modelId'}, 'model binding');
+      final providerId = _identity(binding['providerId'], 'providerId');
+      final modelId = _identity(binding['modelId'], 'modelId');
+      if (followsGlobal &&
+          (providerId != global.providerId || modelId != global.modelId)) {
+        throw const FormatException(
+          'Global participant has a different model binding.',
+        );
+      }
+      participants.add(
+        ChatParticipantModel(
+          id: id,
+          name: _identity(participant['name'], 'participant.name'),
+          followsGlobal: followsGlobal,
+          binding: core_proxy.FunctionModelBinding(
+            providerId: providerId,
+            modelId: modelId,
+            followsChat: false,
+          ),
+        ),
+      );
+    }
+    if (participants.isEmpty) {
+      throw const FormatException('Chat model selection has no participants.');
+    }
+    return ChatModelSelection(
+      globalBinding: global,
+      participants: List.unmodifiable(participants),
+    );
+  }
+
   /// Resolves selector, identity, and background display data from actual owners.
-  Future<ChatUiContext> loadContext({required String? chatId}) async {
+  Future<
+    ({
+      core_proxy.ChatDisplayIdentity? identity,
+      ({core_proxy.ToolPkgUiRoute route, Object? input})? avatarAction,
+      String? backgroundUri,
+    })
+  >
+  loadContext({required String? chatId}) async {
     const api = 'chat.context.actions';
     final owners = await _owners(api);
     final routes = await _routes();
-    ChatUiIdentity? identity;
+    core_proxy.ChatDisplayIdentity? identity;
+    ({core_proxy.ToolPkgUiRoute route, Object? input})? resolvedAvatarAction;
     String? backgroundUri;
     for (final owner in owners) {
       final data = _object(
@@ -47,13 +138,10 @@ class ToolPkgChatUiCatalog {
           );
         }
         final avatarAction = display['avatarAction'] ?? display['action'];
-        identity = ChatUiIdentity(
-          title: _text(display['title'], 'identity.title'),
-          avatarUri: _nullableText(display['avatarUri'], 'identity.avatarUri'),
-          avatarAction: avatarAction == null
-              ? null
-              : _action(avatarAction, owner, routes),
-        );
+        identity = core_proxy.ChatDisplayIdentity.fromJson(display);
+        resolvedAvatarAction = avatarAction == null
+            ? null
+            : _action(avatarAction, owner, routes);
       }
       final background = _nullableText(data['backgroundUri'], 'backgroundUri');
       if (background != null) {
@@ -63,20 +151,30 @@ class ToolPkgChatUiCatalog {
         backgroundUri = background;
       }
     }
-    return ChatUiContext(identity: identity, backgroundUri: backgroundUri);
+    return (
+      identity: identity,
+      avatarAction: resolvedAvatarAction,
+      backgroundUri: backgroundUri,
+    );
   }
 
-  /// Projects only the provided generic history summaries into owner sections.
-  Future<List<ChatUiSection>> loadSections({
+  /// Reads owner sections directly into the workspace's display records.
+  Future<List<WorkspaceContributionUsage>> loadWorkspaceUsages({
     required List<core_proxy.ChatHistoryListItem> chats,
   }) async {
     const api = 'chat.list.sections';
     final owners = await _owners(api);
     final routes = await _routes();
     final knownChatIds = chats.map((chat) => chat.id).toSet();
-    final sections = <ChatUiSection>[];
+    final sections = <WorkspaceContributionUsage>[];
     final payload = <String, Object?>{
-      'chats': chats.map(chatUiHistorySummary).toList(growable: false),
+      'chats': chats
+          .map(
+            (chat) => chat.toJson()
+              ..remove('group')
+              ..remove('parentChatId'),
+          )
+          .toList(growable: false),
     };
     for (final owner in owners) {
       final data = _object(await _invoke(owner, api, payload), 'chat sections');
@@ -104,20 +202,21 @@ class ToolPkgChatUiCatalog {
             'A section contains duplicate or unknown chat IDs.',
           );
         }
+        final preview = _action(section['preview'], owner, routes);
         sections.add(
-          ChatUiSection(
+          WorkspaceContributionUsage(
             ownerPackageName: owner,
-            id: id,
+            sectionId: id,
             title: _text(section['title'], 'section.title'),
             avatarUri: _nullableText(section['avatarUri'], 'section.avatarUri'),
-            chatIds: List<String>.unmodifiable(chatIds),
-            selection: section['selection'],
-            preview: _action(section['preview'], owner, routes),
+            conversationCount: chatIds.length,
+            previewRoute: preview.route,
+            previewInput: preview.input,
           ),
         );
       }
     }
-    return List<ChatUiSection>.unmodifiable(sections);
+    return List<WorkspaceContributionUsage>.unmodifiable(sections);
   }
 
   /// Invokes the same section owner's binding API only after a chat exists.
@@ -169,7 +268,7 @@ class ToolPkgChatUiCatalog {
       );
 
   /// Accepts only the generic route and input fields of a declared presentation.
-  ChatUiAction _action(
+  ({core_proxy.ToolPkgUiRoute route, Object? input}) _action(
     Object? raw,
     String owner,
     List<core_proxy.ToolPkgUiRoute> routes,
@@ -180,7 +279,7 @@ class ToolPkgChatUiCatalog {
   }
 
   /// Requires exactly one route belonging to the actual publishing package.
-  ChatUiAction _resolveAction(
+  ({core_proxy.ToolPkgUiRoute route, Object? input}) _resolveAction(
     String owner,
     Object? routeId,
     Object? input,
@@ -193,7 +292,7 @@ class ToolPkgChatUiCatalog {
     if (matches.length != 1) {
       throw StateError('Unregistered or ambiguous owner route: $owner/$id');
     }
-    return ChatUiAction(route: matches.single, input: input);
+    return (route: matches.single, input: input);
   }
 
   /// Requires a JSON object without guessing field aliases or serializing DTOs.

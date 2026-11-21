@@ -17,7 +17,7 @@ use operit_runtime::core::application::OperitApplication::OperitApplication;
 use operit_runtime::plugins::toolpkg::ToolPkgChatViewHookBridge::ToolPkgChatViewHookBridge;
 use operit_runtime::plugins::toolpkg::ToolPkgHookBridgeSupport::ToolPkgBridgeRuntime;
 use operit_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager;
-use operit_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
+
 use serde_json::{json, Value};
 
 const MODES: [&str; 2] = ["com.operit.plan_mode_bundle", "com.operit.goal_mode_bundle"];
@@ -46,7 +46,7 @@ impl SystemOperationHost for TestSystemLocale {
         sendNotification(request: &SystemNotificationRequest) -> ();
         modifySystemSetting(namespace: &str, setting: &str, value: &str) -> SystemSettingData;
         getSystemSetting(namespace: &str, setting: &str) -> SystemSettingData;
-        installApp(path: &str) -> AppOperationData;
+        installApp(source: &dyn operit_host_api::FileSource, timing: operit_host_api::AppInstallTiming) -> AppOperationData;
         uninstallApp(packageName: &str) -> AppOperationData;
         listInstalledApps(includeSystemApps: bool) -> AppListData;
         startApp(packageName: &str) -> AppOperationData;
@@ -56,7 +56,7 @@ impl SystemOperationHost for TestSystemLocale {
         getDeviceLocation(timeout: i32, highAccuracy: bool, includeAddress: bool) -> LocationData;
         getDeviceInfo() -> DeviceInfoData;
         captureScreenshot() -> String;
-        recognizeText(imagePath: &str, language: OCRLanguage, quality: OCRQuality) -> String;
+        recognizeText(imagePath: &dyn operit_host_api::FileSource, language: OCRLanguage, quality: OCRQuality) -> String;
     }
 }
 
@@ -319,10 +319,7 @@ async fn space_modes_survive_plugin_reload_without_workspace_state() {
             let workspace_root = root.join("workspaces");
             std::fs::create_dir_all(&runtime_root).unwrap();
             std::fs::create_dir_all(&workspace_root).unwrap();
-            setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(
-                runtime_root.clone(),
-                workspace_root.clone(),
-            ));
+
             let storage = Arc::new(NativeRuntimeStorageHost::new(runtime_root, workspace_root));
             let host = HostManager {
                 fileSystemHost: Some(Arc::new(PosixFileSystemHost::new())),

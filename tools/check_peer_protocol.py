@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that published protocol revisions are immutable and changes bump the version.
 
-Cargo's node-runtime build verifies the actual source + generated-route SHA-256.
+Cargo's node-runtime build verifies the annotated route contract SHA-256.
 This check compares the revision ledger against the PR base to prevent replacing
 an old hash without advancing the protocol version.
 """
@@ -15,26 +15,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def check_revisions(current, previous=None):
+    """Require immutable history and increasing compatibility versions."""
     revisions = current["revisions"]
     last = 0
-    hashes = set()
     for revision in revisions:
         version, fingerprint = revision["version"], revision["hash"]
         if (type(version) is not int or not last < version <= 0xFFFFFFFF
                 or len(fingerprint) != 64
-                or any(c not in "0123456789abcdef" for c in fingerprint)
-                or fingerprint in hashes):
-            raise ValueError("Protocol revisions require increasing positive u32 versions and unique lowercase SHA-256 hashes")
+                or any(c not in "0123456789abcdef" for c in fingerprint)):
+            raise ValueError("Protocol revisions require increasing positive u32 versions and lowercase SHA-256 hashes")
         last = version
-        hashes.add(fingerprint)
     if not revisions:
         raise ValueError("Protocol revisions cannot be empty")
     if previous is not None:
         old = previous["revisions"]
         if revisions[:len(old)] != old:
             raise ValueError("Published protocol revisions are immutable; append a revision with a higher version")
-        if any(current.get(key) != previous.get(key) for key in ("sources", "schemaRoots")) and len(revisions) <= len(old):
-            raise ValueError("Changing protocol coverage requires a new protocol revision")
 
 
 def main():

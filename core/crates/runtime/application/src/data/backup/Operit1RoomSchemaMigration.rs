@@ -26,20 +26,21 @@ impl Operit1RoomSchemaVersion {
 }
 
 /// Identifies one explicit Operit1 Room to Operit2 SQLite archive bridge.
+/// Schema 30 restores nullable chat group columns; the archive already preserves those values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Operit1ToOperit2ChatArchiveBridge {
-    Operit1RoomV10ToOperit2SqliteV29,
-    Operit1RoomV20ToOperit2SqliteV29,
-    Operit1RoomV21ToOperit2SqliteV29,
+    Operit1RoomV10ToOperit2SqliteV30,
+    Operit1RoomV20ToOperit2SqliteV30,
+    Operit1RoomV21ToOperit2SqliteV30,
 }
 
 impl Operit1ToOperit2ChatArchiveBridge {
     /// Returns the exact Operit2 SQLite target schema required by this bridge.
     const fn operit2TargetSchemaVersion(self) -> i32 {
         match self {
-            Self::Operit1RoomV10ToOperit2SqliteV29 => 29,
-            Self::Operit1RoomV20ToOperit2SqliteV29 => 29,
-            Self::Operit1RoomV21ToOperit2SqliteV29 => 29,
+            Self::Operit1RoomV10ToOperit2SqliteV30 => 30,
+            Self::Operit1RoomV20ToOperit2SqliteV30 => 30,
+            Self::Operit1RoomV21ToOperit2SqliteV30 => 30,
         }
     }
 }
@@ -67,13 +68,13 @@ fn selectOperit1ToOperit2ChatArchiveBridge(
     };
     let bridge = match sourceSchemaVersion {
         Operit1RoomSchemaVersion::V10 => {
-            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV10ToOperit2SqliteV29
+            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV10ToOperit2SqliteV30
         }
         Operit1RoomSchemaVersion::V20 => {
-            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV20ToOperit2SqliteV29
+            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV20ToOperit2SqliteV30
         }
         Operit1RoomSchemaVersion::V21 => {
-            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV29
+            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV30
         }
     };
     let targetSchemaVersion = bridge.operit2TargetSchemaVersion();
@@ -274,16 +275,16 @@ pub(crate) mod tests {
 
         assert_eq!(
             bridge,
-            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV10ToOperit2SqliteV29
+            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV10ToOperit2SqliteV30
         );
-        assert_eq!(bridge.operit2TargetSchemaVersion(), 29);
+        assert_eq!(bridge.operit2TargetSchemaVersion(), 30);
         assert_eq!(
             readOperit1RoomSchemaVersion(&mut connection).expect("schema version must be readable"),
             10
         );
     }
 
-    /// Selects the version-20 to version-29 bridge without rewriting the source schema.
+    /// Selects the version-20 to version-30 bridge without rewriting the source schema.
     #[test]
     fn accepts_operit1_room_20() {
         let mut connection = TestSqliteConnection::new();
@@ -292,13 +293,13 @@ pub(crate) mod tests {
         );
 
         let bridge = prepareOperit1RoomImport(&mut connection)
-            .expect("Operit1 schema 20 must select the version-20 to version-29 bridge");
+            .expect("Operit1 schema 20 must select the version-20 to version-30 bridge");
 
         assert_eq!(
             bridge,
-            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV20ToOperit2SqliteV29
+            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV20ToOperit2SqliteV30
         );
-        assert_eq!(bridge.operit2TargetSchemaVersion(), 29);
+        assert_eq!(bridge.operit2TargetSchemaVersion(), 30);
         assert_eq!(
             readOperit1RoomSchemaVersion(&mut connection).expect("schema version must be readable"),
             20
@@ -333,8 +334,12 @@ pub(crate) mod tests {
 
         assert_eq!(
             bridge,
-            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV29
+            Operit1ToOperit2ChatArchiveBridge::Operit1RoomV21ToOperit2SqliteV30
         );
-        assert_eq!(bridge.operit2TargetSchemaVersion(), 29);
+        assert_eq!(bridge.operit2TargetSchemaVersion(), 30);
+        assert_eq!(
+            readOperit1RoomSchemaVersion(&mut connection).expect("schema version must be readable"),
+            21
+        );
     }
 }

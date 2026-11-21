@@ -131,7 +131,7 @@ fn settings_fetcher_preserves_opencode_routes_headers_and_model_ids() {
         provider.apiKey = apiKey.to_string();
         provider.customHeaders =
             r#"{"User-Agent":"wrong-client","X-Custom":"kept","Authorization":""}"#.to_string();
-        let result = ModelListFetcher::fetch(&provider, &catalog);
+        let result = ModelListFetcher::fetch(&provider, &catalog, provider.apiKey.clone().into());
         let request = server.join().unwrap();
         let models = result.unwrap();
         assert!(
@@ -144,6 +144,11 @@ fn settings_fetcher_preserves_opencode_routes_headers_and_model_ids() {
         )));
         assert!(!request.contains("wrong-client"));
         assert!(request.contains("x-custom: kept\r\n"));
+        if basePath.ends_with("/zen") {
+            assert!(!request.contains("x-opencode-session:"));
+        } else {
+            assert!(request.contains("x-opencode-session: operit-opencode-test\r\n"));
+        }
         if apiKey.is_empty() {
             assert!(!request.contains("authorization:"));
         } else {
@@ -174,7 +179,7 @@ fn live_opencode_zen_and_go_catalogs_are_fetchable_without_api_keys() {
             ApiProviderType::OPENCODE,
             endpoint.to_string(),
         );
-        let models = ModelListFetcher::fetch(&provider, &catalog).unwrap();
+        let models = ModelListFetcher::fetch(&provider, &catalog, provider.apiKey.clone().into()).unwrap();
         assert!(!models.is_empty(), "{endpoint} should list models");
         println!(
             "{endpoint}: {} models; first = {}",

@@ -5,13 +5,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:operit2/core/proxy/generated/CoreProxyModels.g.dart'
+    as core_proxy;
+import 'package:operit2/data/preferences/UserPreferencesManager.dart';
+import 'package:operit2/l10n/generated/app_localizations.dart';
 import 'package:operit2/ui/features/chat/components/attachments/AttachmentViewerDialog.dart';
 import 'package:operit2/ui/features/chat/components/attachments/ChatMessageImageAttachments.dart';
 import 'package:operit2/ui/features/chat/components/style/input/common/ChatAttachmentImagePreview.dart';
 import 'package:operit2/ui/features/chat/components/style/bubble/BubbleUserMessageComposable.dart'
     as bubble;
+import 'package:operit2/ui/features/chat/components/style/bubble/BubbleSurface.dart';
 import 'package:operit2/ui/features/chat/components/style/cursor/UserMessageComposable.dart'
     as cursor;
+import 'package:operit2/ui/theme/OperitTheme.dart';
 
 const _context = AttachmentData(
   id: 'third_party_context_1',
@@ -207,7 +213,58 @@ void main() {
     },
   );
 
+  test('quoted document text stays separate from the sent message body', () {
+    const markup =
+        'Summarize this <attachment id="pasted_text_1" filename="pasted_text.txt" type="text/plain">'
+        '额外信息 · 文档选区: sample.docx\n\nA &amp; B &lt;/attachment&gt;</attachment>';
+    final cursorMessage = cursor.parseMessageContent(markup);
+    final bubbleMessage = bubble.parseMessageContent(markup);
+    expect(cursorMessage.processedText, 'Summarize this');
+    expect(bubbleMessage.processedText, 'Summarize this');
+    for (final attachment in [
+      cursorMessage.attachments.single,
+      bubbleMessage.attachments.single,
+    ]) {
+      expect(attachment.isInlineContext, isTrue);
+      expect(
+        attachment.content,
+        '额外信息 · 文档选区: sample.docx\n\nA & B </attachment>',
+      );
+    }
+  });
+
   for (final isBubble in [false, true]) {
+    testWidgets(
+      'memory recall attachment folds into supplementary information, bubble=$isBubble',
+      (tester) async {
+        const content = '【相关记忆】\n内容: <context> & "quotes" </attachment>';
+        final markup =
+            'hello\n\n<attachment id="character_memory_recall" filename="相关记忆" type="text/plain" size="${content.length}">'
+            '【相关记忆】\n内容: &lt;context&gt; &amp; &quot;quotes&quot; &lt;/attachment&gt;</attachment>';
+        final bubbleParsed = bubble.parseMessageContent(markup);
+        final cursorParsed = cursor.parseMessageContent(markup);
+        expect(
+          isBubble ? bubbleParsed.processedText : cursorParsed.processedText,
+          'hello',
+        );
+        final attachments = isBubble
+            ? bubbleParsed.attachments
+            : cursorParsed.attachments;
+        final attachment = attachments.single;
+        expect(attachment.id, 'character_memory_recall');
+        expect(attachment.filename, '相关记忆');
+        expect(attachment.isInlineContext, isTrue);
+        expect(attachment.content, content);
+        await tester.pumpWidget(_app(attachments, isBubble: isBubble));
+        await tester.pumpAndSettle();
+        expect(find.text(content), findsNothing);
+        expect(find.text('相关记忆'), findsNothing);
+        await tester.tap(find.text('补充信息'));
+        await tester.pumpAndSettle();
+        expect(find.text(content), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
     testWidgets(
       'context is quiet message metadata with full text and copy, bubble=$isBubble',
       (tester) async {
@@ -281,6 +338,142 @@ void main() {
         expect(tester.takeException(), isNull);
       },
     );
+  }
+
+  for (final count in [2, 3]) {
+    final flatWidth = count == 2 ? 152.0 : 232.0;
+    testWidgets('attachment deck uses its $count-card boundary', (tester) async {
+      final files = _layoutFiles(count);
+      await tester.pumpWidget(
+        _app(files, isBubble: true, width: 280, bubbleWidth: flatWidth),
+      );
+      await tester.pumpAndSettle();
+      _expectFlatLayout(tester, count);
+
+      await tester.pumpWidget(
+        _app(files, isBubble: true, width: 280, bubbleWidth: flatWidth - 1),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('$count'), findsOneWidget);
+      expect(
+        tester.getSize(find.byType(ChatMessageAttachments)),
+        const Size(88, 80),
+      );
+      await tester.tap(find.text('$count'));
+      await tester.pumpAndSettle();
+      expect(find.text('收起 ($count)'), findsOneWidget);
+      for (final file in files) {
+        expect(_layoutCard(file.filename), findsOneWidget);
+      }
+      await tester.tap(find.text('收起 ($count)'));
+      await tester.pumpAndSettle();
+      expect(find.text('$count'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  testWidgets('density changes remeasure the real user bubble and deck', (
+    tester,
+  ) async {
+    // Keep this sample around the 152dp boundary and measure the painted bubble;
+    // SelectableText can retain caret room in addition to the glyph advances.
+    await tester.pumpWidget(
+      _bubbleAttachmentApp(text: 'abcdefghijklm', count: 2),
+    );
+    await tester.pumpAndSettle();
+    final messageState = tester.state(
+      find.byType(bubble.BubbleUserMessageComposable),
+    );
+    final surface = find.byType(BubbleSurface);
+    final compactWidth = tester.getSize(surface).width;
+    expect(compactWidth, inInclusiveRange(144, 151.99));
+    expect(_measuredBubbleWidth(tester), closeTo(compactWidth, 0.01));
+    expect(find.text('2'), findsOneWidget);
+
+    _updateBubbleAppearance(tester, padding: 12);
+    await tester.pumpAndSettle();
+    expect(
+      tester.state(find.byType(bubble.BubbleUserMessageComposable)),
+      same(messageState),
+    );
+    final comfortableWidth = tester.getSize(surface).width;
+    expect(comfortableWidth, closeTo(compactWidth + 8, 0.01));
+    expect(_measuredBubbleWidth(tester), closeTo(comfortableWidth, 0.01));
+    _expectFlatLayout(tester, 2);
+    await tester.tap(_layoutCard('layout-0.docx'));
+    await tester.pumpAndSettle();
+    expect(find.byType(AttachmentViewerDialog), findsOneWidget);
+    await tester.tap(
+      find.descendant(
+        of: find.byType(AttachmentViewerDialog),
+        matching: find.byIcon(Icons.close_rounded),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    _updateBubbleAppearance(tester, padding: 8);
+    await tester.pumpAndSettle();
+    expect(tester.getSize(surface).width, closeTo(compactWidth, 0.01));
+    expect(_measuredBubbleWidth(tester), closeTo(compactWidth, 0.01));
+    expect(find.text('2'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('avatar and wide changes update the real three-file deck', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _bubbleAttachmentApp(
+        text: List<String>.filled(60, 'W').join(),
+        count: 3,
+        avatar: true,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(_measuredBubbleWidth(tester), closeTo(210.8, 0.01));
+    expect(find.text('3'), findsOneWidget);
+
+    _updateBubbleAppearance(tester, avatar: false);
+    await tester.pumpAndSettle();
+    expect(_measuredBubbleWidth(tester), closeTo(244.8, 0.01));
+    _expectFlatLayout(tester, 3);
+
+    _updateBubbleAppearance(tester, avatar: true, wide: true, padding: 12);
+    await tester.pumpAndSettle();
+    expect(_measuredBubbleWidth(tester), closeTo(288, 0.01));
+    _expectFlatLayout(tester, 3);
+
+    _updateBubbleAppearance(tester, wide: false, padding: 8);
+    await tester.pumpAndSettle();
+    expect(_measuredBubbleWidth(tester), closeTo(210.8, 0.01));
+    expect(find.text('3'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  for (final count in [2, 3]) {
+    for (final wide in [false, true]) {
+      testWidgets('attachment-only user row keeps its deck, $count/wide=$wide', (
+        tester,
+      ) async {
+        await tester.pumpWidget(
+          _bubbleAttachmentApp(text: '', count: count, wide: wide),
+        );
+        await tester.pumpAndSettle();
+        expect(find.byType(BubbleSurface), findsNothing);
+        expect(find.text('$count'), findsOneWidget);
+        expect(
+          tester.getSize(find.byType(ChatMessageAttachments)),
+          const Size(88, 80),
+        );
+        await tester.tap(find.text('$count'));
+        await tester.pumpAndSettle();
+        expect(find.text('收起 ($count)'), findsOneWidget);
+        for (final file in _layoutFiles(count)) {
+          expect(_layoutCard(file.filename), findsOneWidget);
+        }
+        expect(tester.takeException(), isNull);
+      });
+    }
   }
 
   testWidgets(
@@ -498,6 +691,168 @@ ThemeData _theme([Brightness brightness = Brightness.light]) => ThemeData(
     clipBehavior: Clip.antiAlias,
   ),
 );
+
+List<AttachmentData> _layoutFiles(int count) => [
+  for (var index = 0; index < count; index++)
+    AttachmentData(
+      id: '/tmp/layout-$index.docx',
+      filename: 'layout-$index.docx',
+      type: 'application/msword',
+      size: 100,
+    ),
+];
+
+Finder _layoutCard(String filename) => find.byWidgetPredicate(
+  (widget) => widget is Tooltip && widget.message == filename,
+);
+
+void _expectFlatLayout(WidgetTester tester, int count) {
+  expect(find.text('$count'), findsNothing);
+  final cards = [
+    for (final file in _layoutFiles(count))
+      tester.getRect(_layoutCard(file.filename)),
+  ];
+  for (var index = 0; index < cards.length; index++) {
+    expect(cards[index].size, const Size(72, 72));
+    if (index > 0) {
+      expect(cards[index].left - cards[index - 1].right, closeTo(8, 0.01));
+      expect(cards[index].top, closeTo(cards[0].top, 0.01));
+    }
+  }
+  expect(
+    cards.last.right - cards.first.left,
+    closeTo(count == 2 ? 152 : 232, 0.01),
+  );
+}
+
+double _measuredBubbleWidth(WidgetTester tester) => tester
+    .widget<ChatMessageAttachments>(find.byType(ChatMessageAttachments))
+    .bubbleWidth!;
+
+void _updateBubbleAppearance(
+  WidgetTester tester, {
+  double? padding,
+  bool? avatar,
+  bool? wide,
+}) {
+  final controller = OperitTheme.of(
+    tester.element(find.byType(bubble.BubbleUserMessageComposable)),
+  );
+  controller.setInitialThemePreferenceSnapshot(
+    ThemePreferenceSnapshot.fromJson({
+      ...controller.themePreferenceSnapshot.toJson(),
+      if (padding != null) ...{
+        'bubbleUserContentPaddingLeft': padding,
+        'bubbleUserContentPaddingRight': padding,
+      },
+      if (avatar != null) 'bubbleShowAvatar': avatar,
+      if (wide != null) 'bubbleWideLayoutEnabled': wide,
+    }),
+  );
+  controller.previewThemeSettings();
+}
+
+Widget _bubbleAttachmentApp({
+  required String text,
+  required int count,
+  bool avatar = false,
+  bool wide = false,
+}) {
+  final content = [
+    text,
+    for (final file in _layoutFiles(count))
+      '<attachment id="${file.id}" filename="${file.filename}" '
+          'type="${file.type}" size="${file.size}"/>',
+  ].join('\n');
+  final message = core_proxy.ChatMessage(
+    pluginExtensions: const {},
+    sender: 'user',
+    parts: [
+      core_proxy.MessagePart(
+        partId: 'attachment-text',
+        sequence: 0,
+        kind: core_proxy.MessagePartKind.markdown,
+        content: content,
+        toolCallId: null,
+        toolName: null,
+        attributes: const {},
+      ),
+    ],
+    timestamp: 1,
+    roleName: '',
+    selectedVariantIndex: 0,
+    variantCount: 1,
+    provider: '',
+    modelName: '',
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    sentAt: 0,
+    outputDurationMs: 0,
+    waitDurationMs: 0,
+    completedAt: 0,
+    displayMode: core_proxy.ChatMessageDisplayMode.normal,
+    isFavorite: false,
+    contentStream: null,
+  );
+  return OperitTheme(
+    initialThemePreferenceSnapshot: ThemePreferenceSnapshot.fromJson({
+      ...UserPreferencesManager.defaultThemePreferenceSnapshot.toJson(),
+      'userChatStyle': 'bubble',
+      'aiChatStyle': 'bubble',
+      'bubbleShowAvatar': avatar,
+      'bubbleWideLayoutEnabled': wide,
+      'bubbleUserContentPaddingLeft': 8.0,
+      'bubbleUserContentPaddingRight': 8.0,
+      'showUserName': false,
+    }),
+    initialThemeIsReady: false,
+    unconfiguredChildEnabled: true,
+    hostInteractionHostsEnabled: false,
+    child: MaterialApp(
+      locale: const Locale('zh'),
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      home: Builder(
+        builder: (context) => Theme(
+          data: Theme.of(context).copyWith(
+            textTheme: Theme.of(context).textTheme.copyWith(
+              bodyMedium: const TextStyle(
+                fontFamily: 'Ahem',
+                fontSize: 10,
+                height: 1,
+              ),
+            ),
+          ),
+          child: Scaffold(
+            body: SingleChildScrollView(
+              child: Center(
+                child: SizedBox(
+                  width: 320,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: bubble.BubbleUserMessageComposable(
+                      key: const ValueKey('attachment-message'),
+                      message: message,
+                      backgroundColor: Colors.blue.shade50,
+                      textColor: Colors.black,
+                      bubbleContentPaddingLeft: OperitTheme.of(
+                        context,
+                      ).themePreferenceSnapshot.bubbleUserContentPaddingLeft,
+                      bubbleContentPaddingRight: OperitTheme.of(
+                        context,
+                      ).themePreferenceSnapshot.bubbleUserContentPaddingRight,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
 
 Widget _app(
   List<AttachmentData> attachments, {

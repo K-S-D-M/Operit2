@@ -43,7 +43,7 @@ impl Operit1SnapshotImportManager {
             }
         }
         if writer.get("imports", &source)?.is_some() {
-            writer.migrateThemes(&source, &theme_preferences, &theme_targets, false)?;
+            writer.migrateThemes(&source, &theme_preferences, &theme_targets)?;
             return Ok((0, 0));
         }
         let api_preferences = parsed
@@ -72,6 +72,7 @@ impl Operit1SnapshotImportManager {
             cards: buildOperit2CharacterCards(parsed, plan)?,
             groups: buildOperit2CharacterGroups(parsed)?,
             tags: buildOperit2PromptTags(parsed)?,
+            active: Some(buildOperit1ActivePrompt(parsed)?),
             ..CharacterMigrationData::default()
         };
         for card in &mut data.cards {
@@ -86,6 +87,11 @@ impl Operit1SnapshotImportManager {
         let profiles = buildOperit1MemorySpaces(parsed)?;
         let bindings = collectOperit1CharacterMemoryProfileBindings(parsed)?;
         let now = parsed.archive.manifest.createdAt;
+        let producerNodeId = operit_store::CoreNodeIdentityStore::CoreNodeIdentityStore::new(
+            self.storageHost.clone(),
+        )
+        .identity()?
+        .nodeId;
         let mut memory_count = 0;
         let mut link_count = 0;
         for profile in profiles.values() {
@@ -99,9 +105,7 @@ impl Operit1SnapshotImportManager {
             });
             let (settings, search) = readOperit1MemorySettings(parsed, profile)?;
             data.owners.push(ownerMetadata(&owner, settings, search));
-            let mut document = Vec::new();
-            parsed.copyEntryTo(&operit1UserMarkdownEntry(&profile.id), &mut document)?;
-            data.documents.insert(owner.clone(), document);
+            data.documents.insert(owner.clone(), readOperit1UserMarkdown(parsed, profile)?);
             let entry = operit1ObjectBoxEntryForProfile(&profile.id);
             if let Some(metadata) = parsed.archive.entries.get(&entry) {
                 let target =
@@ -114,6 +118,7 @@ impl Operit1SnapshotImportManager {
                     &owner,
                     plan,
                     archive,
+                    &producerNodeId,
                 );
                 self.storageHost
                     .delete(target, false)
@@ -123,14 +128,12 @@ impl Operit1SnapshotImportManager {
                     if collection != "memories" {
                         continue;
                     }
-                    for field in ["documentPath", "chunkIndexFilePath"] {
-                        if let Some(path) = envelope["record"][field].as_str() {
-                            if path.starts_with("runtime/") || path.starts_with("workspaces/") {
-                                self.storageHost
-                                    .readBytes(path)
-                                    .map_err(|error| error.to_string())?;
-                                envelope["record"][field] = serde_json::json!(crate::data::backup::CharacterPluginMigration::publicResourcePath(path)?);
-                            }
+                    if let Some(path) = envelope["record"]["documentPath"].as_str() {
+                        if path.starts_with("runtime/") || path.starts_with("workspaces/") {
+                            self.storageHost
+                                .readBytes(path)
+                                .map_err(|error| error.to_string())?;
+                            envelope["record"]["documentPath"] = serde_json::json!(crate::data::backup::CharacterPluginMigration::publicResourcePath(path)?);
                         }
                     }
                 }
@@ -149,34 +152,29 @@ impl Operit1SnapshotImportManager {
                 .ok_or("Operit1 character profile is missing")?;
             let (settings, search) = readOperit1MemorySettings(parsed, profile_metadata)?;
             data.owners.push(ownerMetadata(&owner, settings, search));
-            let mut document = Vec::new();
-            parsed.copyEntryTo(&operit1UserMarkdownEntry(profile), &mut document)?;
-            data.documents.insert(owner, document);
+            data.documents.insert(owner, readOperit1UserMarkdown(parsed, profile_metadata)?);
         }
-        let card_preferences = parsed
-            .archive
-            .datastorePreferences
-            .get(ENTRY_CHARACTER_CARDS)
-            .ok_or("Operit1 character preferences are missing")?;
-        let group_preferences = parsed
-            .archive
-            .datastorePreferences
-            .get(ENTRY_CHARACTER_GROUPS);
-        let group_id = group_preferences
-            .map(|preferences| optionalPreferenceString(preferences, "active_character_group_id"))
-            .transpose()?
-            .flatten()
-            .filter(|id| !id.is_empty());
-        data.active = Some(match group_id {
-            Some(id) => serde_json::json!({"CharacterGroup":{"id":id}}),
-            None => {
-                serde_json::json!({"CharacterCard":{"id":requiredPreferenceString(card_preferences, "active_character_card_id", "Operit1 active character is missing")?}})
-            }
-        });
         writer.import(&source, data)?;
-        writer.migrateThemes(&source, &theme_preferences, &theme_targets, false)?;
+        writer.migrateThemes(&source, &theme_preferences, &theme_targets)?;
         Ok((memory_count, link_count))
     }
+}
+
+/// Decodes the same group, card and implicit default selection as Kotlin's ActivePromptManager.
+fn buildOperit1ActivePrompt(parsed: &ParsedOperit1Snapshot) -> Result<Value, String> {
+    for (entry, key, kind) in [
+        (ENTRY_CHARACTER_GROUPS, "active_character_group_id", "CharacterGroup"),
+        (ENTRY_CHARACTER_CARDS, "active_character_card_id", "CharacterCard"),
+    ] {
+        let id = parsed.archive.datastorePreferences.get(entry)
+            .map(|preferences| optionalPreferenceString(preferences, key))
+            .transpose()?
+            .flatten();
+        if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+            return Ok(serde_json::json!({(kind): {"id": id}}));
+        }
+    }
+    Ok(serde_json::json!({"CharacterCard": {"id": OPERIT1_SOURCE_DEFAULT_CHARACTER_CARD_ID}}))
 }
 
 /// Prepares plugin bindings and carries only draft references until Core imports each chat.
@@ -217,7 +215,75 @@ fn resolveOperit1ArchiveBindings(
                 return Err("Operit1 archive already has a character namespace".into());
             }
         }
+        for message in &mut chat.messages {
+            if message.baseMessage.sender != "ai" {
+                continue;
+            }
+            adoptOperit1MessageIdentity(
+                &mut message.baseMessage.pluginExtensions,
+                &message.baseMessage.roleName,
+                &cards,
+            )?;
+            for variant in &mut message.variants {
+                adoptOperit1MessageIdentity(
+                    &mut variant.pluginExtensions,
+                    &variant.roleName,
+                    &cards,
+                )?;
+            }
+        }
     }
+    Ok(())
+}
+
+/// Publishes only bindings whose chats completed this explicit snapshot import.
+fn publishOperit1ArchiveBindings(
+    chatIds: &[String],
+    sqlite: Arc<dyn RuntimeSqliteHost>,
+    storage: Arc<dyn RuntimeStorageHost>,
+) -> Result<(), String> {
+    use crate::data::backup::CharacterPluginMigration::CharacterPluginWriter;
+    let writer = CharacterPluginWriter::open(sqlite, storage)?;
+    for id in chatIds {
+        let Some(draft) = writer.get("chat_drafts", id)? else {
+            continue;
+        };
+        writer.adoptRecord("chat_bindings", id, draft["value"].clone())?;
+        let version = draft["version"]
+            .as_str()
+            .ok_or("Invalid Operit1 chat draft version")?;
+        writer.remove("chat_drafts", id, version)?;
+    }
+    Ok(())
+}
+
+/// Captures the uniquely named Operit1 author directly in each imported message revision.
+fn adoptOperit1MessageIdentity(
+    extensions: &mut BTreeMap<String, serde_json::Value>,
+    roleName: &str,
+    cards: &[serde_json::Value],
+) -> Result<(), String> {
+    if roleName.trim().is_empty() {
+        return Ok(());
+    }
+    let mut matching = cards.iter().filter(|card| card["name"] == roleName);
+    let Some(card) = matching.next() else {
+        return Ok(());
+    };
+    if matching.next().is_some() {
+        return Ok(());
+    }
+    let id = card["id"]
+        .as_str()
+        .ok_or("Invalid imported character identity")?;
+    extensions.insert(
+        crate::data::backup::CharacterPluginMigration::PLUGIN_ID.into(),
+        serde_json::json!({"participantId":id}),
+    );
+    extensions.insert(
+        "host.chat.identity".into(),
+        serde_json::json!({"title":roleName,"avatarUri":card["avatarUri"]}),
+    );
     Ok(())
 }
 

@@ -25,7 +25,7 @@ test('manual PTY creation resolves the selected terminal namespace first', () =>
   assert.match(create, /\.resolveWorkingDirectory\(/);
   assert.ok(create.indexOf('.resolveWorkingDirectory(') < create.indexOf('.startPtySession('));
   assert.doesNotMatch(create, /resolve_terminal_working_dir\(&self\.context, &workingDir\)/);
-  const api = source('core/crates/foundation/host-api/src/lib.rs');
+  const api = source('core/crates/foundation/host-contract/src/lib.rs');
   assert.match(api, /fn resolveWorkingDirectory\([\s\S]*?\) -> HostResult<String>;/);
 });
 
@@ -41,18 +41,18 @@ test('Linux guest hosts own guest working directory resolution', () => {
     assert.match(resolve, /resolveLinuxGuestDirectory\(/);
     assert.match(resolve, /resolveHostDirectory\(workingDir\)/);
   }
-  const guest = source('core/crates/foundation/host-api/src/TerminalWorkingDirectory.rs');
+  const guest = source('core/crates/foundation/host-contract/src/TerminalWorkingDirectory.rs');
   const resolve = section(guest, 'pub fn resolveLinuxGuestDirectory(', 'pub fn resolveSessionDirectory(');
   assert.match(resolve, /strip_prefix\("\/virtual\/linux"\)/);
   assert.match(resolve, /strip_prefix\("\/mnt\/linux"\)/);
   assert.doesNotMatch(resolve, /target_os|target_arch|\.contains\(/);
 });
 
-/** Preserves host-owned resolution through the Flutter session-publication wrapper. */
-test('Flutter terminal wrapper delegates directory resolution to its exact host', () => {
-  const wrapper = source('apps/flutter/native/operit-flutter-bridge/src/FlutterOwnerCapabilities.rs');
+/** Preserves host-owned resolution through the shared session-publication wrapper. */
+test('shared terminal publisher delegates directory resolution to its exact host', () => {
+  const wrapper = source('core/crates/runtime/application/src/services/PublishingTerminalHost.rs');
   const resolve = section(wrapper, 'fn resolveWorkingDirectory(', 'fn terminalInfo(');
-  assert.match(resolve, /self\.inner\.resolveWorkingDirectory\(/);
+  assert.match(resolve, /self\.inner\s*\.resolveWorkingDirectory\(/);
 });
 
 test('macOS ARM64 uses the real workspace resolver instead of guest home', () => {
@@ -66,7 +66,8 @@ test('macOS ARM64 uses the real workspace resolver instead of guest home', () =>
 test('manual Flutter terminals use uniform VFS locators', () => {
   const panel = source('apps/flutter/app/lib/ui/features/chat/components/workspace/WorkspacePanel.dart');
   const directory = section(panel, 'String _manualTerminalWorkingDirectory(', 'String _nextManualTerminalSessionName(');
-  assert.match(directory, /return '\/operitapp\/data'/);
+  assert.match(directory, /widget\.fileDirectory\?\.trim\(\) \?\? widget\.workspacePath\?\.trim\(\)/);
+  assert.match(directory, /return directory;/);
   assert.doesNotMatch(directory, /v86|Platform|kIsWeb|operitRootPath/);
   const web = source('hosts/web/src/tools/terminal/mod.rs');
   const resolve = section(web, 'fn resolveWorkingDirectory(', 'fn terminalInfo(');
@@ -83,7 +84,7 @@ test('manual launch errors are not promoted to chat errors', () => {
   assert.match(launcher, /await showDialog<void>/);
   assert.doesNotMatch(launcher, /_errorMessage|InputProcessingState|startPtySession|startTerminalPty/);
   const tools = source('core/crates/tool/services/src/tools/defaultTool/standard/StandardTerminalTools.rs');
-  const create = section(tools, 'pub fn createOrGetSession(', 'pub fn executeCommandInSession(');
+  const create = section(tools, 'pub fn createOrGetSession(', 'pub fn executeHiddenCommand(');
   assert.match(create, /Err\(error\) => toolError\(/);
 });
 
@@ -95,4 +96,23 @@ test('Android startup errors return the real process output', () => {
   assert.match(error, /stripAndroidPtyPromptMarkers\(data\)/);
   assert.match(error, /renderTerminalText/);
   assert.match(error, /Startup output:/);
+});
+
+/** Document mounts must reach the exact terminal host through every launch entry point. */
+test('document-backed terminal directories reach Android instead of nativePath rejection', () => {
+  const runtime = source('core/crates/runtime/application/src/services/RuntimeTerminalService.rs');
+  assert.match(runtime, /filesystem\.terminalDirectory\(terminalHost, &path\)/);
+  const tools = source('core/crates/tool/services/src/tools/defaultTool/standard/StandardTerminalTools.rs');
+  assert.equal((tools.match(/\.terminalDirectory\(host, path\)/g) ?? []).length, 1);
+  assert.match(tools, /self\.resolveFileDirectory\(host, &terminal, terminalType, &workspace\)/);
+  const mapper = source('core/crates/foundation/vfs/src/PathMapper.rs');
+  assert.match(mapper, /host\.resolveNativeWorkingDirectory\(&self\.physicalPath\)/);
+  const wrapper = source('core/crates/runtime/application/src/services/PublishingTerminalHost.rs');
+  assert.match(wrapper, /self\.inner\.resolveNativeWorkingDirectory\(path\)/);
+  const host = source('hosts/android/src/terminal.rs');
+  assert.match(host, /resolveAndroidNativeWorkingDirectory\(path, &crate::document_filesystem::call\)/);
+  const backend = source('apps/flutter/app/android/app/src/main/kotlin/app/operit/AndroidDocumentFileSystem.kt');
+  assert.match(backend, /"resolveNativeDirectory" -> node\(request\.getString\("path"\)\)\.nativeDirectory\(\)/);
+  const assets = source('apps/flutter/app/android/app/src/main/kotlin/app/operit/AndroidRuntimeAssets.kt');
+  assert.match(assets, /"\/storage" to "\/storage"/);
 });

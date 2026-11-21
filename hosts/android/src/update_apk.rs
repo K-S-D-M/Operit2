@@ -1,0 +1,330 @@
+//! Reversible APK entry transforms using the Android Host's standard zlib encoder.
+use operit_host_api::{ApplicationUpdateTransform, FileSource, FileTarget, HttpDownloadControl};
+use serde::Deserialize;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+const MAGIC: &[u8; 8] = b"O2APK1\0\0";
+const BUFFER: usize = 1024 * 1024;
+const LIMIT: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Reads a bounded package capability without requiring access to its native path.
+struct PackageReader<'a> {
+    source: &'a dyn FileSource,
+    size: u64,
+    offset: u64,
+}
+
+impl Read for PackageReader<'_> {
+    /// Copies only the requested range and rejects a source that changes during the transform.
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let length = (self.size.saturating_sub(self.offset)).min(output.len() as u64) as usize;
+        if length == 0 {
+            return Ok(0);
+        }
+        let bytes = self
+            .source
+            .readBytesRange(self.offset, length)
+            .map_err(io::Error::other)?;
+        if bytes.len() != length {
+            return Err(invalid("APK source changed during transformation"));
+        }
+        output[..length].copy_from_slice(&bytes);
+        self.offset += length as u64;
+        Ok(length)
+    }
+}
+
+impl Seek for PackageReader<'_> {
+    /// Seeks within the verified package size without interpreting a platform locator.
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let offset = match position {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::Current(offset) => i128::from(self.offset) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.size) + i128::from(offset),
+        };
+        if offset < 0 || offset > i128::from(self.size) {
+            return Err(invalid("APK seek exceeds source bounds"));
+        }
+        self.offset = offset as u64;
+        Ok(self.offset)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Entry {
+    offset: u64,
+    compressed: u64,
+    size: u64,
+    level: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recipe {
+    size: u64,
+    entries: Vec<Entry>,
+}
+
+/// Produces a consistent invalid-data error for malformed authenticated transform recipes.
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// Checks cancellation between every bounded read and compression write.
+fn active(control: &HttpDownloadControl) -> io::Result<()> {
+    if control.isCancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "UPDATE_CANCELLED",
+        ));
+    }
+    Ok(())
+}
+
+/// Parses only bounded, nonoverlapping entry ranges with a fixed reproducible codec.
+fn recipe(metadata: &[u8]) -> io::Result<Recipe> {
+    if metadata.len() > 4 * BUFFER {
+        return Err(invalid("APK recipe exceeds limit"));
+    }
+    let recipe: Recipe = serde_json::from_slice(metadata).map_err(io::Error::other)?;
+    if recipe.size == 0 || recipe.size > LIMIT || recipe.entries.len() > 4096 {
+        return Err(invalid("Invalid APK recipe size"));
+    }
+    let (mut end, mut total) = (0, 0u64);
+    for entry in &recipe.entries {
+        if entry.offset < end
+            || entry.offset > recipe.size
+            || entry.compressed == 0
+            || entry.compressed > recipe.size - entry.offset
+            || entry.size == 0
+            || entry.size > LIMIT
+            || entry.level != 6
+        {
+            return Err(invalid("Invalid APK entry recipe"));
+        }
+        end = entry.offset + entry.compressed;
+        total = total
+            .checked_add(entry.size)
+            .ok_or_else(|| invalid("APK expanded size overflow"))?;
+        if total > LIMIT {
+            return Err(invalid("APK expanded size exceeds limit"));
+        }
+    }
+    Ok(recipe)
+}
+
+/// Copies an exact byte count with bounded buffers and prompt cancellation.
+fn copy(
+    source: &mut impl Read,
+    target: &mut impl Write,
+    count: u64,
+    control: &HttpDownloadControl,
+) -> io::Result<()> {
+    copy_progress(source, target, count, control, &|_| {})
+}
+
+/// Reports payload bytes only after they have reached the copy or compression destination.
+fn copy_progress(
+    source: &mut impl Read,
+    target: &mut impl Write,
+    mut count: u64,
+    control: &HttpDownloadControl,
+    progress: &dyn Fn(u64),
+) -> io::Result<()> {
+    let mut buffer = vec![0; BUFFER];
+    let total = count;
+    while count > 0 {
+        active(control)?;
+        let length = count.min(BUFFER as u64) as usize;
+        source.read_exact(&mut buffer[..length])?;
+        target.write_all(&buffer[..length])?;
+        count -= length as u64;
+        progress(total - count);
+    }
+    Ok(())
+}
+
+/// Expands selected raw DEFLATE streams and preserves the untouched signed APK shell.
+fn decode(
+    source: &mut (impl Read + Seek),
+    source_size: u64,
+    output: &mut File,
+    metadata: &[u8],
+    control: &HttpDownloadControl,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> io::Result<()> {
+    let recipe = recipe(metadata)?;
+    if source_size != recipe.size {
+        return Err(invalid("APK recipe does not match original size"));
+    }
+    output.write_all(MAGIC)?;
+    output.write_all(&(metadata.len() as u32).to_le_bytes())?;
+    output.write_all(metadata)?;
+    let shell = recipe.size
+        - recipe
+            .entries
+            .iter()
+            .map(|entry| entry.compressed)
+            .sum::<u64>();
+    let total = shell + recipe.entries.iter().map(|entry| entry.size).sum::<u64>();
+    progress(0, total);
+    let mut offset = 0;
+    for entry in &recipe.entries {
+        source.seek(SeekFrom::Start(offset))?;
+        copy(source, output, entry.offset - offset, control)?;
+        offset = entry.offset + entry.compressed;
+    }
+    source.seek(SeekFrom::Start(offset))?;
+    copy(source, output, recipe.size - offset, control)?;
+    let mut completed = shell;
+    progress(completed, total);
+    for entry in &recipe.entries {
+        source.seek(SeekFrom::Start(entry.offset))?;
+        let mut decoder = flate2::read::DeflateDecoder::new((&mut *source).take(entry.compressed));
+        copy_progress(&mut decoder, output, entry.size, control, &|done| {
+            progress(completed + done, total)
+        })?;
+        let mut trailing = [0];
+        if decoder.read(&mut trailing)? != 0 || decoder.total_in() != entry.compressed {
+            return Err(invalid("Expanded APK entry does not match recipe"));
+        }
+        completed += entry.size;
+    }
+    Ok(())
+}
+
+struct EntryWriter<'a> {
+    file: &'a mut File,
+    remaining: u64,
+}
+
+impl Write for EntryWriter<'_> {
+    /// Prevents the encoder from overwriting APK shell bytes outside the declared entry.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(invalid("APK compressed entry exceeds recipe"));
+        }
+        let count = self.file.write(bytes)?;
+        self.remaining -= count as u64;
+        Ok(count)
+    }
+
+    /// Flushes the destination without changing the DEFLATE stream.
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Recreates each original DEFLATE stream without rewriting APK metadata or signatures.
+fn encode(
+    source: &mut impl Read,
+    source_size: u64,
+    output: &mut File,
+    control: &HttpDownloadControl,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> io::Result<()> {
+    let mut magic = [0; 8];
+    source.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(invalid("Invalid expanded APK header"));
+    }
+    let mut length = [0; 4];
+    source.read_exact(&mut length)?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length > 4 * BUFFER {
+        return Err(invalid("APK recipe exceeds limit"));
+    }
+    let mut metadata = vec![0; length];
+    source.read_exact(&mut metadata)?;
+    let recipe = recipe(&metadata)?;
+    let shell = recipe.size - recipe.entries.iter().map(|e| e.compressed).sum::<u64>();
+    let expanded = recipe.entries.iter().map(|e| e.size).sum::<u64>();
+    if source_size != 12 + length as u64 + shell + expanded {
+        return Err(invalid("Expanded APK length mismatch"));
+    }
+    let total = shell + expanded;
+    progress(0, total);
+    let mut offset = 0;
+    for entry in &recipe.entries {
+        output.seek(SeekFrom::Start(offset))?;
+        copy(source, output, entry.offset - offset, control)?;
+        offset = entry.offset + entry.compressed;
+    }
+    output.seek(SeekFrom::Start(offset))?;
+    copy(source, output, recipe.size - offset, control)?;
+    output.set_len(recipe.size)?;
+    let mut completed = shell;
+    progress(completed, total);
+    for entry in &recipe.entries {
+        output.seek(SeekFrom::Start(entry.offset))?;
+        let writer = EntryWriter {
+            file: output,
+            remaining: entry.compressed,
+        };
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(writer, flate2::Compression::new(entry.level));
+        copy_progress(source, &mut encoder, entry.size, control, &|done| {
+            progress(completed + done, total)
+        })?;
+        if encoder.finish()?.remaining != 0 {
+            return Err(invalid("APK encoder does not reproduce target layout"));
+        }
+        completed += entry.size;
+    }
+    Ok(())
+}
+
+/// Writes only inside the disposable update job and removes incomplete transforms on all failures.
+pub(super) fn transform(
+    source: &dyn FileSource,
+    target: &dyn FileTarget,
+    transform: ApplicationUpdateTransform,
+    control: &HttpDownloadControl,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> io::Result<()> {
+    active(control)?;
+    let size = u64::try_from(source.fileInfo().map_err(io::Error::other)?.size)
+        .map_err(|_| invalid("Invalid APK source size"))?;
+    if size == 0 || size > LIMIT {
+        return Err(invalid("APK source exceeds size limits"));
+    }
+    let mut input = BufReader::with_capacity(
+        BUFFER,
+        PackageReader {
+            source,
+            size,
+            offset: 0,
+        },
+    );
+    let target_path = target.nativePath().map_err(io::Error::other)?;
+    let target = Path::new(&target_path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    let result = match transform {
+        ApplicationUpdateTransform::ExpandApkEntries { recipe } => {
+            decode(&mut input, size, &mut output, &recipe, control, progress)
+        }
+        ApplicationUpdateTransform::RestoreApkEntries => {
+            encode(&mut input, size, &mut output, control, progress)
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Unsupported Android installer transform",
+        )),
+    }
+    .and_then(|_| active(control))
+    .and_then(|_| output.flush());
+    drop(output);
+    if result.is_err() {
+        std::fs::remove_file(target)?;
+    }
+    result
+}

@@ -2409,6 +2409,23 @@ pub struct BoxProps {
     /// Default placement of children within the box bounds.
     pub contentAlignment: Option<ComposeAlignment>,
 }
+/// Transparent animated perimeter, painted by the host without JavaScript frames.
+pub struct GlowBorderProps {
+    /// Shared layout, drawing and identity properties.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Ordered colors that flow around the perimeter.
+    pub colors: Vec<ComposeColor>,
+    /// Corner radius in logical pixels, default 0 (square corners).
+    pub cornerRadius: Option<f64>,
+    /// Crisp edge width in logical pixels, default 3.
+    pub strokeWidth: Option<f64>,
+    /// Soft inward bloom width in logical pixels, default 56.
+    pub glowWidth: Option<f64>,
+    /// One full circuit in milliseconds, default 6000.
+    pub durationMillis: Option<u32>,
+    /// Whether to animate; respects the host's reduced motion preference.
+    pub running: Option<bool>,
+}
 /// Empty layout element that reserves explicit width and height.
 pub struct SpacerProps {
     /// Horizontal space reserved by the element.
@@ -2527,6 +2544,48 @@ pub struct ScrollAreaProps {
     /// Keeps the scrollbar thumb visible while content can scroll.
     pub thumbVisibility: Option<bool>,
     /// Child content.
+    pub content: Option<ComposeChildren>,
+}
+
+/// Intrinsic source extent and gutter space in one custom editor column.
+pub struct ComposeCodeEditorColumn {
+    pub text: String,
+    /// Proportion of available body width, between zero and one.
+    pub fraction: Option<f64>,
+    /// Reserved horizontal space for gutter, padding and column separators.
+    pub horizontalPadding: Option<f64>,
+}
+
+/// The shared native code editor in read-only or custom-body presentation mode.
+pub struct CodeEditorProps {
+    /// Shared layout properties.
+    pub base_compose_common_props: ComposeCommonProps,
+    /// Source document. Omit when supplying a custom body.
+    pub text: Option<String>,
+    /// Material typography role and optional source font overrides.
+    pub style: Option<ComposeTextStyle>,
+    pub fontSize: Option<f64>,
+    pub fontFamily: Option<String>,
+    pub fontWeight: Option<String>,
+    pub color: Option<ComposeColor>,
+    pub lineHeight: Option<f64>,
+    /// Filename used to choose the editor's syntax grammar.
+    pub filePath: Option<String>,
+    /// Optional unscaled document width for custom source rows.
+    pub contentWidth: Option<f64>,
+    /// Source columns measured by the native editor for unwrapped custom bodies.
+    pub contentColumns: Option<Vec<ComposeCodeEditorColumn>>,
+    /// Reflows text to the viewport as it zooms. Defaults to true.
+    pub wrapToViewport: Option<bool>,
+    /// Shows the editor's logical line-number gutter for ordinary source text.
+    pub showLineNumbers: Option<bool>,
+    /// Enables diagonal panning; defaults to true for read-only code views.
+    pub panEnabled: Option<bool>,
+    /// Controlled zoom factor and allowed zoom interval.
+    pub scale: Option<f64>,
+    pub minScale: Option<f64>,
+    pub maxScale: Option<f64>,
+    /// Optional decorated body containing one vertical scrollable. Omit for text.
     pub content: Option<ComposeChildren>,
 }
 
@@ -2667,6 +2726,10 @@ pub struct TextFieldProps {
     pub value: String,
     /// Receives each user-proposed value for controlled-state updates.
     pub onValueChange: Arc<dyn Fn(String) -> () + Send + Sync>,
+    /// Receives the current text when Enter or the keyboard action submits the field.
+    pub onSubmitted: Option<Arc<dyn Fn(String) -> ComposeInteractionOutput + Send + Sync>>,
+    /// Native keyboard action, such as search, done, send or next.
+    pub imeAction: Option<String>,
     /// Restricts input and layout to one visual line.
     pub singleLine: Option<bool>,
     /// Minimum visible line count reserved by the field.
@@ -3323,6 +3386,8 @@ pub struct AlertDialogProps {
 }
 /// Core component factories available through `ComposeDslContext::UI`.
 pub struct ComposeUiFactoryRegistry {
+    /// Paints a host-animated gradient perimeter with a transparent center.
+    pub GlowBorder: ComposeNodeFactory<GlowBorderProps>,
     /// Creates one native paragraph with individually styled spans.
     pub RichText: ComposeNodeFactory<RichTextProps>,
     /// Renders source text using the shared native syntax palette and font metrics.
@@ -3331,6 +3396,8 @@ pub struct ComposeUiFactoryRegistry {
     pub Tooltip: ComposeNodeFactory<TooltipProps>,
     /// Creates one independently controlled native scroll viewport.
     pub ScrollArea: ComposeNodeFactory<ScrollAreaProps>,
+    /// Presents source text or custom diff rows through the shared native editor.
+    pub CodeEditor: ComposeNodeFactory<CodeEditorProps>,
     /// Opens a native popup with plugin-composed anchor and entries.
     pub MenuAnchor: ComposeNodeFactory<MenuAnchorProps>,
     /// Adds a native Material ink response without imposing button geometry.
@@ -3502,12 +3569,14 @@ pub struct ComposeFilePickerResult {
     /// Files selected by the user; empty when the request was cancelled.
     pub files: Vec<ComposePickedFile>,
 }
-/// UTF-8 content and metadata passed to the host file-save selector.
+/// Text or binary content and metadata passed to the host file-save selector.
 pub struct ComposeFileSaveOptions {
     /// File name suggested in the save dialog, without directory components.
     pub suggestedName: String,
-    /// Exact UTF-8 text to save after the user accepts the destination.
-    pub content: String,
+    /// Exact UTF-8 text. Supply exactly one of content or contentBase64.
+    pub content: Option<String>,
+    /// Base64-encoded binary bytes, decoded before opening the save selector.
+    pub contentBase64: Option<String>,
     /// Media type of the exported file.
     pub mimeType: String,
     /// File extensions accepted by the save dialog, without leading dots.
@@ -3630,7 +3699,7 @@ pub trait ComposeDslContextMethods: Send + Sync {
         &self,
         options: Option<ComposeFilePickerOptions>,
     ) -> JsFuture<ComposeFilePickerResult>;
-    /// Saves UTF-8 content to a user-selected destination through the host file selector.
+    /// Saves text or binary bytes to a user-selected destination through the host file selector.
     fn saveFile(&self, options: ComposeFileSaveOptions) -> JsFuture<ComposeFileSaveResult>;
     /// Returns the registered runtime-module specification decoded as the requested type.
     fn getModuleSpec<TSpec>(&self) -> TSpec;

@@ -89,6 +89,7 @@ fn profile(nodeId: String) -> operit_store::CoreSpaceStore::CoreSpaceDeviceProfi
 fn listener(storage: Arc<dyn RuntimeStorageHost>) {
     PeerStateStore::new(storage)
         .saveHostConfig(&PeerHostConfig {
+            discovery: None,
             bindAddress: "127.0.0.1:0".into(),
             transports: vec![PeerTransport::Tcp],
             discoveryEnabled: false,
@@ -251,8 +252,8 @@ exports.run=async function(params) {{
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
         speech.beginRecognition().unwrap();
-        speech.appendPcm(vec![0, 128, 255, 127]).unwrap();
-        speech.finishRecognition().unwrap();
+        speech.appendPcm(vec![0, 128, 255, 127]).await.unwrap();
+        speech.finishRecognition().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while speech.snapshot()["phase"] != 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -368,8 +369,8 @@ async fn verify_package(
     .await
     .unwrap();
     speech.beginRecognition().unwrap();
-    speech.appendPcm(vec![0, 128, 255, 127]).unwrap();
-    speech.finishRecognition().unwrap();
+    speech.appendPcm(vec![0, 128, 255, 127]).await.unwrap();
+    speech.finishRecognition().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while speech.snapshot()["phase"] != 0 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -409,8 +410,8 @@ async fn verify_package(
     );
     http.failStt.store(true, Ordering::Relaxed);
     speech.beginRecognition().unwrap();
-    speech.appendPcm(vec![0, 128, 255, 127]).unwrap();
-    speech.finishRecognition().unwrap();
+    speech.appendPcm(vec![0, 128, 255, 127]).await.unwrap();
+    speech.finishRecognition().await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while speech.snapshot()["phase"] != 0 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

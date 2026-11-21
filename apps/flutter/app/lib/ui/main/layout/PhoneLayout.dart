@@ -10,14 +10,18 @@ import 'package:flutter/rendering.dart';
 
 import '../../../core/bridge/OperitRuntimeBridge.dart';
 import '../../../core/bridge/ProxyCoreRuntimeBridge.dart';
+import '../../../l10n/generated/app_localizations.dart';
 
 import '../components/DrawerConversationState.dart';
 import '../components/DrawerContent.dart';
 import '../components/NavigationDrawerAppearance.dart';
 import '../navigation/AppNavigationModels.dart';
+import '../MainLayoutController.dart';
 import 'DrawerMotionScope.dart';
+import 'SidebarDockController.dart';
 import '../../theme/OperitGlassSurface.dart';
 import '../../common/interactions/DrawerGestureExclusion.dart';
+import '../../common/components/RetainedPage.dart';
 
 class PhoneLayout extends StatefulWidget {
   /// Creates the retained phone content and its animated navigation drawer.
@@ -63,12 +67,16 @@ class _PhoneLayoutState extends State<PhoneLayout>
   static const double _noBouncyDampingRatio = 1.0;
   static const double _springStiffness = 1000;
   static const double _dragThreshold = 40;
+  static const double _edgeSwipeWidth = 24;
 
   late final AnimationController _drawerProgressController;
   final ValueNotifier<bool> _drawerIsAnimating = ValueNotifier<bool>(false);
   final ValueNotifier<int> _contentActivation = ValueNotifier<int>(0);
   double _currentDrag = 0;
   double _verticalDrag = 0;
+  final Set<int> _touchPointers = <int>{};
+  Offset? _edgeSwipeStart;
+  int _activePluginDrags = 0;
 
   /// Connects the drawer state to its spring animation and motion lifecycle.
   @override
@@ -86,6 +94,9 @@ class _PhoneLayoutState extends State<PhoneLayout>
   @override
   void didUpdateWidget(covariant PhoneLayout oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.selectedRouteId != widget.selectedRouteId) {
+      _edgeSwipeStart = null;
+    }
     if (oldWidget.drawerOpenState != widget.drawerOpenState) {
       oldWidget.drawerOpenState.removeListener(_animateDrawerProgress);
       widget.drawerOpenState.addListener(_animateDrawerProgress);
@@ -113,6 +124,7 @@ class _PhoneLayoutState extends State<PhoneLayout>
 
   /// Retargets the drawer spring from its current position and velocity.
   void _animateDrawerProgress() {
+    _edgeSwipeStart = null;
     final target = widget.drawerOpenState.value ? 1.0 : 0.0;
     final dampingRatio = widget.drawerOpenState.value
         ? _lowBouncyDampingRatio
@@ -140,6 +152,33 @@ class _PhoneLayoutState extends State<PhoneLayout>
   void _handleConversationActivated() {
     widget.onConversationActivated();
     _contentActivation.value++;
+  }
+
+  /// Shows the workspace drop zone only while a plugin is being dragged.
+  void _handlePluginDockDragChanged(bool active) {
+    if (mounted) {
+      setState(() => _activePluginDrags += active ? 1 : -1);
+    }
+  }
+
+  /// Docks the plugin into the visible chat's workspace and dismisses the drawer.
+  void _dockPlugin(
+    SidebarDockController dock,
+    MainLayoutController layout,
+    SidebarDockDragPayload payload,
+  ) {
+    final openWorkspace = layout.workspaceDockDestination;
+    if (openWorkspace == null ||
+        !dock.canMove(payload.entryId, SidebarDockLocation.secondary)) {
+      return;
+    }
+    dock.move(
+      payload.entryId,
+      location: SidebarDockLocation.secondary,
+      insertionIndex: dock.secondaryViews.length,
+    );
+    openWorkspace();
+    widget.onCloseDrawer();
   }
 
   /// Resets accumulated movement for a new drawer gesture.
@@ -172,16 +211,63 @@ class _PhoneLayoutState extends State<PhoneLayout>
     _verticalDrag = 0;
   }
 
+  /// Observes edge touches without competing with embedded page recognizers.
+  void _handleEdgePointerDown(PointerDownEvent event) {
+    if (event.kind != PointerDeviceKind.touch) return;
+    _touchPointers.add(event.pointer);
+    _edgeSwipeStart = null;
+    if (_touchPointers.length != 1 ||
+        widget.drawerOpenState.value ||
+        _drawerProgressController.isAnimating ||
+        event.localPosition.dx < 0 ||
+        event.localPosition.dx > _edgeSwipeWidth ||
+        _startsInDrawerGestureExcludedRegion(event)) {
+      return;
+    }
+    _edgeSwipeStart = event.localPosition;
+  }
+
+  /// Opens once for a rightward edge swipe and abandons vertical or leftward drags.
+  void _handleEdgePointerMove(PointerMoveEvent event) {
+    final start = _edgeSwipeStart;
+    if (start == null || !_touchPointers.contains(event.pointer)) return;
+    final delta = event.localPosition - start;
+    if (delta.dx < -kTouchSlop ||
+        (delta.dy.abs() > kTouchSlop && delta.dy.abs() >= delta.dx.abs())) {
+      _edgeSwipeStart = null;
+      return;
+    }
+    if (delta.dx > _dragThreshold && delta.dx > delta.dy.abs() * 1.5) {
+      _edgeSwipeStart = null;
+      if (!widget.drawerOpenState.value) widget.onOpenDrawer();
+    }
+  }
+
+  /// Ends touch tracking on release or cancellation, including multi-touch sequences.
+  void _handleEdgePointerEnd(PointerEvent event) {
+    _touchPointers.remove(event.pointer);
+    _edgeSwipeStart = null;
+  }
+
   /// Builds retained content layers and animates their drawer presentation.
   @override
   Widget build(BuildContext context) {
     final appearance = navigationDrawerAppearanceOf(context);
+    final layout = MainLayoutScope.maybeOf(context);
+    final dock = SidebarDockScope.maybeOf(context);
     final animatedChild = _PhoneLayoutAnimatedChild(
       content: RepaintBoundary(
         child: DrawerMotionScope(
           isAnimating: _drawerIsAnimating,
           contentActivation: _contentActivation,
-          child: widget.content,
+          child: Listener(
+            behavior: HitTestBehavior.translucent,
+            onPointerDown: _handleEdgePointerDown,
+            onPointerMove: _handleEdgePointerMove,
+            onPointerUp: _handleEdgePointerEnd,
+            onPointerCancel: _handleEdgePointerEnd,
+            child: widget.content,
+          ),
         ),
       ),
       drawerContent: RepaintBoundary(
@@ -207,6 +293,7 @@ class _PhoneLayoutState extends State<PhoneLayout>
                 loading: drawerState.loading,
                 onNavigationEntrySelected: _handleNavigationEntrySelected,
                 onConversationActivated: _handleConversationActivated,
+                onPluginDockDragChanged: _handlePluginDockDragChanged,
               );
             },
           ),
@@ -324,7 +411,22 @@ class _PhoneLayoutState extends State<PhoneLayout>
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onTap: widget.onCloseDrawer,
-                    child: const ColoredBox(color: Colors.transparent),
+                    child:
+                        _activePluginDrags > 0 &&
+                            layout != null &&
+                            layout.workspaceDockDestination != null &&
+                            dock != null
+                        ? _PhoneWorkspaceDropTarget(
+                            canAccept: (payload) =>
+                                layout.workspaceDockDestination != null &&
+                                dock.canMove(
+                                  payload.entryId,
+                                  SidebarDockLocation.secondary,
+                                ),
+                            onAccept: (payload) =>
+                                _dockPlugin(dock, layout, payload),
+                          )
+                        : const ColoredBox(color: Colors.transparent),
                   ),
                 ),
               Positioned(
@@ -334,8 +436,8 @@ class _PhoneLayoutState extends State<PhoneLayout>
                 top: 0,
                 bottom: 0,
                 width: widget.drawerWidth,
-                child: TickerMode(
-                  enabled: isDrawerOpen,
+                child: RetainedPage(
+                  active: isDrawerOpen,
                   child: Transform.translate(
                     // A fixed Stack slot keeps drag frames in the paint phase.
                     offset: Offset(drawerOffset, 0),
@@ -384,6 +486,63 @@ class _PhoneLayoutState extends State<PhoneLayout>
   }
 }
 
+class _PhoneWorkspaceDropTarget extends StatelessWidget {
+  /// Creates the workspace landing area in the space beside the open drawer.
+  const _PhoneWorkspaceDropTarget({
+    required this.canAccept,
+    required this.onAccept,
+  });
+
+  final bool Function(SidebarDockDragPayload) canAccept;
+  final ValueChanged<SidebarDockDragPayload> onAccept;
+
+  /// Highlights the workspace landing area when the dragged plugin enters it.
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    return DragTarget<SidebarDockDragPayload>(
+      onWillAcceptWithDetails: (details) => canAccept(details.data),
+      onAcceptWithDetails: (details) => onAccept(details.data),
+      builder: (context, candidates, rejected) {
+        final hovered = candidates.isNotEmpty;
+        return ColoredBox(
+          color: hovered
+              ? colors.primaryContainer
+              : colors.surfaceContainerHigh,
+          child: SafeArea(
+            left: false,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Icon(
+                      Icons.drive_folder_upload_outlined,
+                      color: colors.primary,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      AppLocalizations.of(context)!.workspaceDockDropTarget,
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: hovered
+                            ? colors.onPrimaryContainer
+                            : colors.onSurface,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 class _DrawerHorizontalDragGestureRecognizer
     extends HorizontalDragGestureRecognizer {
   /// Keeps gestures beginning in editable or excluded content out of the arena.
@@ -392,33 +551,29 @@ class _DrawerHorizontalDragGestureRecognizer
     if (!super.isPointerAllowed(event)) {
       return false;
     }
-    return !_startsInExcludedRegion(event);
+    return !_startsInDrawerGestureExcludedRegion(event);
   }
 
   /// Applies the same exclusion policy to pointer pan and zoom gestures.
   @override
   bool isPointerPanZoomAllowed(PointerPanZoomStartEvent event) {
     return super.isPointerPanZoomAllowed(event) &&
-        !_startsInExcludedRegion(event);
+        !_startsInDrawerGestureExcludedRegion(event);
   }
+}
 
-  /// Resolves gesture exclusions using the transformed hit-test path.
-  bool _startsInExcludedRegion(PointerEvent event) {
-    // Reject before entering the arena, not in onUpdate: winning the arena
-    // would already cancel the text field's cursor/selection recognizers.
-    // Use the actual hit-test path so zoom and animated transforms are honored.
-    final result = HitTestResult();
-    RendererBinding.instance.hitTestInView(
-      result,
-      event.position,
-      event.viewId,
-    );
-    return result.path.any(
-      (entry) =>
-          entry.target is RenderEditable ||
-          DrawerGestureExclusion.containsTarget(entry.target),
-    );
-  }
+/// Resolves gesture exclusions using the transformed hit-test path.
+bool _startsInDrawerGestureExcludedRegion(PointerEvent event) {
+  // Reject before entering the arena, not in onUpdate: winning the arena
+  // would already cancel the text field's cursor/selection recognizers.
+  // Use the actual hit-test path so zoom and animated transforms are honored.
+  final result = HitTestResult();
+  RendererBinding.instance.hitTestInView(result, event.position, event.viewId);
+  return result.path.any(
+    (entry) =>
+        entry.target is RenderEditable ||
+        DrawerGestureExclusion.containsTarget(entry.target),
+  );
 }
 
 class _PhoneLayoutAnimatedChild extends StatelessWidget {

@@ -24,6 +24,7 @@ impl DirectoryTerminalHost {
             types: ["bash", "zsh", "shell"]
                 .into_iter()
                 .map(|kind| TerminalTypeInfo {
+                    nameKey: None,
                     terminal: if kind == "shell" { "arm64" } else { "native" }.into(),
                     terminalType: kind.into(),
                     available: true,
@@ -203,15 +204,15 @@ async fn super_admin_sdk_keeps_chat_directory_across_javascript_scheduling() {
         handler.registerDefaultTools();
         let output = operit_store::ChatOutputStore::ChatOutputStore::new(storage.clone())
             .bind("terminal-chat", 1793740800123, None).unwrap();
-        let mapper = operit_tools::files::PathMapper::PathMapper::new(
-            storage.runtimeRootDir().unwrap(), storage.workspaceRootDir().unwrap(), storage.clone());
+        let filesystem = app.hostManager.vfs().unwrap();
         for workspace in [None, Some("/operitapp/workspaces/project with space"), None] {
             let base = workspace.unwrap_or(&output);
-            let native = std::path::PathBuf::from(mapper.resolve(base).unwrap().nativePath().unwrap());
+            let native = std::path::PathBuf::from(operit_host_api::FileSource::nativePath(&filesystem.file(base).unwrap()).unwrap());
             std::fs::create_dir_all(native.join(".operit/attachments/fixture")).unwrap();
             std::fs::write(native.join(".operit/attachments/fixture/input.txt"), base).unwrap();
             for kind in ["bash", "zsh", "shell"] {
                 let context = ToolRuntimeContext {
+                    callerName: None,
                     callerChatId: Some("terminal-chat".into()), callerParticipantId: None,
                     workspacePath: workspace.map(str::to_string), workspaceFolders: Vec::new(),
                     toolExposureMode: ToolExposureMode::FULL, extensionOwner: "test-owner".into(), executionData: Default::default(),
@@ -236,6 +237,7 @@ async fn super_admin_sdk_keeps_chat_directory_across_javascript_scheduling() {
             for kind in ["bash", "zsh", "shell"] {
                 let before = terminal.commands.lock().unwrap().len();
                 let context = ToolRuntimeContext {
+                    callerName: None,
                     callerChatId: Some(chat_id.into()), callerParticipantId: None,
                     workspacePath: workspace.map(str::to_string), workspaceFolders: Vec::new(),
                     toolExposureMode: ToolExposureMode::FULL, extensionOwner: "test-owner".into(), executionData: Default::default(),

@@ -4,13 +4,14 @@ import { fileURLToPath } from "node:url";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { checkProject } from "./check.mjs";
+import { buildWasm } from "./build-wasm.mjs";
 const require = createRequire(import.meta.url);
 const { build } = require("esbuild");
 const { zipSync } = require("fflate");
 const ts = require("typescript");
 const root = fileURLToPath(new URL("../", import.meta.url));
 
-/** Bundles current typed browser sources into the sole offline IIFE used by the WebView. */
+/** Bundles only the read-only memory graph canvas for the optional WebView. */
 export async function buildBrowserScript() {
   const result = await build({ absWorkingDir: root, entryPoints: [path.join(root, "web/app.ts")], tsconfig: path.join(root, "tsconfig.web.json"), bundle: true, format: "iife", platform: "browser", target: "es2020", write: false, legalComments: "none" });
   if (result.outputFiles.length !== 1) throw new Error("The offline editor must have exactly one browser script");
@@ -37,9 +38,9 @@ export async function buildGraphModule() {
   return result.outputFiles[0].text;
 }
 
-/** Lowers async/await to scoped Promise continuations so shared services retain each execution owner. */
+/** Bundles the main provider; the engine owns async continuation compilation. */
 export async function buildMainScript() {
-  const result = await build({ absWorkingDir: root, entryPoints: [path.join(root, "src/main.ts")], bundle: true, format: "cjs", platform: "neutral", target: "es2020", supported: { "async-await": false }, external: ["./ui/*/index.ui.js"], write: false });
+  const result = await build({ absWorkingDir: root, entryPoints: [path.join(root, "src/main.ts")], bundle: true, format: "cjs", platform: "neutral", target: "es2020", external: ["./ui/*/index.ui.js"], write: false });
   if (result.outputFiles.length !== 1) throw new Error("The package must have exactly one main provider script");
   return result.outputFiles[0].contents;
 }
@@ -50,7 +51,7 @@ export async function buildUiScreenScripts() {
   if (entries.length !== 9) throw new Error("Character cards must build its nine independently registered Compose screens");
   const scripts = {};
   for (const entry of entries) {
-    const result = await build({ absWorkingDir: root, entryPoints: [path.join(root, entry)], bundle: true, format: "cjs", platform: "neutral", target: "es2020", charset: "utf8", supported: { "async-await": false }, write: false });
+    const result = await build({ absWorkingDir: root, entryPoints: [path.join(root, entry)], bundle: true, format: "cjs", platform: "neutral", target: "es2020", charset: "utf8", write: false });
     if (result.outputFiles.length !== 1) throw new Error("A Compose screen must produce exactly one module: " + entry);
     const output = entry.replace(/^src\//, "dist/").replace(/\.ts$/, ".js");
     scripts[output] = result.outputFiles[0].contents;
@@ -93,14 +94,11 @@ export async function buildRuntimeToolsScript() {
   return result.outputFiles[0].contents;
 }
 
-/** Creates the exact offline document from current TypeScript sources for packaging and UI tests. */
+/** Creates the display-only graph document; native DSL owns every management control. */
 export async function createHtmlDocument() {
   const script = await buildBrowserScript();
-  const styles = ["web/style.css", "web/shared/ui/presentation.css", "web/features/graph/style.css"];
-  const sections = [];
-  for (const style of styles) sections.push(await readFile(path.join(root, style), "utf8"));
-  const css = sections.join("\n");
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'none'; font-src 'none'"><title>角色卡</title><style>${css}</style></head><body><main id="app" aria-label="角色卡"><div class="loading" role="status">正在加载角色卡…</div></main><div id="dialogs"></div><div id="snackbar" role="status" aria-live="polite"></div><script>${script.replaceAll("</script", "<\\/script")}</script></body></html>`;
+  const css = await readFile(path.join(root, "web/style.css"), "utf8");
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; font-src 'none'"><title>记忆图谱</title><style>${css}</style></head><body><main aria-label="记忆图谱"><svg aria-label="记忆图谱画布"></svg><div id="status" role="status">正在加载记忆图谱…</div></main><script>${script.replaceAll("</script", "<\\/script")}</script></body></html>`;
 }
 
 /** Enumerates every regular source file so new modules cannot silently disappear from archives. */
@@ -108,6 +106,7 @@ export async function sourceFiles(directory) {
   const result = [];
   const entries = await readdir(path.join(root, directory), { withFileTypes: true });
   for (const entry of entries) {
+    if (entry.name === "__pycache__" || entry.name === ".cache") continue;
     const relative = `${directory}/${entry.name}`;
     if (entry.isDirectory()) result.push(...await sourceFiles(relative));
     else if (entry.isFile()) result.push(relative);
@@ -148,6 +147,7 @@ export async function createPackageArchive(mainScript, toolsScript, htmlDocument
 
 /** Packages one typed character-and-memory provider with the same document exercised by UI tests. */
 export async function buildPackage() {
+  buildWasm();
   const inputs = await captureBuildInputs();
   if (checkProject("tsconfig.json") !== 0) throw new Error("Main-runtime TypeScript diagnostics must be resolved before packaging");
   if (checkProject("tsconfig.web.json") !== 0) throw new Error("Browser TypeScript diagnostics must be resolved before packaging");

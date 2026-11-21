@@ -19,8 +19,7 @@ use aes_gcm::{aead::{Aead, KeyInit, Payload}, Aes256Gcm, Nonce};
 pub use operit_data_rescue::RescueProgress;
 
 const BOOTSTRAP: &str = "runtime/link/local_runtime_storage.json";
-const SECRET_KEYS: &[&str] = &["operit.preferences.encryption_key.v1", "market.github-oauth-pending"];
-const SYSTEM_SECRETS: &str = "system/host-secrets.json";
+use operit_data_rescue::secrets::{self, SECRET_KEYS, SYSTEM_SECRETS};
 
 /// Holds the operating-system file lock until every user of this lease has stopped.
 pub struct StorageLease { _file: File }
@@ -237,9 +236,15 @@ struct JournalSecrets { imported: BTreeMap<String, String>, previous: BTreeMap<S
 impl NativeRescueHost {
     /// Removes interrupted archive transfers from the exact Host-owned staging namespaces.
     fn cleanup_abandoned_archives(&self) -> Result<(), String> {
-        for parent in [&self.application, &self.roots["runtime"], &self.roots["runtime"].join("identities")] {
+        let runtime = &self.roots["runtime"];
+        let runtimeParent = runtime.parent().ok_or("Runtime root has no parent")?;
+        let parents = BTreeSet::from([
+            self.application.as_path(), runtimeParent, runtime.as_path(),
+        ]);
+        for parent in parents {
             NativeArchiveStagingHost::cleanupAbandonedArchivesForRuntimeParent(parent).map_err(text)?;
         }
+        NativeArchiveStagingHost::cleanupAbandonedArchivesForRuntimeParent(&runtime.join("identities")).map_err(text)?;
         Ok(())
     }
 
@@ -391,13 +396,7 @@ impl NativeRescueHost {
 
     /// Reads the portable secret values without exporting OS-specific wrapping keys.
     fn read_secrets(&self) -> Result<BTreeMap<String, String>, String> {
-        let mut values = BTreeMap::new();
-        if let Some(store) = &self.secrets {
-            for key in SECRET_KEYS {
-                if let Some(value) = store.readSecret(key).map_err(text)? { values.insert((*key).into(), STANDARD.encode(value)); }
-            }
-        }
-        Ok(values)
+        secrets::read_secrets(self.secrets.as_deref())
     }
 
     /// Seals portable key material before any durable publication catalog is written.
@@ -428,10 +427,7 @@ impl NativeRescueHost {
         let ciphertext = STANDARD.decode(&envelope.ciphertext).map_err(text)?;
         let plaintext = cipher.decrypt(Nonce::from_slice(&nonce), Payload { msg: &ciphertext, aad: journal.id.as_bytes() }).map_err(text)?;
         let values: JournalSecrets = serde_json::from_slice(&plaintext).map_err(text)?;
-        for (key, value) in &values.imported {
-            if !SECRET_KEYS.contains(&key.as_str()) { return Err("Unregistered publication secret".into()); }
-            STANDARD.decode(value).map_err(text)?;
-        }
+        secrets::validate_secrets(&values.imported)?;
         Ok(Some(values))
     }
 
@@ -518,10 +514,7 @@ impl NativeRescueHost {
             let store = self.secrets.as_ref().ok_or("This Host cannot import system secrets")?;
             progress.advance(self, journal.secret_index as u64);
             for (index, key) in SECRET_KEYS.iter().enumerate().skip(journal.secret_index) {
-                match secrets.imported.get(*key) {
-                    Some(encoded) => store.writeSecret(key, &STANDARD.decode(encoded).map_err(text)?).map_err(text)?,
-                    None => store.deleteSecret(key).map_err(text)?,
-                }
+                secrets::restore_secret(store.as_ref(), &secrets.imported, key)?;
                 journal.secret_index = index + 1;
                 self.save_journal(&journal)?;
                 progress.advance(self, 1);
@@ -652,13 +645,12 @@ impl RescueHost for NativeRescueHost {
         File::open(source).map_err(text)?.take(MAX_PREFERENCES_EXPORT_BYTES as u64 + 1).read_to_end(&mut content).map_err(text)?;
         if content.len() > MAX_PREFERENCES_EXPORT_BYTES { return Err(format!("Preferences exceed 16 MiB: {path}")); }
         let profile_secrets = NativeFileSecretStore(root.join("secrets"));
-        let storage = NativeRuntimeStorageHost::new(root, self.roots["workspaces"].clone());
         let secrets = if self.profile_file_secrets {
             Some(&profile_secrets as &dyn HostSecretStore)
         } else {
             self.secrets.as_deref()
         };
-        exportPreferences(&storage_path, content, || readPreferencesExportKey(&storage, secrets))
+        exportPreferences(&storage_path, content, || readPreferencesExportKey(secrets))
             .map(Some).map_err(|error| format!("{path}: {error}"))
     }
 
@@ -712,11 +704,7 @@ impl RescueHost for NativeRescueHost {
         let nodes = self.manifest_nodes(manifest)?;
         let secret_path = self.staged_path(id, SYSTEM_SECRETS)?;
         let secrets: BTreeMap<String, String> = serde_json::from_slice(&fs::read(secret_path).map_err(text)?).map_err(text)?;
-        for (key, encoded) in &secrets {
-            if !SECRET_KEYS.contains(&key.as_str()) { return Err(format!("Unregistered Host secret: {key}")); }
-            STANDARD.decode(encoded).map_err(text)?;
-        }
-        if !secrets.is_empty() && self.secrets.is_none() { return Err("This Host does not support importing the archive's system secrets".into()); }
+        secrets::validate_destination(&secrets, self.secrets.as_deref())?;
         let bootstrap = self.staged_path(id, "client/link/local_runtime_storage.json")?;
         if bootstrap.is_file() {
             let mut value: Value = serde_json::from_slice(&fs::read(&bootstrap).map_err(text)?).map_err(|error| format!("Imported startup configuration is invalid: {error}"))?;

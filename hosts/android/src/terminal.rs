@@ -31,6 +31,24 @@ const PLATFORM: &str = "android";
 const PROOT_TERMINAL: &str = "proot";
 const ANDROID_SYSTEM_TERMINAL: &str = "android-system";
 const PRIMARY_TERMINAL_TYPE: &str = "bash";
+
+fn resolveAndroidNativeWorkingDirectory(
+    path: &str,
+    documentOperation: &dyn Fn(serde_json::Value) -> HostResult<serde_json::Value>,
+) -> HostResult<String> {
+    let Some(resource) = operit_host_api::FileSystemResource::FileSystemResource::parse(path)? else {
+        return Ok(path.to_string());
+    };
+    if resource.backend != "android_documents" {
+        return Err(HostError::new("Unsupported Android terminal filesystem backend"));
+    }
+    let value = documentOperation(serde_json::json!({
+        "operation": "resolveNativeDirectory", "path": path,
+    }))?;
+    let directory = value.as_str().filter(|value| value.starts_with('/') && !value.contains('\0'))
+        .ok_or_else(|| HostError::new("Android document provider returned an invalid native directory"))?;
+    Ok(directory.to_string())
+}
 type RawFd = i32;
 #[cfg(target_os = "android")]
 type AndroidPid = libc::pid_t;
@@ -50,6 +68,7 @@ extern "C" {
 #[derive(Clone, Default)]
 pub struct AndroidTerminalHost {
     state: Arc<Mutex<AndroidTerminalState>>,
+    profile: Option<operit_host_api::TerminalProfile>,
 }
 
 #[derive(Default)]
@@ -130,6 +149,7 @@ impl AndroidTerminalHost {
         let normalizedTerminalType = requireAndroidTerminal(terminal, terminalType)?;
         let workDir = nonBlank(workingDir, "working_directory")?;
         let session = createAndroidPtySession(
+            self.profile.as_ref(),
             normalizedSessionName,
             normalizedTerminalType,
             workDir,
@@ -185,16 +205,18 @@ impl AndroidTerminalHost {
         Ok(exitCode)
     }
 
+    /// Removes session mappings before tearing down its process outside the registry lock.
     pub fn closePtySession(&self, sessionId: &str) -> HostResult<()> {
-        let mut state = self.lockState()?;
-        let removed = state.ptySessions.remove(sessionId);
-        if removed.is_none() {
-            androidLogError(&format!("closePtySession missing sessionId={sessionId}"));
-            return Err(HostError::new(format!(
-                "Android PTY session does not exist: {sessionId}"
-            )));
-        }
-        removeAndroidSessionMappings(&mut state, sessionId);
+        let removed = {
+            let mut state = self.lockState()?;
+            let removed = state.ptySessions.remove(sessionId).ok_or_else(|| {
+                HostError::new(format!("Android PTY session does not exist: {sessionId}"))
+            })?;
+            removeAndroidSessionMappings(&mut state, sessionId);
+            removed
+        };
+        // Process teardown may block and must not hold the terminal registry lock.
+        drop(removed);
         Ok(())
     }
 
@@ -210,6 +232,101 @@ impl AndroidTerminalHost {
 }
 
 impl TerminalHost for AndroidTerminalHost {
+    /// Offers ARM64 rootfs archives only on Android devices executing that architecture.
+    fn terminalDistributions(&self) -> HostResult<Vec<operit_host_api::TerminalDistribution>> {
+        if std::env::consts::ARCH != "aarch64" {
+            return Ok(Vec::new());
+        }
+        Ok(operit_host_native_common::TerminalRootfs::distributions())
+    }
+
+    /// Installs each downloaded distribution into its own device-local rootfs directory.
+    fn installTerminalDistribution(
+        &self,
+        distributionId: &str,
+        instanceId: &str,
+        name: &str,
+        control: operit_host_api::HttpDownloadControl,
+        progress: operit_host_api::TerminalInstallProgressCallback,
+    ) -> HostResult<operit_host_api::TerminalProfile> {
+        if std::env::consts::ARCH != "aarch64" {
+            return Err(HostError::new(
+                "Downloadable rootfs images require an ARM64 Android host",
+            ));
+        }
+        let runtime = requiredAndroidRuntimePath("OPERIT_ANDROID_RUNTIME_ROOT")?;
+        let relative = operit_host_api::RuntimeStorageLayout::TERMINAL_ROOTFS_DIR_PATH
+            .strip_prefix("runtime/")
+            .ok_or_else(|| HostError::new("Invalid terminal storage definition"))?;
+        operit_host_native_common::TerminalRootfs::install(
+            &runtime.join(relative),
+            distributionId,
+            instanceId,
+            name,
+            PROOT_TERMINAL,
+            "bash",
+            control,
+            progress,
+        )
+    }
+
+    /// Removes only a fresh host-owned instance when durable profile registration fails.
+    fn discardTerminalDistribution(&self, instanceId: &str) -> HostResult<()> {
+        let runtime = requiredAndroidRuntimePath("OPERIT_ANDROID_RUNTIME_ROOT")?;
+        let relative = operit_host_api::RuntimeStorageLayout::TERMINAL_ROOTFS_DIR_PATH
+            .strip_prefix("runtime/")
+            .ok_or_else(|| HostError::new("Invalid terminal storage definition"))?;
+        operit_host_native_common::TerminalRootfs::discard(&runtime.join(relative), instanceId)
+    }
+
+    /// Registers user-supplied Linux root filesystems without modifying the bundled runtime.
+    fn terminalProfileSupport(&self) -> HostResult<Vec<operit_host_api::TerminalProfileSupport>> {
+        Ok(self
+            .terminalInfo()?
+            .types
+            .into_iter()
+            .map(|entry| operit_host_api::TerminalProfileSupport {
+                fields: if entry.terminal == PROOT_TERMINAL {
+                    vec!["rootfs".into()]
+                } else {
+                    Vec::new()
+                },
+                terminal: entry.terminal,
+                terminalType: entry.terminalType,
+            })
+            .collect())
+    }
+
+    /// Creates a separate PTY registry for an explicitly supplied proot root filesystem.
+    fn configuredTerminal(
+        &self,
+        profile: &operit_host_api::TerminalProfile,
+    ) -> HostResult<Arc<dyn TerminalHost>> {
+        requireAndroidTerminal(&profile.terminal, &profile.terminalType)?;
+        let rootfs = profile
+            .options
+            .get("rootfs")
+            .ok_or_else(|| HostError::new("Custom proot terminal requires rootfs"))?;
+        if profile.terminal != PROOT_TERMINAL
+            || profile.options.len() != 1
+            || !Path::new(rootfs).is_absolute()
+            || !Path::new(rootfs).is_dir()
+            || !Path::new(rootfs).join("bin/bash").is_file()
+        {
+            return Err(HostError::new(
+                "Proot rootfs must be an accessible absolute directory containing /bin/bash",
+            ));
+        }
+        Ok(Arc::new(Self {
+            state: Arc::default(),
+            profile: Some(profile.clone()),
+        }))
+    }
+
+    fn resolveNativeWorkingDirectory(&self, path: &str) -> HostResult<String> {
+        resolveAndroidNativeWorkingDirectory(path, &crate::document_filesystem::call)
+    }
+
     /// Resolves proot guest paths separately from Android system-shell host paths.
     fn resolveWorkingDirectory(
         &self,
@@ -223,7 +340,16 @@ impl TerminalHost for AndroidTerminalHost {
                 workingDir,
                 resolveHostDirectory,
             ),
-            "shell" => resolveHostDirectory(workingDir),
+            "shell" => {
+                let directory = resolveHostDirectory(workingDir)?;
+                let transport = crate::terminal_privilege::privileges()?.select()?;
+                let internalRoot = requiredAndroidRuntimePath("OPERIT_ANDROID_INTERNAL_ROOT")?;
+                Ok(androidSystemShellWorkingDirectory(
+                    &transport,
+                    &directory,
+                    &internalRoot,
+                ))
+            }
             value => Err(HostError::new(format!(
                 "Unsupported Android terminal type: {value}"
             ))),
@@ -241,12 +367,14 @@ impl TerminalHost for AndroidTerminalHost {
                     terminalType: PRIMARY_TERMINAL_TYPE.to_string(),
                     available: true,
                     description: "Android proot Linux bash terminal".to_string(),
+                    nameKey: Some("terminalBuiltinAndroidLinux".into()),
                 },
                 TerminalTypeInfo {
                     terminal: ANDROID_SYSTEM_TERMINAL.to_string(),
                     terminalType: "shell".to_string(),
                     available: true,
                     description: "Android system shell terminal".to_string(),
+                    nameKey: Some("terminalBuiltinAndroidSystem".into()),
                 },
             ],
         })
@@ -352,6 +480,7 @@ impl TerminalHost for AndroidTerminalHost {
 
         let workingDir = initialAndroidWorkingDir(&normalizedTerminalType)?;
         let session = createAndroidPtySession(
+            self.profile.as_ref(),
             normalizedSessionName.clone(),
             normalizedTerminalType.clone(),
             workingDir,
@@ -518,24 +647,30 @@ impl TerminalHost for AndroidTerminalHost {
 
     fn closeSession(&self, sessionId: &str) -> HostResult<TerminalCloseOutput> {
         let normalizedSessionId = nonBlank(sessionId, "session_id")?;
-        let mut state = self.lockState()?;
-        state
-            .ptySessions
-            .remove(&normalizedSessionId)
-            .ok_or_else(|| {
-                HostError::new(format!("Terminal session does not exist: {sessionId}"))
-            })?;
-        state
-            .sessionNameToId
-            .retain(|_, value| value != &normalizedSessionId);
-        state
-            .hiddenExecutorKeyToSessionId
-            .retain(|_, value| value != &normalizedSessionId);
+        self.closePtySession(&normalizedSessionId)?;
         Ok(TerminalCloseOutput {
             sessionId: normalizedSessionId.clone(),
             success: true,
             message: format!("Terminal session closed: {normalizedSessionId}"),
         })
+    }
+
+    fn closeSessionIfIdle(&self, sessionId: &str, sessionName: &str) -> HostResult<TerminalCloseOutput> {
+        let id = nonBlank(sessionId, "session_id")?;
+        let name = nonBlank(sessionName, "session_name")?;
+        let mut state = self.lockState()?;
+        let session = state.ptySessions.get(&id)
+            .ok_or_else(|| HostError::new(format!("Terminal session does not exist: {id}")))?;
+        if !operit_host_api::terminalSessionNameMatches(&session.sessionName, &name) {
+            return Err(HostError::new("Terminal session name does not match"));
+        }
+        if session.commandRunning {
+            return Err(HostError::new("Terminal session has a command in progress"));
+        }
+        state.ptySessions.remove(&id);
+        state.sessionNameToId.retain(|_, value| value != &id);
+        state.hiddenExecutorKeyToSessionId.retain(|_, value| value != &id);
+        Ok(TerminalCloseOutput { sessionId: id.clone(), success: true, message: format!("Idle terminal session closed: {id}") })
     }
 
     fn getSessionScreen(&self, sessionId: &str) -> HostResult<TerminalScreenOutput> {
@@ -592,6 +727,7 @@ fn hiddenAndroidPtySessionId(
     }
 
     let session = createAndroidPtySession(
+        host.profile.as_ref(),
         format!("hidden:{executorLabel}"),
         terminalType.to_string(),
         initialAndroidWorkingDir(terminalType)?,
@@ -608,6 +744,7 @@ fn hiddenAndroidPtySessionId(
 }
 
 fn createAndroidPtySession(
+    profile: Option<&operit_host_api::TerminalProfile>,
     sessionName: String,
     terminalType: String,
     workingDir: String,
@@ -617,7 +754,10 @@ fn createAndroidPtySession(
     androidLogInfo(&format!(
         "createAndroidPtySession start name={sessionName} type={terminalType} workingDir={workingDir} size={rows}x{cols}"
     ));
-    let command = buildAndroidPtyCommand(&terminalType, &workingDir)?;
+    let command = match profile {
+        Some(profile) => buildAndroidProfileCommand(profile, &workingDir)?,
+        None => buildAndroidPtyCommand(&terminalType, &workingDir)?,
+    };
     let (pid, readerFd, masterFd) = startAndroidPtyProcess(&command, rows, cols)?;
     androidLogInfo(&format!(
         "createAndroidPtySession forked pid={pid:?} masterFd={masterFd} name={sessionName}"
@@ -1586,8 +1726,70 @@ struct AndroidPtyCommand {
     envp: Vec<CString>,
     cwd: CString,
     shizuku: bool,
+    dropRootToShell: bool,
     workingDir: Option<String>,
     startupInput: Option<String>,
+}
+
+/// Starts bash inside the user-selected proot filesystem with the managed workspace binds.
+fn buildAndroidProfileCommand(
+    profile: &operit_host_api::TerminalProfile,
+    workingDir: &str,
+) -> HostResult<AndroidPtyCommand> {
+    let rootfs = profile
+        .options
+        .get("rootfs")
+        .ok_or_else(|| HostError::new("Proot rootfs is required"))?;
+    let mut command = crate::runtime_common::buildAndroidProotCommandWithRootfs(
+        "/bin/bash",
+        Some(workingDir),
+        Path::new(rootfs),
+    )?;
+    command.env("TERM", "xterm-256color");
+    command.env("PS1", "$PWD $ ");
+    command.env("PROMPT_COMMAND", androidPtyPromptCommand());
+    command.args(["--noprofile", "--norc", "-i"]);
+    let executable = cstring(&command.get_program().to_string_lossy())?;
+    let mut argv = vec![executable.clone()];
+    for argument in command.get_args() {
+        argv.push(cstring(&argument.to_string_lossy())?);
+    }
+    let mut environment: BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+        env::vars_os().collect();
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                environment.insert(key.into(), value.into());
+            }
+            None => {
+                environment.remove(key);
+            }
+        }
+    }
+    let envp = environment
+        .into_iter()
+        .map(|(key, value)| {
+            cstring(&format!(
+                "{}={}",
+                key.to_string_lossy(),
+                value.to_string_lossy()
+            ))
+        })
+        .collect::<HostResult<Vec<_>>>()?;
+    Ok(AndroidPtyCommand {
+        executable,
+        argv,
+        envp,
+        cwd: cstringPath(
+            command
+                .get_current_dir()
+                .ok_or_else(|| HostError::new("Proot process directory is required"))?,
+        )?,
+        shizuku: false,
+        dropRootToShell: false,
+        workingDir: None,
+        startupInput: None,
+    })
 }
 
 /// Builds the PTY startup command for an Android terminal type.
@@ -1657,6 +1859,7 @@ fn buildAndroidBashPtyCommand(workingDir: &str) -> HostResult<AndroidPtyCommand>
         envp,
         cwd: cstringPath(&internalRoot)?,
         shizuku: false,
+        dropRootToShell: false,
         workingDir: None,
         startupInput: None,
     })
@@ -1685,6 +1888,21 @@ fn buildAndroidShellPtyCommand(workingDir: &str) -> HostResult<AndroidPtyCommand
     )
 }
 
+/// Maps app-private directories to shared storage for Shizuku system shells.
+fn androidSystemShellWorkingDirectory(
+    transport: &crate::terminal_privilege::ShellTransport,
+    workingDir: &str,
+    internalRoot: &Path,
+) -> String {
+    if *transport == crate::terminal_privilege::ShellTransport::Shizuku
+        && Path::new(workingDir).starts_with(internalRoot)
+    {
+        "/sdcard".to_string()
+    } else {
+        workingDir.to_string()
+    }
+}
+
 /// Builds the selected persistent shell with literal argv and transport-specific paths.
 fn buildAndroidSystemShellCommand(
     transport: crate::terminal_privilege::ShellTransport,
@@ -1697,11 +1915,11 @@ fn buildAndroidSystemShellCommand(
 ) -> HostResult<AndroidPtyCommand> {
     use crate::terminal_privilege::ShellTransport;
 
-    let mut workDir = nonBlank(workingDir, "working_directory")?;
-    // The ADB shell UID cannot enter the app's private default directory.
-    if transport == ShellTransport::Shizuku && Path::new(&workDir) == internalRoot {
-        workDir = "/sdcard".to_string();
-    }
+    let workDir = androidSystemShellWorkingDirectory(
+        &transport,
+        &nonBlank(workingDir, "working_directory")?,
+        internalRoot,
+    );
     let ldLibraryPath = format!(
         "{}:{}",
         nativeLibraryDir.to_string_lossy(),
@@ -1778,6 +1996,7 @@ fn buildAndroidSystemShellCommand(
             cstringPath(&internalRoot)?
         },
         shizuku: transport == ShellTransport::Shizuku,
+        dropRootToShell: false,
         workingDir: Some(workDir),
         startupInput: Some(include_str!("system_shell_init.sh").to_string()),
     })
@@ -1946,6 +2165,92 @@ fn resizeAndroidPtyProcess(
     }
 }
 
+/// A root-started Shizuku (e.g. KernelSU) leaks uid 0 into its UserService
+/// children; the terminal promises shell identity, so drop before exec or die.
+/// Mirrors Operit1's shell_identity_launcher: groups → gid → uid → setcon.
+#[cfg(target_os = "android")]
+unsafe fn dropRootToShellIdentity() {
+    const SHELL_UID: libc::uid_t = 2000;
+    const SHELL_GID: libc::gid_t = 2000;
+    const SHELL_GROUPS: [libc::gid_t; 12] = [
+        2000, // shell
+        1004, // input
+        1007, // log
+        1011, // adb
+        1015, // sdcard_rw
+        1028, // sdcard_r
+        3001, // net_bt_admin
+        3002, // net_bt
+        3003, // inet
+        3006, // net_bw_stats
+        3009, // readproc
+        3011, // uhid
+    ];
+    let fail = |message: &[u8]| -> ! {
+        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+        libc::_exit(126);
+    };
+    if libc::setgroups(SHELL_GROUPS.len(), SHELL_GROUPS.as_ptr()) != 0 {
+        fail(b"setgroups(shell) failed\n");
+    }
+    if libc::setgid(SHELL_GID) != 0 {
+        fail(b"setgid(2000) failed\n");
+    }
+    if libc::setuid(SHELL_UID) != 0 {
+        fail(b"setuid(2000) failed\n");
+    }
+    // Best effort: some su domains cannot dyntransition to u:r:shell:s0, and
+    // uid 2000 already removes root DAC powers. Drop uid first because the
+    // shell domain would deny setuid/setgid.
+    let context = b"u:r:shell:s0\0";
+    let fd = libc::open(
+        b"/proc/self/attr/current\0".as_ptr().cast(),
+        libc::O_WRONLY | libc::O_CLOEXEC,
+    );
+    let switched = fd >= 0 && {
+        let written = libc::write(fd, context.as_ptr().cast(), context.len());
+        libc::close(fd);
+        written == context.len() as libc::ssize_t
+    };
+    if !switched {
+        let message = b"setcon(u:r:shell:s0) failed; continuing as uid 2000\n";
+        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+    }
+    if libc::getuid() != SHELL_UID || libc::getgid() != SHELL_GID {
+        fail(b"shell identity verification failed\n");
+    }
+}
+
+/// Re-execs a standalone Android Host after applying the terminal's shell identity.
+#[cfg(target_os = "android")]
+pub fn androidExecShellProcess(arguments: &[String]) -> HostResult<()> {
+    let arguments = arguments
+        .iter()
+        .map(|argument| cstring(argument))
+        .collect::<HostResult<Vec<_>>>()?;
+    let executable = arguments
+        .first()
+        .ok_or_else(|| HostError::new("Missing Android shell executable"))?;
+    let mut pointers = arguments
+        .iter()
+        .map(|argument| argument.as_ptr())
+        .collect::<Vec<_>>();
+    pointers.push(std::ptr::null());
+    unsafe {
+        if libc::geteuid() == 0 {
+            dropRootToShellIdentity();
+        }
+        if libc::getuid() != 2000 || libc::getgid() != 2000 {
+            return Err(HostError::new("Android UI server requires shell uid/gid 2000"));
+        }
+        libc::execv(executable.as_ptr(), pointers.as_ptr());
+    }
+    Err(HostError::new(format!(
+        "Android shell exec failed: {}",
+        std::io::Error::last_os_error()
+    )))
+}
+
 /// Forks the PTY child in the current process's Android security context.
 fn forkPtyExecve(
     command: &AndroidPtyCommand,
@@ -1978,6 +2283,9 @@ fn forkPtyExecve(
         }
         if pid == 0 {
             unsafe {
+                if command.dropRootToShell && libc::geteuid() == 0 {
+                    dropRootToShellIdentity();
+                }
                 if libc::chdir(command.cwd.as_ptr()) != 0 {
                     libc::write(
                         libc::STDERR_FILENO,
@@ -2015,6 +2323,89 @@ fn forkPtyExecve(
             return Err(HostError::new("Could not mark Android PTY close-on-exec"));
         }
         Ok((pid, masterFd))
+    }
+}
+
+/// Forks a noninteractive child with separate stdout/stderr pipes so binary
+/// output (e.g. screencap PNG) never passes through PTY line discipline.
+#[cfg(target_os = "android")]
+fn forkPipeExecve(command: &AndroidPtyCommand) -> HostResult<(AndroidPid, RawFd, RawFd)> {
+    let mut stdoutPipe: [libc::c_int; 2] = [-1, -1];
+    let mut stderrPipe: [libc::c_int; 2] = [-1, -1];
+    unsafe {
+        if libc::pipe(stdoutPipe.as_mut_ptr()) != 0 {
+            return Err(HostError::new("stdout pipe failed"));
+        }
+        if libc::pipe(stderrPipe.as_mut_ptr()) != 0 {
+            libc::close(stdoutPipe[0]);
+            libc::close(stdoutPipe[1]);
+            return Err(HostError::new("stderr pipe failed"));
+        }
+        let pid = libc::fork();
+        if pid < 0 {
+            for fd in stdoutPipe.iter().chain(stderrPipe.iter()) {
+                libc::close(*fd);
+            }
+            return Err(HostError::new("fork failed"));
+        }
+        if pid == 0 {
+            if libc::dup2(stdoutPipe[1], libc::STDOUT_FILENO) < 0
+                || libc::dup2(stderrPipe[1], libc::STDERR_FILENO) < 0
+            {
+                libc::write(
+                    stderrPipe[1],
+                    b"dup2 failed\n".as_ptr().cast(),
+                    b"dup2 failed\n".len(),
+                );
+                libc::_exit(1);
+            }
+            for fd in stdoutPipe.iter().chain(stderrPipe.iter()) {
+                libc::close(*fd);
+            }
+            let fail = |message: &[u8]| -> ! {
+                libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+                libc::_exit(1);
+            };
+            let null = libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY);
+            if null < 0 || libc::dup2(null, libc::STDIN_FILENO) < 0 {
+                fail(b"stdin /dev/null failed\n");
+            }
+            if null > libc::STDERR_FILENO {
+                libc::close(null);
+            }
+            // After dup2 so a refused identity drop is visible in collected stderr.
+            if command.dropRootToShell && libc::geteuid() == 0 {
+                dropRootToShellIdentity();
+            }
+            if libc::chdir(command.cwd.as_ptr()) != 0 {
+                fail(b"chdir failed\n");
+            }
+            let mut argv = command
+                .argv
+                .iter()
+                .map(|item| item.as_ptr())
+                .collect::<Vec<_>>();
+            argv.push(ptr::null());
+            let mut envp = command
+                .envp
+                .iter()
+                .map(|item| item.as_ptr())
+                .collect::<Vec<_>>();
+            envp.push(ptr::null());
+            libc::execve(command.executable.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            fail(b"execve failed\n");
+        }
+        libc::close(stdoutPipe[1]);
+        libc::close(stderrPipe[1]);
+        for fd in [stdoutPipe[0], stderrPipe[0]] {
+            if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                terminateAndroidPtyProcess(AndroidPtyProcess::Local(pid));
+                libc::close(stdoutPipe[0]);
+                libc::close(stderrPipe[0]);
+                return Err(HostError::new("Could not mark Android exec pipes close-on-exec"));
+            }
+        }
+        Ok((pid, stdoutPipe[0], stderrPipe[0]))
     }
 }
 
@@ -2182,6 +2573,44 @@ fn pollPidExitCode(process: AndroidPtyProcess) -> HostResult<Option<i32>> {
     }
 }
 
+/// Parses one privileged launch request; every child must keep the shell identity.
+#[cfg(target_os = "android")]
+fn privilegedPtyCommand(request: &serde_json::Value) -> HostResult<AndroidPtyCommand> {
+    use serde_json::Value;
+    let strings = |key: &str| -> HostResult<Vec<CString>> {
+        request
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| HostError::new(format!("Missing PTY {key}")))?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .ok_or_else(|| HostError::new("Invalid PTY argument"))
+                    .and_then(cstring)
+            })
+            .collect()
+    };
+    let argv = strings("argv")?;
+    let executable = argv
+        .first()
+        .ok_or_else(|| HostError::new("Empty PTY argv"))?
+        .clone();
+    let cwd = request
+        .get("cwd")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::new("Missing PTY cwd"))?;
+    Ok(AndroidPtyCommand {
+        executable,
+        argv,
+        envp: strings("env")?,
+        cwd: cstring(cwd)?,
+        shizuku: false,
+        dropRootToShell: true,
+        workingDir: None,
+        startupInput: None,
+    })
+}
+
 /// Provides PTY primitives to the privileged Binder service without invoking the app runtime.
 #[cfg(target_os = "android")]
 pub fn androidPrivilegedPtyOperation(request: &str) -> HostResult<String> {
@@ -2189,49 +2618,25 @@ pub fn androidPrivilegedPtyOperation(request: &str) -> HostResult<String> {
     let request: Value =
         serde_json::from_str(request).map_err(|e| HostError::new(e.to_string()))?;
     if request.get("operation").and_then(Value::as_str) != Some("start")
+        && request.get("operation").and_then(Value::as_str) != Some("exec")
         && requiredPtyInteger(&request, "pid")? == 0
     {
         return Err(HostError::new("Android PTY PID must be positive"));
     }
     let response = match request.get("operation").and_then(Value::as_str) {
         Some("start") => {
-            let strings = |key: &str| -> HostResult<Vec<CString>> {
-                request
-                    .get(key)
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| HostError::new(format!("Missing PTY {key}")))?
-                    .iter()
-                    .map(|v| {
-                        v.as_str()
-                            .ok_or_else(|| HostError::new("Invalid PTY argument"))
-                            .and_then(cstring)
-                    })
-                    .collect()
-            };
-            let argv = strings("argv")?;
-            let executable = argv
-                .first()
-                .ok_or_else(|| HostError::new("Empty PTY argv"))?
-                .clone();
-            let cwd = request
-                .get("cwd")
-                .and_then(Value::as_str)
-                .ok_or_else(|| HostError::new("Missing PTY cwd"))?;
-            let command = AndroidPtyCommand {
-                executable,
-                argv,
-                envp: strings("env")?,
-                cwd: cstring(cwd)?,
-                shizuku: false,
-                workingDir: None,
-                startupInput: None,
-            };
+            let command = privilegedPtyCommand(&request)?;
             let rows = u16::try_from(requiredPtyInteger(&request, "rows")?)
                 .map_err(|e| HostError::new(e.to_string()))?;
             let cols = u16::try_from(requiredPtyInteger(&request, "cols")?)
                 .map_err(|e| HostError::new(e.to_string()))?;
             let (pid, fd) = forkPtyExecve(&command, rows, cols)?;
             json!({"pid": pid, "fd": fd})
+        }
+        Some("exec") => {
+            let command = privilegedPtyCommand(&request)?;
+            let (pid, stdoutFd, stderrFd) = forkPipeExecve(&command)?;
+            json!({"pid": pid, "stdoutFd": stdoutFd, "stderrFd": stderrFd})
         }
         Some("poll") => {
             json!({"exitCode": pollPidExitCode(AndroidPtyProcess::Local(requiredPtyInteger(&request, "pid")?))?})
@@ -2258,6 +2663,57 @@ pub fn androidPrivilegedPtyOperation(request: &str) -> HostResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn document_resource() -> String {
+        operit_host_api::FileSystemResource::FileSystemResource {
+            backend: "android_documents".into(),
+            root: "content://com.android.externalstorage.documents/tree/primary%3AProjects".into(),
+            path: "项目 with spaces".into(),
+        }.encode().unwrap()
+    }
+
+    #[test]
+    fn document_working_directory_is_resolved_by_android_provider() {
+        let resource = document_resource();
+        let directory = resolveAndroidNativeWorkingDirectory(&resource, &|request| {
+            assert_eq!(request["operation"], "resolveNativeDirectory");
+            assert_eq!(request["path"], resource);
+            Ok(serde_json::json!("/storage/emulated/0/Projects/项目 with spaces"))
+        }).unwrap();
+        assert_eq!(directory, "/storage/emulated/0/Projects/项目 with spaces");
+        for (terminal, kind) in [("proot", "bash"), ("android-system", "shell")] {
+            let actual = AndroidTerminalHost::default().resolveWorkingDirectory(
+                terminal, kind, "/virtual/android/documents/id/项目 with spaces", &|_| Ok(directory.clone()),
+            ).unwrap();
+            assert_eq!(actual, directory);
+        }
+    }
+
+    #[test]
+    fn native_and_guest_directories_do_not_call_document_provider() {
+        let reject = |_: serde_json::Value| panic!("provider must not receive native paths");
+        assert_eq!(resolveAndroidNativeWorkingDirectory("/storage/emulated/0/work", &reject).unwrap(),
+            "/storage/emulated/0/work");
+        let host = AndroidTerminalHost::default();
+        assert_eq!(host.resolveWorkingDirectory("proot", "bash", "/virtual/linux/root", &|_| {
+            panic!("guest paths must not reach host resolver")
+        }).unwrap(), "/root");
+    }
+
+    #[test]
+    fn document_directory_errors_and_invalid_provider_responses_are_rejected() {
+        let resource = document_resource();
+        let error = resolveAndroidNativeWorkingDirectory(&resource, &|_| {
+            Err(HostError::new("Document tree permission was revoked"))
+        }).unwrap_err();
+        assert!(error.message.contains("permission was revoked"));
+        for value in [serde_json::Value::Null, serde_json::json!("relative/path"),
+            serde_json::json!("/storage/bad\u{0}path")] {
+            assert!(resolveAndroidNativeWorkingDirectory(&resource, &|_| Ok(value.clone())).is_err());
+        }
+        let unsupported = resource.replace("android_documents", "other_backend");
+        assert!(resolveAndroidNativeWorkingDirectory(&unsupported, &|_| panic!("unsupported backend")).is_err());
+    }
 
     /// Builds production shell argv without requiring an Android runtime or device.
     fn system_shell(
@@ -2312,21 +2768,29 @@ mod tests {
     /// Shizuku must not inherit private app paths that the ADB shell UID cannot access.
     #[test]
     fn shizuku_system_shell_has_accessible_environment_and_default_directory() {
-        let command = system_shell(
-            crate::terminal_privilege::ShellTransport::Shizuku,
-            "/private/app",
-        );
-        assert!(command.shizuku);
-        assert_eq!(command.cwd.to_str().unwrap(), "/");
-        assert_eq!(command.workingDir.as_deref(), Some("/sdcard"));
-        for value in command.envp {
-            assert!(!value.to_str().unwrap().contains("/private/"));
+        for directory in ["/private/app", "/private/app/workspaces/project"] {
+            let command = system_shell(
+                crate::terminal_privilege::ShellTransport::Shizuku,
+                directory,
+            );
+            assert!(command.shizuku);
+            assert_eq!(command.cwd.to_str().unwrap(), "/");
+            assert_eq!(command.workingDir.as_deref(), Some("/sdcard"));
+            assert!(command.argv[2]
+                .to_str()
+                .unwrap()
+                .contains("cd '/sdcard' || exit;"));
+            for value in command.envp {
+                assert!(!value.to_str().unwrap().contains("/private/"));
+            }
         }
-        let explicit = system_shell(
-            crate::terminal_privilege::ShellTransport::Shizuku,
-            "/sdcard/custom",
-        );
-        assert_eq!(explicit.workingDir.as_deref(), Some("/sdcard/custom"));
+        for directory in ["/sdcard/custom", "/private/app-other/workspaces/project"] {
+            let explicit = system_shell(
+                crate::terminal_privilege::ShellTransport::Shizuku,
+                directory,
+            );
+            assert_eq!(explicit.workingDir.as_deref(), Some(directory));
+        }
     }
 
     /// Literal paths cannot inject commands and the app shell keeps its original private directory.

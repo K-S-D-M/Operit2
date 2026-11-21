@@ -16,6 +16,7 @@ import 'ui/rescue/DataRescueApp.dart';
 import 'core/errors/UnhandledErrorReporter.dart';
 import 'core/logging/ClientLogger.dart';
 import 'core/notifications/NotificationActivationService.dart';
+import 'core/host/IncomingAttachmentService.dart';
 import 'core/runtime/RuntimeBootstrapManager.dart';
 import 'ui/features/packages/screens/GitHubOAuthLoginCallback.dart';
 import 'ui/main/OperitApp.dart';
@@ -52,6 +53,7 @@ void main(List<String> arguments) async {
             name: 'Operit Data Rescue',
             child: DataRescueApp(
               canStopNormalProcess: launch['canStopNormalProcess'] == true,
+              canManageFiles: launch['canManageFiles'] == true,
             ),
           ),
         );
@@ -99,6 +101,7 @@ void main(List<String> arguments) async {
         );
       } else {
         NotificationActivationService.instance.initialize(arguments);
+        IncomingAttachmentService.instance.initialize();
         final runtimeStopwatch = Stopwatch()..start();
         await RuntimeBootstrapManager.instance.initialize();
         ClientLogger.v(
@@ -152,7 +155,6 @@ void main(List<String> arguments) async {
                         androidServiceClassName: 'app.operit.OperitCoreService',
                         openLabel: '打开 Operit2',
                         exitLabel: '退出 Operit2',
-                        quitMessage: '退出将停止后台任务。确定退出 Operit2？',
                       ),
                     );
                   }

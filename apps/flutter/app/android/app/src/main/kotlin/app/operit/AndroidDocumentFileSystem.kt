@@ -28,6 +28,7 @@ class AndroidDocumentFileSystem(
     fun execute(encoded: String): String = try {
         val request = JSONObject(encoded)
         val value: Any? = when (request.getString("operation")) {
+            "resolveNativeDirectory" -> node(request.getString("path")).nativeDirectory()
             "listFiles" -> JSONArray(node(request.getString("path")).children().map { it.entry() })
             "readFileBytes", "readFileWithLimit" -> {
                 val maximum = request.optLong("maxBytes", -1)
@@ -58,7 +59,7 @@ class AndroidDocumentFileSystem(
             }
             "openFile", "shareFile" -> {
                 val target = node(request.getString("path"))
-                require(!target.info().getBoolean("isDirectory")) { "Cannot open a directory as a file" }
+                require(!target.stat().getBoolean("isDirectory")) { "Cannot open a directory as a file" }
                 // Validate the real read capability, including revoked SAF grants.
                 target.input().use { }
                 val id = if (target.file == null) target.documentId() else null
@@ -125,7 +126,9 @@ class AndroidDocumentFileSystem(
         }
         JSONObject().put("ok", true).put("value", value ?: JSONObject.NULL).toString()
     } catch (error: Exception) {
-        JSONObject().put("ok", false).put("error", "${error.javaClass.simpleName}: ${error.message}").toString()
+        val presentation = runCatching { JSONObject(encoded).optString("operation") in setOf("openFile", "shareFile") }.getOrDefault(false)
+        val message = if (presentation) AndroidFileOpener.safeFailureMessage(error) else error.message
+        JSONObject().put("ok", false).put("error", "${error.javaClass.simpleName}: $message").toString()
     }
 
     private fun relativeParts(path: String): List<String> {
@@ -222,6 +225,10 @@ class AndroidDocumentFileSystem(
                 }
             }
             return current
+        }
+        fun nativeDirectory(): String {
+            require(stat().getBoolean("isDirectory")) { "Terminal working directory is not a directory" }
+            return file?.canonicalPath ?: documents.nativeDirectory(tree!!, documentId())
         }
         fun stat(): JSONObject {
             if (file != null) {

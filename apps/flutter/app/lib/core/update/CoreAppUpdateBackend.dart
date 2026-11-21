@@ -2,10 +2,12 @@
 import '../bridge/ProxyCoreRuntimeBridge.dart';
 import '../bridge/PlatformCoreProxy.dart';
 import '../proxy/generated/CoreProxyClients.g.dart';
+import '../proxy/generated/CoreProxyModels.g.dart' show ApplicationUpdatePlan;
 import '../logging/ClientLogger.dart';
+import '../link/CoreLinkProtocol.dart';
 import 'AppUpdateModels.dart';
 
-/// Presentation adapter only. The core owns target selection, HTTP, files and install_app.
+/// Presentation adapter only. Core and Host own target selection, HTTP, files and installation.
 class CoreAppUpdateBackend extends AppUpdateBackend {
   CoreAppUpdateBackend({
     GeneratedCoreProxyClients clients = const GeneratedCoreProxyClients(
@@ -13,6 +15,68 @@ class CoreAppUpdateBackend extends AppUpdateBackend {
     ),
   }) : _clients = clients;
   final GeneratedCoreProxyClients _clients;
+
+  /// Watches the local Host's network cost and transport through Core.
+  @override
+  Stream<AppUpdateNetwork> get backgroundNetwork =>
+      _clients.application.applicationUpdateNetworkFlow().map(
+        (network) => !network.connected
+            ? AppUpdateNetwork.offline
+            : network.unmetered
+            ? AppUpdateNetwork.unmetered
+            : AppUpdateNetwork.restricted,
+      );
+
+  /// Maps only explicit Core decisions to UI states.
+  AppUpdatePlan _plan(ApplicationUpdatePlan value) => AppUpdatePlan(
+    mode: switch (value.mode) {
+      'full' => AppUpdateMode.full,
+      'incremental' => AppUpdateMode.incremental,
+      'needs_base' => AppUpdateMode.needsBase,
+      'unavailable' => AppUpdateMode.unavailable,
+      _ => throw StateError('核心未返回可识别的更新方案'),
+    },
+    fullAvailable: value.fullAvailable,
+    incrementalAvailable: value.incrementalAvailable,
+    baseVersion: value.baseVersion,
+    fullBytes: value.fullBytes,
+    incrementalBytes: value.incrementalBytes,
+  );
+
+  /// Requests an authoritative plan before the first transfer.
+  @override
+  Future<AppUpdatePlan> plan(AppUpdateRelease release) async => _plan(
+    await _clients.application.planApplicationUpdate(version: release.version),
+  );
+
+  /// Verifies the selected old installer without downloading patch data.
+  @override
+  Future<AppUpdatePlan> supplyBase(
+    AppUpdateRelease release,
+    String path,
+  ) async {
+    try {
+      return _plan(
+        await _clients.application.supplyApplicationUpdateBase(
+          version: release.version,
+          sourcePath: path,
+        ),
+      );
+    } on CoreLinkError catch (error) {
+      if (error.message.startsWith('UPDATE_BASE_MISMATCH:')) {
+        throw const AppUpdateBaseMismatch();
+      }
+      rethrow;
+    }
+  }
+
+  /// Uses the existing plan when the user has no original installer.
+  @override
+  Future<AppUpdatePlan> chooseFull(AppUpdateRelease release) async => _plan(
+    await _clients.application.selectApplicationUpdateFull(
+      version: release.version,
+    ),
+  );
 
   @override
   Future<AppUpdateRelease?> check() async {
@@ -29,12 +93,51 @@ class CoreAppUpdateBackend extends AppUpdateBackend {
   @override
   Future<String> download(
     AppUpdateRelease release,
-    AppUpdateProgress progress,
-  ) async {
+    AppUpdateProgress progress, {
+    void Function()? onSelectingSource,
+    void Function()? onReconstructing,
+    void Function(AppUpdatePreparationProgress)? onPreparationProgress,
+  }) async {
+    var preparing = false;
     final subscription = _clients.application
         .applicationUpdateProgressFlow()
         .listen(
           (event) {
+            if (event.stage == 'selecting_source') {
+              preparing = false;
+              onSelectingSource?.call();
+              return;
+            }
+            if (event.stage == 'reconstructing') {
+              preparing = true;
+              onReconstructing?.call();
+              return;
+            }
+            final phase = switch (event.stage) {
+              'verifying_base' => AppUpdatePreparationPhase.verifyingBase,
+              'verifying_patch' => AppUpdatePreparationPhase.verifyingPatch,
+              'expanding_base' => AppUpdatePreparationPhase.expandingBase,
+              'verifying_expanded_base' =>
+                AppUpdatePreparationPhase.verifyingExpandedBase,
+              'applying_patch' => AppUpdatePreparationPhase.applyingPatch,
+              'restoring_package' => AppUpdatePreparationPhase.restoringPackage,
+              'verifying_package' => AppUpdatePreparationPhase.verifyingPackage,
+              'saving_package' => AppUpdatePreparationPhase.savingPackage,
+              _ => null,
+            };
+            if (phase != null) {
+              preparing = true;
+              onPreparationProgress?.call(
+                AppUpdatePreparationProgress(
+                  phase,
+                  event.receivedBytes,
+                  event.totalBytes,
+                ),
+              );
+              return;
+            }
+            if (event.stage != 'downloading') return;
+            preparing = false;
             progress(
               event.receivedBytes,
               event.totalBytes > 0 ? event.totalBytes : null,
@@ -43,7 +146,7 @@ class CoreAppUpdateBackend extends AppUpdateBackend {
           onError: (Object error, StackTrace stack) {
             // Completion/failure still comes from the download call. A broken
             // progress subscription must not escape as an unhandled UI error.
-            progress(0, null);
+            if (!preparing) progress(0, null);
             ClientLogger.w(
               'Application update progress unavailable',
               tag: 'AppUpdate',
@@ -57,6 +160,10 @@ class CoreAppUpdateBackend extends AppUpdateBackend {
         version: release.version,
       );
     } catch (error) {
+      if (error is CoreLinkError &&
+          error.message.startsWith('UPDATE_UNAVAILABLE')) {
+        throw const AppUpdateUnavailable();
+      }
       if (error.toString().contains('UPDATE_CANCELLED')) {
         throw const AppUpdateCancelled();
       }

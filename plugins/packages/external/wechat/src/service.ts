@@ -1,9 +1,12 @@
+import { ChannelStore, conversationKey } from "./channel-store.js";
+import { ChannelInbox, messageKey } from "./channel-inbox.js";
+import type { ChannelRequest, ChannelResponses, ChannelMessage, ChannelConversation } from "./channel-api.js";
 import {
   getSettings as waifuSettings,
   stream as waifuStream,
 } from "./dependencies/waifu/api.js";
-import { WeChatApi, hostHttp, WeChatApiError } from "./api.js";
-import { downloadMedia, uploadMedia, mediaReference } from "./media.js";
+import { WeChatApi, hostHttp, WeChatApiError, WeChatTransportError } from "./api.js";
+import { downloadMedia, downloadMediaContent, uploadMedia, mediaReference } from "./media.js";
 import {
   API_BASE,
   CHANNEL,
@@ -30,8 +33,18 @@ import {
   type Status,
 } from "./model.js";
 
-/** Owns one device-local WeChat account, long poll and ordered automatic replies. */
+interface ReplyTask {
+  superseded: boolean;
+  stopDelivery?: () => void;
+  done?: Promise<void>;
+  cancellation?: Promise<unknown>;
+}
+
+/** Owns one device-local WeChat account, long poll and automatic replies. */
 class WeChatService {
+  private readonly sessions = new ChannelStore();
+  private readonly opening = new Map<string, Promise<ChannelConversation>>();
+  private readonly channelInbox = new ChannelInbox();
   private readonly http = hostHttp();
   private api: WeChatApi;
   private readonly loginApi = new WeChatApi(this.http);
@@ -46,6 +59,7 @@ class WeChatService {
     qrcode: string;
     baseUrl: string;
     verifyCode: string;
+    startOnConfirm: boolean;
   } | null = null;
   private loginDelay: { timer: number; resolve: () => void } | null = null;
   private pollDelay: { timer: number; resolve: () => void } | null = null;
@@ -55,28 +69,37 @@ class WeChatService {
     expiresAt: 0,
     error: "",
   };
-  private autoTask: Promise<void> | null = null;
+  private readonly autoTasks = new Map<string, ReplyTask>();
   private autoTimer: number | null = null;
   private autoGeneration = 0;
-  private activeChat: string | null = null;
+  private readonly activeChats = new Map<string, string>();
+  private readonly activeContexts = new Map<string, {chatId: string; accountId: string; conversationId: string; authorId: string}>();
   private autoError = "";
   private repliedCount = 0;
 
   /** Binds a stored account to the ordinary cross-platform host network port. */
   constructor(private readonly config: Config) {
-    this.api = new WeChatApi(this.http, config.account);
-    if (config.delivery?.state === "processing") {
-      config.delivery.state = "failed";
-      config.delivery.error =
-        "上次运行在回复完成前结束，请确认已发送内容后选择重试或跳过。";
-      this.autoError = config.delivery.error;
+    this.api = new WeChatApi(this.http, config.account, this.sessions.recordSend("wechat"));
+    if (config.autoReply.enabled) config.queue = this.latestByUser(config.queue);
+    config.failedDeliveries ??= [];
+    config.activeDeliveries ??= [];
+    const interrupted = [...config.activeDeliveries, ...(config.delivery ? [config.delivery] : [])];
+    if (interrupted.length > 0) {
+      const recovered = interrupted.map((item) => item.state === "processing"
+        ? { ...item, state: "failed" as const, error: "上次运行在回复完成前结束，请确认已发送内容后选择重试或跳过。" }
+        : item);
+      config.failedDeliveries = [...config.failedDeliveries, ...recovered];
+      config.activeDeliveries = [];
+      config.delivery = null;
+      this.autoError = recovered[0].error;
     }
   }
 
   /** Exposes operational state while never returning the bearer token. */
   status(): Status {
     const account = this.config.account;
-    const delivery = this.config.delivery;
+    const allDeliveries = [...this.config.failedDeliveries, ...this.config.activeDeliveries];
+    const delivery = allDeliveries[0] ?? null;
     return {
       account:
         account === null
@@ -92,10 +115,11 @@ class WeChatService {
       queue: { size: this.config.queue.length, capacity: MAX_EVENTS },
       autoReply: {
         config: { ...this.config.autoReply },
-        running: this.autoTask !== null || this.autoTimer !== null,
+        running: this.autoTasks.size > 0 || this.autoTimer !== null,
         error: this.autoError,
         repliedCount: this.repliedCount,
         bindingCount: Object.keys(this.config.bindings).length,
+        deliveries: allDeliveries.map((item) => ({ messageId: item.event.messageId, userId: item.event.userId, state: item.state, delivered: item.delivered, error: item.error })),
         delivery:
           delivery === null
             ? null
@@ -111,7 +135,7 @@ class WeChatService {
   }
 
   /** Starts QR acquisition and returns as soon as a displayable QR value exists. */
-  async loginStart(): Promise<void> {
+  async loginStart(startOnConfirm = false): Promise<void> {
     await this.cancelLogin();
     await this.stopRuntime();
     this.config.listenerEnabled = false;
@@ -131,7 +155,7 @@ class WeChatService {
       this.loginSession = {
         qrcode: nonblank(response.qrcode, "qrcode"),
         baseUrl: API_BASE,
-        verifyCode: "",
+        verifyCode: "", startOnConfirm,
       };
       this.loginTask = this.pollLogin(++this.loginGeneration);
     } catch (error) {
@@ -214,13 +238,18 @@ class WeChatService {
             this.config.contexts = {};
             this.config.history = [];
             this.config.delivery = null;
+            this.config.activeDeliveries = [];
+            this.config.failedDeliveries = [];
           }
           this.config.account = account;
-          this.api = new WeChatApi(this.http, account);
+          this.api = new WeChatApi(this.http, account, this.sessions.recordSend("wechat"));
           this.login.qrContent = "";
           this.login.error = "扫码登录成功。";
           this.loginSession = null;
           await PluginConfig.flush(this.config);
+          if (session.startOnConfirm && generation === this.loginGeneration) {
+            await this.start().catch(error => { this.lastError = this.diagnostic(error); });
+          }
           return;
         }
         throw new Error(`未知微信二维码状态：${state}`);
@@ -275,16 +304,18 @@ class WeChatService {
       throw new Error("请先扫码登录微信机器人。");
     if (restart) await this.stopRuntime();
     if (this.pollTask !== null) return;
-    if (this.config.autoReply.enabled)
-      await waifuSettings(this.config.autoReply.waifuProfile);
     this.state = "connecting";
     this.lastError = "";
     try {
       await this.api.post("msg/notifystart");
     } catch (error) {
-      this.state = "error";
+      if (error instanceof WeChatApiError && error.code === -14) {
+        this.state = "error";
+        this.lastError = this.diagnostic(error);
+        throw new Error(this.lastError);
+      }
+      // Lifecycle notifications are best-effort in the iLink protocol.
       this.lastError = this.diagnostic(error);
-      throw new Error(this.lastError);
     }
     this.config.listenerEnabled = true;
     await PluginConfig.flush(this.config);
@@ -300,39 +331,73 @@ class WeChatService {
   /** Repeats getUpdates with the server cursor and persists it atomically with events. */
   private async poll(generation: number): Promise<void> {
     try {
-      let timeoutSeconds = 45;
+      let timeoutSeconds = 45, failures = 0;
       while (
         generation === this.pollGeneration &&
         this.config.listenerEnabled
       ) {
-        const response = await this.api.updates(
-          this.config.cursor,
-          timeoutSeconds,
-        );
+        let response: JsonObject;
+        try { response = await this.api.updates(this.config.cursor, timeoutSeconds); }
+        catch (error) {
+          const retryable = error instanceof WeChatTransportError || (error instanceof WeChatApiError && error.code !== -14);
+          if (!retryable || generation !== this.pollGeneration) throw error;
+          this.state = "connecting";
+          this.lastError = `网络中断，正在重连：${this.diagnostic(error)}`;
+          await this.waitPoll(Math.min(30000, 1000 * 2 ** Math.min(failures++, 5)));
+          continue;
+        }
+        failures = 0;
         if (generation !== this.pollGeneration) return;
         const messages = response.msgs === undefined ? [] : response.msgs;
         if (!Array.isArray(messages))
           throw new Error("微信 getUpdates 的 msgs 必须是数组。");
-        const cursor = text(response.get_updates_buf, "get_updates_buf");
+        const cursor = response.get_updates_buf === undefined ? "" : text(response.get_updates_buf, "get_updates_buf");
         const seen = new Set(this.config.seen);
         const incoming: InboundEvent[] = [];
         for (const value of messages) {
-          const raw = object(value, "WeChat message");
-          if (
-            raw.message_type !== 1 ||
-            (raw.message_state !== undefined && raw.message_state !== 2)
-          )
+          let event: InboundEvent;
+          try {
+            const raw = object(value, "WeChat message");
+            if (raw.message_type !== 1 || (raw.message_state !== undefined && raw.message_state !== 2) || (typeof raw.group_id === "string" && raw.group_id)) continue;
+            event = inbound(raw);
+          } catch (error) {
+            console.warn("[wechat.inbound]", this.diagnostic(error));
             continue;
-          const event = inbound(raw);
-          if (seen.has(event.messageId)) continue;
-          seen.add(event.messageId);
+          }
+          // The same remote message ID in another conversation is a different
+          // message. Legacy plain IDs remain conservative during migration.
+          const identity = JSON.stringify([this.api.requireAccount().botId, event.userId, event.messageId]);
+          if (seen.has(identity) || seen.has(event.messageId)) continue;
+          seen.add(identity);
           incoming.push(event);
         }
-        if (this.config.queue.length + incoming.length > MAX_EVENTS)
-          throw new Error(
-            "微信事件队列已满，请先消费或清空事件，再启动机器人。",
-          );
-        this.config.queue.push(...incoming);
+        // Route explicitly selected maintenance messages to the durable channel inbox
+        // alone when automatic replies are disabled. Other messages retain the normal queue.
+        const capture = this.config.channelCapture === true;
+        const ids = this.config.channelConversationIds;
+        const selected = (event: InboundEvent): boolean => capture && (!Array.isArray(ids) || ids.includes(event.userId));
+        const channelOnly = this.config.channelOnlyWhenNoAuto === true && !this.config.autoReply.enabled;
+        const queued = channelOnly ? incoming.filter(event => !selected(event)) : incoming;
+        const autoReply = this.config.autoReply.enabled;
+        const backlog = [...this.config.queue, ...queued];
+        const nextQueue = autoReply ? this.latestByUser(backlog) : backlog.slice(-MAX_EVENTS);
+        if (nextQueue.length > MAX_EVENTS) {
+          throw new Error("微信事件队列已满，请先消费或清空事件，再启动机器人。");
+        }
+        const accountId=nonblank(this.config.account?.botId,"botId");
+        for(const event of incoming){
+          const message:ChannelMessage={key:messageKey(["wechat",accountId,event.userId,event.messageId]),channel:"wechat",accountId,
+            messageId:event.messageId,conversationId:event.userId,authorId:event.userId,text:event.text,timestamp:String(event.timestamp),
+            autoReplyEnabled:this.config.autoReply.enabled,context:JSON.parse(JSON.stringify({contextToken:event.contextToken,items:event.items,raw:event.raw}))};
+          await this.sessions.observe(message,"c2c",`微信私聊 ${event.userId}`,this.config.bindings[`${accountId}:${event.userId}`]);
+          if(selected(event))await this.channelInbox.record(message);
+        }
+        if (this.config.autoReply.enabled) {
+          for (const event of queued) this.interrupt(event.userId);
+        }
+        // A worker or manual consumer may have claimed an entry during storage writes.
+        const remaining = [...this.config.queue, ...queued];
+        this.config.queue = this.config.autoReply.enabled ? this.latestByUser(remaining).slice(-MAX_EVENTS) : remaining.slice(-MAX_EVENTS);
         this.config.seen = [...seen].slice(-512);
         this.config.history = [...this.config.history, ...incoming].slice(-512);
         for (const event of incoming)
@@ -341,6 +406,7 @@ class WeChatService {
         this.receivedCount += incoming.length;
         await PluginConfig.flush(this.config);
         this.state = "ready";
+        this.lastError = "";
         if (response.longpolling_timeout_ms !== undefined) {
           const duration = integer(
             response.longpolling_timeout_ms,
@@ -350,13 +416,7 @@ class WeChatService {
           );
           timeoutSeconds = Math.ceil(duration / 1000) + 10;
         }
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(() => {
-            this.pollDelay = null;
-            resolve();
-          }, 100);
-          this.pollDelay = { timer, resolve };
-        });
+        await this.waitPoll(100);
       }
     } catch (error) {
       if (generation === this.pollGeneration) {
@@ -372,6 +432,13 @@ class WeChatService {
     } finally {
       if (generation === this.pollGeneration) this.pollTask = null;
     }
+  }
+
+  private waitPoll(ms: number): Promise<void> {
+    return new Promise(resolve => {
+      const timer = setTimeout(() => { this.pollDelay = null; resolve(); }, ms);
+      this.pollDelay = { timer, resolve };
+    });
   }
 
   /** Stops the poll, model generation and typing state before releasing the runtime. */
@@ -391,106 +458,125 @@ class WeChatService {
       await this.api.post("msg/notifystop");
   }
 
-  /** Starts automatic replies only after the authenticated poll is alive. */
+  /** Starts bounded workers after the authenticated poll is alive. */
   private startAuto(): void {
-    if (this.autoTask !== null || this.autoTimer !== null) return;
+    if (this.autoTasks.size > 0 || this.autoTimer !== null) return;
     const generation = ++this.autoGeneration;
     this.scheduleAuto(generation);
   }
 
-  /** Schedules one serialized event consumption pass. */
+  /** Repeatedly claims at most one message per peer, up to three peers. */
   private scheduleAuto(generation: number): void {
-    if (
-      generation !== this.autoGeneration ||
-      !this.config.autoReply.enabled ||
-      this.config.delivery !== null
-    )
-      return;
+    if (generation !== this.autoGeneration || !this.config.autoReply.enabled || this.autoTimer !== null) return;
     this.autoTimer = setTimeout(() => {
       this.autoTimer = null;
-      this.autoTask = this.autoTick(generation);
-      void this.autoTask.then(
-        () => {
-          this.autoTask = null;
-          this.scheduleAuto(generation);
-        },
-        (error) => {
-          this.autoTask = null;
-          this.autoError = this.diagnostic(error);
-        },
-      );
+      while (this.autoTasks.size < 3 && generation === this.autoGeneration && this.state === "ready") {
+        const event = this.claimAutoEvent();
+        if (event === null) break;
+        this.launchAuto(event, generation);
+      }
+      this.scheduleAuto(generation);
     }, 300);
   }
 
-  /** Cancels active Chat work and prevents another event from being claimed. */
+  /** Keeps one pending automatic reply per peer. */
+  private latestByUser(events: InboundEvent[]): InboundEvent[] {
+    const latest = new Map(events.map(event => [event.userId, event]));
+    return events.filter(event => latest.get(event.userId) === event);
+  }
+
+  private interrupt(userId: string): void {
+    const task = this.autoTasks.get(userId);
+    if (!task || task.superseded) return;
+    task.superseded = true;
+    void this.cancelReply(userId, task);
+  }
+
+  private cancelReply(userId: string, task: ReplyTask): Promise<unknown> | undefined {
+    task.stopDelivery?.();
+    const chatId = this.activeChats.get(userId);
+    if (chatId) task.cancellation ??= Tools.Chat.cancel(chatId).catch(error => console.error("[wechat.cancel]", this.diagnostic(error)));
+    return task.cancellation;
+  }
+
+  /** Reserves a peer synchronously before starting asynchronous persistence and model work. */
+  private claimAutoEvent(): InboundEvent | null {
+    const index = this.config.queue.findIndex(item => !this.autoTasks.has(item.userId));
+    if (index < 0) return null;
+    const event = this.config.queue[index];
+    this.config.queue = this.config.queue.filter((_, position) => position !== index);
+    this.config.activeDeliveries = [...this.config.activeDeliveries, { event, state: "processing", delivered: 0, error: "" }];
+    return event;
+  }
+
+  /** Keeps failures in durable records; a persistence error stops the entire worker pool. */
+  private launchAuto(event: InboundEvent, generation: number): Promise<void> {
+    const task: ReplyTask = { superseded: false };
+    this.autoTasks.set(event.userId, task);
+    const done = this.autoTick(event, generation, task).finally(async () => {
+      await task.cancellation;
+      this.autoTasks.delete(event.userId);
+    });
+    task.done = done;
+    void done.catch(error => {
+      this.autoError = this.diagnostic(error);
+      void this.stopAuto().catch(stopError => console.error("[wechat.stop]", this.diagnostic(stopError)));
+    });
+    return done;
+  }
+
+  /** Cancels every active Chat and waits for all records to settle. */
   private async stopAuto(): Promise<void> {
     ++this.autoGeneration;
     if (this.autoTimer !== null) {
       clearTimeout(this.autoTimer);
       this.autoTimer = null;
     }
-    if (this.activeChat !== null) await Tools.Chat.cancel(this.activeChat);
-    if (this.autoTask !== null) await this.autoTask;
-    this.autoTask = null;
+    await Promise.all([...this.autoTasks].map(([userId, task]) => this.cancelReply(userId, task)));
+    await Promise.allSettled([...this.autoTasks.values()].map(task => task.done));
   }
 
-  /** Converts one inbound message into an isolated native chat and delivers all AI segments. */
-  private async autoTick(generation: number): Promise<void> {
-    if (
-      generation !== this.autoGeneration ||
-      this.state !== "ready" ||
-      this.config.delivery !== null
-    )
-      return;
-    const event = this.config.queue.shift();
-    if (event === undefined || generation !== this.autoGeneration) return;
+  /** Converts one reserved inbound message to an isolated native chat and delivers all segments. */
+  private async autoTick(event: InboundEvent, generation: number, task: ReplyTask): Promise<void> {
+    const superseded = () => task.superseded;
     const config = this.config.autoReply;
-    this.autoError = "";
-    const binding = `${this.api.requireAccount().botId}:${event.userId}`;
-    this.config.delivery = {
-      event,
-      state: "processing",
-      delivered: 0,
-      error: "",
+    const current = () => this.config.activeDeliveries.find((item) => item.event === event);
+    const update = (delivered: number) => {
+      this.config.activeDeliveries = this.config.activeDeliveries.map((item) => item.event === event ? { ...item, delivered } : item);
     };
     let timedOut = false;
+    let finishedDelivery: (typeof this.config.activeDeliveries)[number] | undefined;
     try {
       await PluginConfig.flush(this.config);
-      let chatId = this.config.bindings[binding];
-      if (chatId === undefined) {
-        const input =
-          config.characterSelection === ""
-            ? null
-            : {
-                "com.operit.character_cards": {
-                  version: 1,
-                  selection: config.characterSelection,
-                },
-              };
-        chatId = (
-          await Tools.Chat.createNew({ setAsCurrentChat: false, input })
-        ).chatId;
-        await Tools.Chat.updateTitle(chatId, `微信 ${event.userId}`);
-        if (config.chatGroup !== "")
-          await Tools.Chat.updateGroup([chatId], config.chatGroup);
-        this.config.bindings = { ...this.config.bindings, [binding]: chatId };
-        await PluginConfig.flush(this.config);
-      }
+      if (superseded()) return;
+      await this.conversations();
+      if (superseded()) return;
+      const session=await this.openChat(conversationKey("wechat",this.api.requireAccount().botId,"c2c",event.userId));
+      const chatId=session.chatId!;
       if (generation !== this.autoGeneration)
         throw new Error("微信自动回复已停止。");
-      this.activeChat = chatId;
+      if (superseded()) return;
+      this.activeContexts.set(event.userId, {chatId, accountId: this.api.requireAccount().botId, conversationId: event.userId, authorId: event.userId});
       const attachments = [];
-      for (const item of event.items) {
-        if (mediaReference(item) === null) continue;
-        attachments.push(await downloadMedia(this.api, item, event.messageId));
+      let failedMedia = 0;
+      for (const item of event.items.flatMap(item => {
+        const quote = item.ref_msg as JsonObject | undefined;
+        return quote?.message_item && typeof quote.message_item === "object" ? [item, quote.message_item as JsonObject] : [item];
+      }).slice(0, 20)) {
+        if (superseded() || generation !== this.autoGeneration) return;
+        try {
+          if (mediaReference(item) !== null) attachments.push(await downloadMedia(this.api, item, event.messageId));
+        } catch (error) {
+          failedMedia++;
+          console.error("[wechat.media]", this.diagnostic(error));
+        }
       }
       if (generation !== this.autoGeneration)
         throw new Error("微信自动回复已停止。");
+      if (superseded()) return;
       const timer = setTimeout(() => {
         timedOut = true;
-        void Tools.Chat.cancel(chatId!).catch((error) =>
-          console.error("[wechat.timeout]", this.diagnostic(error)),
-        );
+        void this.cancelReply(event.userId, task);
       }, config.aiTimeoutMs);
       try {
         const input = {
@@ -498,14 +584,25 @@ class WeChatService {
           chatId,
           runtime: "main" as const,
           input: {
-            text: `${this.messageText(event)}\n\n[微信用户=${event.userId}; message=${event.messageId}]\n${config.assistantInstruction}`,
+            text: `${this.messageText(event)}${failedMedia ? `\n\n[${failedMedia} 个附件暂时无法读取，请勿编造内容]` : ""}\n\n${config.assistantInstruction}`,
             attachments,
             replyToMessageTimestamp: null,
           },
           turn: { kind: "execute" as const },
           notifyReply: false,
         };
-        for await (const output of waifuStream(input, config.waifuProfile)) {
+        const begin = () => {
+          if (superseded() || generation !== this.autoGeneration || timedOut) return null;
+          this.activeChats.set(event.userId, chatId);
+          return Tools.Chat.sendMessageStreaming(input)[Symbol.asyncIterator]();
+        };
+        const stopped = new Promise<void>(resolve => { task.stopDelivery = resolve; });
+        for await (const output of replyStream(input, config.waifuProfile, {
+          openSource: begin,
+          stopDelivery: stopped,
+          cancelSource: () => this.cancelReply(event.userId, task),
+        })) {
+          if (superseded()) return;
           if (generation !== this.autoGeneration)
             throw new Error("微信自动回复已停止。");
           if (timedOut) throw new Error("微信自动回复已超时。");
@@ -513,6 +610,7 @@ class WeChatService {
           if (output.segment.kind === "text") {
             const characters = Array.from(output.segment.text);
             for (let start = 0; start < characters.length; start += 4000) {
+              if (superseded()) return;
               if (generation !== this.autoGeneration || timedOut)
                 throw new Error("微信自动回复已停止或超时。");
               await this.api.sendText(
@@ -520,7 +618,7 @@ class WeChatService {
                 event.contextToken,
                 characters.slice(start, start + 4000).join(""),
               );
-              this.config.delivery.delivered++;
+              update((current()?.delivered ?? 0) + 1);
               await PluginConfig.flush(this.config);
             }
           } else {
@@ -530,36 +628,49 @@ class WeChatService {
               "image",
               output.segment.source,
             );
+            if (superseded()) return;
             if (generation !== this.autoGeneration || timedOut)
               throw new Error("微信自动回复已停止或超时。");
             await this.api.send(event.userId, event.contextToken, item);
-            this.config.delivery.delivered++;
+            update((current()?.delivered ?? 0) + 1);
             await PluginConfig.flush(this.config);
           }
         }
         if (timedOut) throw new Error("微信自动回复已超时。");
       } finally {
         clearTimeout(timer);
+        task.stopDelivery?.();
       }
-      if (this.config.delivery.delivered === 0)
-        throw new Error("Waifu 没有产生可发送的回复。");
-      this.repliedCount++;
-      this.config.delivery = null;
+      if (superseded()) return;
+      if (timedOut) throw new Error("微信自动回复已超时。");
+      if (generation !== this.autoGeneration) throw new Error("微信自动回复已停止。");
+      if ((current()?.delivered ?? 0) === 0)
+        throw new Error("模型没有产生可发送的回复。");
+      finishedDelivery = current();
+      this.config.activeDeliveries = this.config.activeDeliveries.filter((item) => item.event !== event);
       await PluginConfig.flush(this.config);
+      this.repliedCount++;
     } catch (error) {
+      if (superseded()) return;
       const message = timedOut
         ? "微信自动回复已超时。"
         : generation !== this.autoGeneration
           ? "微信自动回复已停止，请核对已发送内容后处理。"
           : this.diagnostic(error);
       this.autoError = message;
-      if (this.config.delivery !== null) {
-        this.config.delivery.state = "failed";
-        this.config.delivery.error = message;
+      const failed = current() ?? finishedDelivery;
+      if (failed) {
+        this.config.failedDeliveries = [...this.config.failedDeliveries, { ...failed, state: "failed" as const, error: message }].slice(-MAX_EVENTS);
+        this.config.activeDeliveries = this.config.activeDeliveries.filter((item) => item.event !== event);
       }
       await PluginConfig.flush(this.config);
     } finally {
-      this.activeChat = null;
+      this.activeChats.delete(event.userId);
+      this.activeContexts.delete(event.userId);
+      if (superseded() && current()) {
+        this.config.activeDeliveries = this.config.activeDeliveries.filter(item => item.event !== event);
+        await PluginConfig.flush(this.config);
+      }
     }
   }
 
@@ -583,10 +694,11 @@ class WeChatService {
           params.user_id === undefined || event.userId === params.user_id,
       )
       .slice(0, limit);
-    if (params.consume !== false)
-      for (const event of selected)
-        this.config.queue.splice(this.config.queue.indexOf(event), 1);
-    if (params.consume !== false) await PluginConfig.flush(this.config);
+    if (params.consume !== false && selected.length > 0) {
+      const consumed = new Set(selected);
+      this.config.queue = this.config.queue.filter((event) => !consumed.has(event));
+      await PluginConfig.flush(this.config);
+    }
     const events: JsonObject[] = selected.map((event) =>
       params.include_raw === true
         ? { ...event }
@@ -631,9 +743,10 @@ class WeChatService {
       );
     if (params.waifu_profile !== undefined)
       next.waifuProfile = nonblank(params.waifu_profile, "waifu_profile");
-    if (next.enabled) await waifuSettings(next.waifuProfile);
+    if (next.enabled && next.waifuProfile !== "native") await waifuSettings(next.waifuProfile);
     if (!next.enabled) await this.stopAuto();
     this.config.autoReply = next;
+    if (next.enabled) this.config.queue = this.latestByUser(this.config.queue);
     await PluginConfig.flush(this.config);
     if (next.enabled && this.pollTask !== null) this.startAuto();
   }
@@ -704,46 +817,54 @@ class WeChatService {
       case "auto_configure":
         await this.configureAuto(request.params);
         break;
-      case "auto_once":
+      case "auto_once": {
         if (this.state !== "ready") throw new Error("请先启动微信监听。");
-        if (this.autoTask !== null || this.autoTimer !== null)
+        if (this.autoTasks.size > 0 || this.autoTimer !== null)
           throw new Error("自动回复已在运行，请先关闭自动回复。");
-        this.autoTask = this.autoTick(this.autoGeneration);
-        try {
-          await this.autoTask;
-        } finally {
-          this.autoTask = null;
+        const event = this.claimAutoEvent();
+        if (event !== null) {
+          this.autoError = "";
+          await this.launchAuto(event, this.autoGeneration);
         }
         if (this.autoError !== "") throw new Error(this.autoError);
         break;
+      }
       case "delivery_resolve": {
-        if (
-          this.config.delivery === null ||
-          this.config.delivery.state !== "failed"
-        )
-          throw new Error("没有待处理的失败回复");
+        const failed = this.config.failedDeliveries;
         if (request.resolution !== "retry" && request.resolution !== "discard")
           throw new Error("resolution must be retry or discard");
+        if ((request.message_id === undefined) !== (request.user_id === undefined))
+          throw new Error("message_id and user_id must be provided together");
+        if (request.message_id === undefined && failed.length > 1)
+          throw new Error("存在多条失败回复，请指定用户和消息。");
+        const index = request.message_id === undefined ? 0 : failed.findIndex(
+          (item) => item.event.messageId === request.message_id && item.event.userId === request.user_id,
+        );
+        if (index < 0 || index >= failed.length) throw new Error("没有找到待处理的失败回复");
         if (request.resolution === "retry") {
           if (this.config.queue.length >= MAX_EVENTS)
             throw new Error("消息队列已满，请先消费消息再重试。");
-          this.config.queue.unshift(this.config.delivery.event);
+          this.config.queue = [failed[index].event, ...this.config.queue];
         }
-        this.config.delivery = null;
-        this.autoError = "";
+        this.config.failedDeliveries = failed.filter((_, position) => position !== index);
+        this.autoError = this.config.failedDeliveries[0]?.error ?? "";
         await PluginConfig.flush(this.config);
         if (this.state === "ready" && this.config.autoReply.enabled)
           this.startAuto();
         break;
       }
-      case "reset_conversation":
-        if (this.activeChat !== null)
+      case "reset_conversation": {
+        await this.conversations();
+        if (this.autoTasks.size > 0)
           throw new Error("请先停止正在进行的自动回复。");
-        delete this.config.bindings[
-          `${this.api.requireAccount().botId}:${nonblank(request.user_id, "user_id")}`
-        ];
+        const key = `${this.api.requireAccount().botId}:${nonblank(request.user_id, "user_id")}`;
+        const bindings = { ...this.config.bindings };
+        delete bindings[key];
+        this.config.bindings = bindings;
         await PluginConfig.flush(this.config);
+        await this.sessions.bind(conversationKey("wechat",this.api.requireAccount().botId,"c2c",request.user_id),null);
         break;
+      }
       case "download_media": {
         const event = [...this.config.queue, ...this.config.history].find(
           (value) => value.messageId === request.message_id,
@@ -805,6 +926,8 @@ class WeChatService {
     this.config.history = [];
     this.config.seen = [];
     this.config.delivery = null;
+    this.config.activeDeliveries = [];
+    this.config.failedDeliveries = [];
     this.api = new WeChatApi(this.http);
     this.login = { state: "idle", qrContent: "", expiresAt: 0, error: "" };
     this.autoError = "";
@@ -876,11 +999,7 @@ class WeChatService {
         const previous = this.config.history.find(
           (value) => value.messageId === id && value.userId === event.userId,
         );
-        quotes.push(
-          previous === undefined
-            ? `[引用消息 ${id}，本地未保存内容]`
-            : previous.text,
-        );
+        if (previous?.text) quotes.push(previous.text);
       }
       if (ref.title !== undefined)
         quotes.push(text(ref.title, "ref_msg.title"));
@@ -888,6 +1007,100 @@ class WeChatService {
     return [...quotes.map((value) => `[引用]\n${value}`), event.text].join(
       "\n\n",
     );
+  }
+
+  private async conversations():Promise<ChannelConversation[]>{
+    const accountId=this.config.account?.botId;if(!accountId)return [];
+    for(const [binding,chatId] of Object.entries(this.config.bindings)){
+      if(!binding.startsWith(accountId+":"))continue;
+      const id=binding.slice(accountId.length+1);
+      await this.sessions.remember({key:conversationKey("wechat",accountId,"c2c",id),channel:"wechat",accountId,scene:"c2c",conversationId:id,
+        title:`微信私聊 ${id}`,chatId,lastMessageAt:0});
+    }
+    return this.sessions.conversations("wechat",accountId);
+  }
+  private openChat(key:string):Promise<ChannelConversation>{
+    const existing=this.opening.get(key);if(existing)return existing;
+    const task=(async()=>{
+      const session=await this.sessions.get(key);
+      if(session.accountId!==this.config.account?.botId)throw Error("会话不属于当前微信账号");
+      if(session.chatId)return session;
+      const retained=this.config.bindings[`${session.accountId}:${session.conversationId}`];
+      if(retained)return this.sessions.bind(key,retained);
+      const config=this.config.autoReply,input=config.characterSelection===""?null:{"com.operit.character_cards":{version:1,selection:config.characterSelection}};
+      const chatId=(await Tools.Chat.createNew({setAsCurrentChat:false,input})).chatId;
+      this.config.bindings={...this.config.bindings,[`${session.accountId}:${session.conversationId}`]:chatId};await PluginConfig.flush(this.config);
+      const bound=await this.sessions.bind(key,chatId);
+      await Tools.Chat.updateTitle(chatId,session.title);if(config.chatGroup)await Tools.Chat.updateGroup([chatId],config.chatGroup);
+      return bound;
+    })();this.opening.set(key,task);void task.finally(()=>this.opening.delete(key)).catch(()=>{});return task;
+  }
+
+  /** Independent public channel contract, separate from the automatic-reply queue. */
+  async channel(request: ChannelRequest): Promise<ChannelResponses[ChannelRequest["action"]]> {
+    if (request === null || typeof request !== "object") throw new Error("Invalid channel request");
+    switch (request.action) {
+      case "conversations": return {conversations:await this.conversations()};
+      case "open_chat": return this.openChat(request.conversationKey);
+      case "history": {
+        const session=await this.sessions.get(request.conversationKey);
+        if(session.accountId!==this.config.account?.botId)throw Error("会话不属于当前微信账号");
+        return this.sessions.history(session.key,request.limit,request.before,undefined,true);
+      }
+      case "attachment": {
+        const requestApi = this.api;
+        const session = await this.sessions.get(request.conversationKey);
+        if (session.accountId !== requestApi.requireAccount().botId || requestApi !== this.api) throw Error("微信会话不属于当前账户");
+        const item = await this.sessions.attachment(session.key,request.messageId,request.index);
+        const bytes = await downloadMediaContent(requestApi,item,8 * 1024 * 1024);
+        if (requestApi !== this.api) throw Error("微信账户已切换");
+        return bytes;
+      }
+      case "subscribe": return this.sessions.subscribe(request.consumerId,request.routes,"wechat",this.config.account?.botId??"");
+      case "configure": {
+        if (typeof request.capture !== "boolean") throw new Error("capture must be boolean");
+        if (request.conversationIds !== undefined && request.conversationIds !== null &&
+            (!Array.isArray(request.conversationIds) || request.conversationIds.some(id => typeof id !== "string" || id.trim() === "")))
+          throw new Error("conversationIds must be null or an array of non-empty strings");
+        if (request.channelOnlyWhenNoAuto !== undefined && typeof request.channelOnlyWhenNoAuto !== "boolean") throw new Error("channelOnlyWhenNoAuto must be boolean");
+        const previous = this.config.channelCapture, previousIds = this.config.channelConversationIds, previousOnly = this.config.channelOnlyWhenNoAuto;
+        this.config.channelCapture = request.capture;
+        if (request.channelOnlyWhenNoAuto !== undefined) this.config.channelOnlyWhenNoAuto = request.channelOnlyWhenNoAuto;
+        if (request.conversationIds !== undefined) this.config.channelConversationIds = request.conversationIds === null ? null : [...new Set(request.conversationIds)];
+        try { await PluginConfig.flush(this.config); } catch (error) { this.config.channelCapture = previous; this.config.channelConversationIds = previousIds; this.config.channelOnlyWhenNoAuto = previousOnly; throw error; }
+        return { capture: this.config.channelCapture, conversationIds: this.config.channelConversationIds ?? null, channelOnlyWhenNoAuto: this.config.channelOnlyWhenNoAuto === true };
+      }
+      case "status": return { channel: "wechat", capture: this.config.channelCapture === true, conversationIds: this.config.channelConversationIds ?? null, channelOnlyWhenNoAuto: this.config.channelOnlyWhenNoAuto === true, service: this.state,
+        configured: this.config.account !== null, listenerEnabled: this.config.listenerEnabled, autoReplyEnabled: this.config.autoReply.enabled, error: this.lastError || this.autoError };
+      case "manage": {
+        const command = request.command;
+        if (!["start", "stop", "test", "login_start", "login_cancel", "login_status", "login_verify", "logout"].includes(command)) throw Error("Unknown WeChat management command");
+        if (command === "start" && "autoReply" in request && request.autoReply !== undefined) await this.configureAuto({ enabled: request.autoReply });
+        if (command === "login_start") await this.loginStart(true);
+        else if (command === "login_verify") await this.request({ action: command, code: request.code });
+        else if (command !== "login_status") await this.request({ action: command });
+        const status = await this.channel({ action: "status" });
+        return { ...status, login: { ...this.login } } as ChannelResponses["manage"];
+      }
+      case "active_context": {
+        const chatId = nonblank(request.chatId, "chatId");
+        const matches = [...this.activeContexts.values()].filter(value => value.chatId === chatId);
+        return matches.length === 1 ? {channel: "wechat", ...matches[0]} : null;
+      }
+      case "peek": return { messages: (request.consumerId===undefined ? await this.channelInbox.peek(request.limit, request.conversationId) : await this.sessions.peek(request.consumerId,request.limit,request.conversationKey)).filter(message=>message.accountId===this.config.account?.botId) };
+      case "ack": return { acknowledged: request.consumerId===undefined ? await this.channelInbox.ack(request.key) : await this.sessions.ack(request.consumerId,request.key) };
+      case "reply": {
+        const message = await this.channelInbox.get(request.key) ?? await this.sessions.replyRoute(request.key);
+        if (message === null) throw new Error("Pending message not found");
+        if (message.accountId !== this.config.account?.botId) throw new Error("Message belongs to a different WeChat account");
+        const { media } = request;
+        if (media) return { response: await this.sendMedia({ user_id: message.conversationId, source: media.source,
+          kind: media.kind === "audio" ? "voice" : media.kind, file_name: media.fileName,
+          duration_ms: media.durationMs, voice_format: media.voiceFormat, sample_rate: media.sampleRate, text: request.text }) };
+        return { response: await this.api.sendText(message.conversationId, this.replyContext(message.conversationId), nonblank(request.text, "text")) };
+      }
+      default: throw new Error("Unknown channel request");
+    }
   }
 
   /** Redacts credentials and conversation tokens before displaying or logging errors. */
@@ -902,6 +1115,17 @@ class WeChatService {
       secrets.push(request.params.context_token ?? "");
     if (request?.action === "login_verify") secrets.push(request.code);
     return errorText(error, secrets);
+  }
+}
+
+async function* replyStream(input: Parameters<typeof waifuStream>[0], profile: string, controls: Required<NonNullable<Parameters<typeof waifuStream>[2]>>): ReturnType<typeof waifuStream> {
+  if (profile !== "native") { yield* waifuStream(input, profile, controls); return; }
+  const source = controls.openSource();
+  if (!source) return;
+  for await (const item of { [Symbol.asyncIterator]: () => source }) {
+    if (item.type === "completed" && item.result.outcome.type === "committed" && item.result.outcome.status === "completed" && item.result.aiResponse) {
+      yield { type: "segment", index: 0, segment: { kind: "text", text: item.result.aiResponse } };
+    }
   }
 }
 
@@ -937,6 +1161,13 @@ export function receive(request: Request): Promise<Response> {
     } catch (error) {
       throw new Error(owner.diagnostic(error, request));
     }
+  });
+}
+
+export function channel(request: ChannelRequest): Promise<ChannelResponses[ChannelRequest["action"]]> {
+  return command(async owner => {
+    try { return await owner.channel(request); }
+    catch (error) { throw new Error(owner.diagnostic(error)); }
   });
 }
 

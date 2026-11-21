@@ -12,12 +12,15 @@ import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../../../l10n/generated/app_localizations.dart';
 import '../../../common/components/CommonNetworkErrorView.dart';
+import '../../../common/ApiErrorText.dart';
 import '../../../common/ThinkingLevelText.dart';
 import '../../../common/components/M3LoadingIndicator.dart';
 import '../../../theme/OperitFormStyles.dart';
 import '../../../theme/OperitGlassSurface.dart';
+import '../components/ApiKeyTextField.dart';
 import '../components/SettingsControlStyles.dart';
 import 'CodexLoginDialog.dart';
+import 'ApiKeyPoolEditor.dart';
 import 'ModelConnectionTestCapabilities.dart';
 import 'ProviderLogo.dart';
 import '../tts/TtsSettingsPanel.dart';
@@ -202,9 +205,9 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
           providerType: provider.providerType,
           endpoint: provider.endpoint,
           apiKey: result.apiKey,
-          useMultipleApiKeys: provider.useMultipleApiKeys,
-          apiKeyPool: provider.apiKeyPool,
-          currentKeyIndex: provider.currentKeyIndex,
+          useMultipleApiKeys: result.useMultipleApiKeys,
+          apiKeyPool: result.apiKeyPool,
+          currentKeyIndex: 0,
           keyRotationMode: provider.keyRotationMode,
           customHeaders: result.customHeaders,
           requestLimitPerMinute: result.requestLimitPerMinute,
@@ -261,8 +264,8 @@ class ModelSettingsPanelState extends State<ModelSettingsPanel> {
           ),
           endpoint: saveResult.endpoint,
           apiKey: saveResult.apiKey,
-          useMultipleApiKeys: provider.useMultipleApiKeys,
-          apiKeyPool: provider.apiKeyPool,
+          useMultipleApiKeys: saveResult.useMultipleApiKeys,
+          apiKeyPool: saveResult.apiKeyPool,
           currentKeyIndex: provider.currentKeyIndex,
           keyRotationMode: provider.keyRotationMode,
           customHeaders: saveResult.customHeaders,
@@ -643,6 +646,8 @@ class _ProviderEditSaveResult extends _ProviderEditResult {
     required this.providerTypeId,
     required this.endpoint,
     required this.apiKey,
+    required this.useMultipleApiKeys,
+    required this.apiKeyPool,
     required this.customHeaders,
     required this.requestLimitPerMinute,
     required this.maxConcurrentRequests,
@@ -652,6 +657,8 @@ class _ProviderEditSaveResult extends _ProviderEditResult {
   final String providerTypeId;
   final String endpoint;
   final String apiKey;
+  final bool useMultipleApiKeys;
+  final List<core_proxy.ApiKeyInfo> apiKeyPool;
   final String customHeaders;
   final int requestLimitPerMinute;
   final int maxConcurrentRequests;
@@ -698,6 +705,7 @@ class _ProviderEditorDialog extends StatefulWidget {
 
 class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
   final _formKey = GlobalKey<FormState>();
+  final _advancedController = ExpansibleController();
   late final TextEditingController _nameController;
   late final TextEditingController _endpointController;
   late final TextEditingController _apiKeyController;
@@ -706,11 +714,16 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
   late final TextEditingController _maxConcurrentController;
   String? _selectedProviderTypeId;
   core_proxy.CodexSessionStatus? _codexStatus;
+  late bool _useKeyPool;
+  late List<core_proxy.ApiKeyInfo> _keyPool;
+  bool _keyTesting = false;
 
   @override
   void initState() {
     super.initState();
     final provider = widget.provider;
+    _useKeyPool = provider?.useMultipleApiKeys ?? false;
+    _keyPool = List.of(provider?.apiKeyPool ?? const <core_proxy.ApiKeyInfo>[]);
     _nameController = TextEditingController(text: provider?.name ?? '');
     _endpointController = TextEditingController(text: provider?.endpoint ?? '');
     _apiKeyController = TextEditingController(text: provider?.apiKey ?? '');
@@ -741,6 +754,7 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
 
   @override
   void dispose() {
+    _advancedController.dispose();
     _nameController.dispose();
     _endpointController.dispose();
     _apiKeyController.dispose();
@@ -889,9 +903,44 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
     );
   }
 
+  /// Probes a draft credential using the current endpoint, headers, and first model.
+  Future<core_proxy.ApiKeyInfo> _testPoolEntry(core_proxy.ApiKeyInfo entry) {
+    final provider = widget.provider!;
+    return widget.clients.application.testProviderApiKey(
+      provider: core_proxy.ProviderProfile(
+        id: provider.id,
+        name: _nameController.text.trim(),
+        providerTypeId: _selectedProviderTypeId!,
+        providerType: core_proxy.ApiProviderType.fromJson(
+          _selectedProviderTypeId,
+        ),
+        endpoint: _endpointController.text.trim(),
+        apiKey: _apiKeyController.text,
+        useMultipleApiKeys: _useKeyPool,
+        apiKeyPool: _keyPool,
+        currentKeyIndex: provider.currentKeyIndex,
+        keyRotationMode: provider.keyRotationMode,
+        customHeaders: _customHeadersController.text,
+        requestLimitPerMinute: int.parse(_requestLimitController.text),
+        maxConcurrentRequests: int.parse(_maxConcurrentController.text),
+        models: provider.models,
+      ),
+      keyId: entry.id,
+    );
+  }
+
   /// Saves provider settings from the dialog form.
   void _save() {
-    if (!_formKey.currentState!.validate() || _selectedProviderTypeId == null) {
+    final invalidFields = _formKey.currentState!.validateGranularly();
+    if (invalidFields.any(
+      (field) =>
+          field.context.findAncestorWidgetOfExactType<ExpansionTile>()
+              ?.controller ==
+          _advancedController,
+    )) {
+      _advancedController.expand();
+    }
+    if (invalidFields.isNotEmpty || _selectedProviderTypeId == null) {
       return;
     }
     Navigator.of(context).pop(
@@ -902,6 +951,9 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
             ? 'https://chatgpt.com/backend-api/codex/responses'
             : _endpointController.text.trim(),
         apiKey: _apiKeyController.text,
+        useMultipleApiKeys:
+            !_isCodexProvider && !_isLocalProvider && _useKeyPool,
+        apiKeyPool: _keyPool,
         customHeaders: _customHeadersController.text,
         requestLimitPerMinute: int.parse(_requestLimitController.text),
         maxConcurrentRequests: int.parse(_maxConcurrentController.text),
@@ -995,11 +1047,14 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
                     status: _codexStatus,
                     onLogin: _openCodexLogin,
                   )
-                else
-                  _DialogTextField(
-                    controller: _apiKeyController,
-                    label: l10n.settingsModelApiKey,
-                    obscureText: true,
+                else if (!_useKeyPool || _isLocalProvider)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: ApiKeyTextField(
+                      key: ValueKey<String?>(_selectedProviderTypeId),
+                      controller: _apiKeyController,
+                      labelText: l10n.settingsModelApiKey,
+                    ),
                   ),
                 Theme(
                   data: Theme.of(context).copyWith(
@@ -1009,6 +1064,8 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
                     ),
                   ),
                   child: ExpansionTile(
+                    controller: _advancedController,
+                    maintainState: true,
                     tilePadding: EdgeInsets.zero,
                     childrenPadding: const EdgeInsets.only(top: 8),
                     shape: const Border(),
@@ -1019,7 +1076,6 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
                         fontWeight: FontWeight.w700,
                       ),
                     ),
-                    initiallyExpanded: false,
                     children: <Widget>[
                       _DialogTextField(
                         controller: _customHeadersController,
@@ -1045,6 +1101,29 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
                           ),
                         ],
                       ),
+                      if (!_isCodexProvider && !_isLocalProvider)
+                        ApiKeyPoolEditor(
+                          singleKey: _apiKeyController.text,
+                          onResetHealth: widget.provider == null
+                              ? null
+                              : () => widget
+                                    .clients
+                                    .preferencesModelConfigManager
+                                    .clearProviderApiKeyFailures(
+                                      providerId: widget.provider!.id,
+                                    ),
+                          enabled: _useKeyPool,
+                          entries: _keyPool,
+                          onEnabledChanged: (value) =>
+                              setState(() => _useKeyPool = value),
+                          onChanged: (entries) =>
+                              setState(() => _keyPool = entries),
+                          onTestingChanged: (value) =>
+                              setState(() => _keyTesting = value),
+                          onTestEntry: widget.provider?.models.isNotEmpty == true
+                              ? _testPoolEntry
+                              : null,
+                        ),
                     ],
                   ),
                 ),
@@ -1065,7 +1144,10 @@ class _ProviderEditorDialogState extends State<_ProviderEditorDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: Text(l10n.cancel),
         ),
-        FilledButton(onPressed: _save, child: Text(l10n.save)),
+        FilledButton(
+          onPressed: _keyTesting ? null : _save,
+          child: Text(l10n.save),
+        ),
       ],
     );
   }
@@ -2053,7 +2135,7 @@ class _AvailableModelItemCard extends StatelessWidget {
   }
 }
 
-/// Says where model details come from and whether the last catalog download failed.
+/// Describes the active catalog without surfacing background download failures.
 class _CatalogStatusLine extends StatelessWidget {
   const _CatalogStatusLine({
     required this.status,
@@ -2072,24 +2154,19 @@ class _CatalogStatusLine extends StatelessWidget {
     final l10n = AppLocalizations.of(context)!;
     final theme = Theme.of(context);
     final colorScheme = theme.colorScheme;
-    final error = retryError ?? status.lastError;
+    final error = retryError;
     final updatedAt = status.updatedAt;
     final String message;
-    if (error != null && updatedAt != null) {
-      message = l10n.settingsModelCatalogUpdateFailedUsing(
-        _formatCatalogTime(updatedAt),
-        error,
-      );
-    } else if (error != null) {
+    if (error != null) {
       message = l10n.settingsModelCatalogUpdateFailed(error);
     } else if (updatedAt == null) {
-      message = l10n.settingsModelCatalogNotDownloaded;
+      message = l10n.settingsModelCatalogBundled;
     } else {
       message = l10n.settingsModelCatalogUpdatedAt(
         _formatCatalogTime(updatedAt),
       );
     }
-    final failed = error != null || updatedAt == null;
+    final failed = error != null;
     final color = failed ? colorScheme.error : colorScheme.onSurfaceVariant;
     return Row(
       children: <Widget>[
@@ -2110,12 +2187,12 @@ class _CatalogStatusLine extends StatelessWidget {
             ),
           ),
         ),
-        if (failed && retrying)
+        if (retrying)
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: 8),
             child: M3LoadingIndicator(size: 14),
           )
-        else if (failed)
+        else
           TextButton(
             onPressed: onRetry,
             style: TextButton.styleFrom(
@@ -2672,7 +2749,7 @@ class _ProviderDetailScreen extends StatefulWidget {
 }
 
 /// How far one model's connection test has got.
-enum _ModelTestPhase { queued, testing, passed, failed }
+enum _ModelTestPhase { queued, testing, passed, failed, restricted }
 
 /// The latest connection test of one model in the list.
 class _ModelTestResult {
@@ -2688,23 +2765,46 @@ class _ModelTestResult {
     core_proxy.ModelConnectionTestReport report, {
     String? note,
   }) {
+    final restricted =
+        connectionTestHasRestrictions(report) &&
+        !connectionTestHasFailures(report);
     return _ModelTestResult._(
-      report.success ? _ModelTestPhase.passed : _ModelTestPhase.failed,
+      report.success
+          ? _ModelTestPhase.passed
+          : restricted
+          ? _ModelTestPhase.restricted
+          : _ModelTestPhase.failed,
       report: report,
       note: note,
     );
   }
 
   /// A test that could not run at all.
-  const _ModelTestResult.crashed(String error)
-    : this._(_ModelTestPhase.failed, error: error);
+  factory _ModelTestResult.crashed(String error) {
+    return _ModelTestResult._(
+      connectionTestRestriction(error) == null
+          ? _ModelTestPhase.failed
+          : _ModelTestPhase.restricted,
+      error: error,
+    );
+  }
+
+  factory _ModelTestResult.saved(core_proxy.ModelConnectionTestResult result) {
+    final report = result.report;
+    if (report != null) {
+      return _ModelTestResult.finished(report);
+    }
+    return _ModelTestResult.crashed(result.error!);
+  }
 
   final _ModelTestPhase phase;
   final core_proxy.ModelConnectionTestReport? report;
 
   /// Whether the test has an outcome to show, rather than still being waited on or run.
   bool get isFinished =>
-      phase == _ModelTestPhase.passed || phase == _ModelTestPhase.failed;
+      phase == _ModelTestPhase.passed ||
+      phase == _ModelTestPhase.failed ||
+      phase == _ModelTestPhase.restricted;
 
   /// Why the test could not run, when it could not.
   final String? error;
@@ -2714,8 +2814,8 @@ class _ModelTestResult {
 }
 
 class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
-  /// Models a batch tests at once; a provider's models share its rate limit.
-  static const int _batchConcurrency = 3;
+  /// Maximum number of models tested concurrently in one batch.
+  static const int _batchConcurrency = 32;
 
   late ModelSettingsData _data = widget.initialData;
   String? _expandedModelId;
@@ -2732,6 +2832,39 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
   int _batchDone = 0;
   int _batchTotal = 0;
   final GlobalKey<_DialogToastState> _toastKey = GlobalKey<_DialogToastState>();
+  late final Future<void> _testsLoaded;
+
+  @override
+  void initState() {
+    super.initState();
+    _testsLoaded = _restoreTests();
+  }
+
+  Future<Map<String, _ModelTestResult>> _loadSavedTests() async {
+    final results = await widget.clients.preferencesModelConfigManager
+        .getModelConnectionTestResults(providerId: widget.providerId);
+    return <String, _ModelTestResult>{
+      for (final result in results)
+        _modelTestKey(result.providerId, result.modelId):
+            _ModelTestResult.saved(result),
+    };
+  }
+
+  Future<void> _restoreTests() async {
+    try {
+      final tests = await _loadSavedTests();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _tests.addAll(tests);
+      });
+    } catch (error) {
+      if (mounted) {
+        _notify(_errorMessage(error), error: true);
+      }
+    }
+  }
 
   void _toggleModelSettings(String modelId) {
     setState(() {
@@ -2755,6 +2888,7 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
 
   Future<void> _refresh() async {
     try {
+      await _testsLoaded;
       final data = await widget.reload();
       if (!mounted) {
         return;
@@ -2773,14 +2907,27 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
       final testKeys = modelIds
           .map((modelId) => _modelTestKey(widget.providerId, modelId))
           .toSet();
+      final savedTests = await _loadSavedTests();
+      if (!mounted) {
+        return;
+      }
       setState(() {
         _data = data;
         // Checks and results of models deleted meanwhile go with them.
         _checkedModelIds.retainWhere(modelIds.contains);
-        _tests.removeWhere((key, _) => !testKeys.contains(key));
+        _tests.removeWhere(
+          (key, result) =>
+              !testKeys.contains(key) ||
+              (result.isFinished && !savedTests.containsKey(key)),
+        );
+        for (final entry in savedTests.entries) {
+          _tests.putIfAbsent(entry.key, () => entry.value);
+        }
       });
-    } catch (_) {
-      // Keep showing the last snapshot if a background refresh fails.
+    } catch (error) {
+      if (mounted) {
+        _notify(_errorMessage(error), error: true);
+      }
     }
   }
 
@@ -2849,6 +2996,10 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
     core_proxy.ModelProfile model,
     core_proxy.ModelCapabilities capabilities,
   ) async {
+    await _testsLoaded;
+    if (!mounted) {
+      return null;
+    }
     final key = _modelTestKey(provider.id, model.id);
     final current = _tests[key];
     if (current != null && !current.isFinished) {
@@ -2894,6 +3045,9 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
       );
     } catch (error) {
       result = _ModelTestResult.crashed(_errorMessage(error));
+      if (mounted) {
+        _notify(_errorMessage(error), error: true);
+      }
     }
     if (!mounted) {
       return found;
@@ -2918,6 +3072,9 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
       );
       return _ModelTestResult.finished(report);
     } catch (error) {
+      if (mounted) {
+        _notify(_errorMessage(error), error: true);
+      }
       return _ModelTestResult.crashed(_errorMessage(error));
     }
   }
@@ -2928,7 +3085,8 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
     core_proxy.ProviderProfile provider,
     List<core_proxy.ModelProfile> models,
   ) async {
-    if (_batchRunning || models.isEmpty) {
+    await _testsLoaded;
+    if (!mounted || _batchRunning || models.isEmpty) {
       return;
     }
     final l10n = AppLocalizations.of(context)!;
@@ -2945,6 +3103,7 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
     var next = 0;
     var passed = 0;
     var failed = 0;
+    var restricted = 0;
     Future<void> worker() async {
       while (next < models.length && !_batchStopping && mounted) {
         final model = models[next];
@@ -2960,6 +3119,8 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
         }
         if (result.phase == _ModelTestPhase.passed) {
           passed += 1;
+        } else if (result.phase == _ModelTestPhase.restricted) {
+          restricted += 1;
         } else {
           failed += 1;
         }
@@ -2980,18 +3141,28 @@ class _ProviderDetailScreenState extends State<_ProviderDetailScreen> {
       return;
     }
     setState(() {
-      // A stop leaves the rest untested, so they show nothing again.
+      // Discard queued markers; refresh restores their last completed checks.
       for (final model in models.skip(next)) {
         _tests.remove(_modelTestKey(provider.id, model.id));
       }
       _batchRunning = false;
       _batchStopping = false;
     });
-    if (passed + failed == 0) {
+    await _refresh();
+    if (!mounted) {
+      return;
+    }
+    if (passed + failed + restricted == 0) {
       return;
     }
     _notify(
-      failed == 0
+      restricted > 0
+          ? l10n.settingsModelTestSummaryWithRestricted(
+              passed,
+              failed,
+              restricted,
+            )
+          : failed == 0
           ? l10n.settingsModelTestAllPassed(passed)
           : l10n.settingsModelTestSummary(passed, failed),
       error: failed > 0,
@@ -3285,6 +3456,11 @@ String _errorMessage(Object error) {
 /// The green that marks a passed check, legible on the panel's surfaces.
 Color _testPassedColor(bool isDark) {
   return isDark ? const Color(0xFF5CC98A) : const Color(0xFF1E8F52);
+}
+
+/// Marks a check blocked by credit or upstream limits, separately from failure.
+Color _testRestrictedColor(bool isDark) {
+  return isDark ? const Color(0xFFE9BB62) : const Color(0xFF986600);
 }
 
 /// The actions over a provider's models: test them all, or check some to test or delete.
@@ -4072,14 +4248,12 @@ class _TestStatusDot extends StatefulWidget {
 class _TestStatusDotState extends State<_TestStatusDot>
     with SingleTickerProviderStateMixin {
   final OverlayPortalController _portal = OverlayPortalController();
-  final LayerLink _link = LayerLink();
   final Object _tapGroup = Object();
   late final AnimationController _motion;
   late final CurvedAnimation _curve;
   Timer? _hideTimer;
   bool _pinned = false;
   bool _hovered = false;
-  bool _opensBelow = true;
 
   bool get _finished => widget.result?.isFinished ?? false;
 
@@ -4132,11 +4306,6 @@ class _TestStatusDotState extends State<_TestStatusDot>
 
   void _show({bool linger = false}) {
     _hideTimer?.cancel();
-    final box = context.findRenderObject() as RenderBox?;
-    if (box != null && box.hasSize) {
-      final top = box.localToGlobal(Offset.zero).dy;
-      _opensBelow = top + 240 < MediaQuery.sizeOf(context).height;
-    }
     if (!_portal.isShowing) {
       _portal.show();
     }
@@ -4232,66 +4401,62 @@ class _TestStatusDotState extends State<_TestStatusDot>
       case _ModelTestPhase.failed:
         mark = _dot(colorScheme.error);
         label = l10n.settingsModelConnectionTestFailed;
+      case _ModelTestPhase.restricted:
+        mark = _dot(_testRestrictedColor(theme.brightness == Brightness.dark));
+        label = l10n.settingsModelConnectionTestRestricted;
     }
     return Semantics(
       label: label,
       button: _finished,
-      child: OverlayPortal(
+      // The copy button's Tooltip also lays out an overlay. Its ancestors must
+      // establish their transforms during layout, before either overlay paints.
+      child: OverlayPortal.overlayChildLayoutBuilder(
         controller: _portal,
         overlayChildBuilder: _buildBubble,
-        child: CompositedTransformTarget(
-          link: _link,
-          child: TapRegion(
-            groupId: _tapGroup,
-            onTapOutside: (_) {
-              if (_portal.isShowing) {
-                _hide();
-              }
-            },
-            child: CallbackShortcuts(
-              bindings: <ShortcutActivator, VoidCallback>{
-                const SingleActivator(LogicalKeyboardKey.escape): () {
-                  if (_portal.isShowing) {
-                    _hide();
-                  }
-                },
+        child: TapRegion(
+          groupId: _tapGroup,
+          onTapOutside: (_) {
+            if (_portal.isShowing) {
+              _hide();
+            }
+          },
+          child: CallbackShortcuts(
+            bindings: <ShortcutActivator, VoidCallback>{
+              const SingleActivator(LogicalKeyboardKey.escape): () {
+                if (_portal.isShowing) {
+                  _hide();
+                }
               },
-              child: MouseRegion(
-                cursor: _finished
-                    ? SystemMouseCursors.click
-                    : MouseCursor.defer,
-                onEnter: (_) {
-                  _hovered = true;
-                  if (_finished) {
-                    _show();
-                  }
-                },
-                onExit: (_) {
-                  _hovered = false;
-                  _hideSoon();
-                },
-                child: InkResponse(
-                  onTap: _finished ? _toggle : null,
-                  radius: 14,
-                  child: SizedBox.square(
-                    dimension: 18,
-                    child: Center(
-                      child: AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 220),
-                        switchInCurve: Curves.easeOutBack,
-                        switchOutCurve: Curves.easeInCubic,
-                        transitionBuilder: (child, animation) =>
-                            ScaleTransition(
-                              scale: animation,
-                              child: FadeTransition(
-                                opacity: animation,
-                                child: child,
-                              ),
-                            ),
-                        child: KeyedSubtree(
-                          key: ValueKey<_ModelTestPhase?>(result?.phase),
-                          child: mark,
-                        ),
+            },
+            child: MouseRegion(
+              cursor: _finished ? SystemMouseCursors.click : MouseCursor.defer,
+              onEnter: (_) {
+                _hovered = true;
+                if (_finished) {
+                  _show();
+                }
+              },
+              onExit: (_) {
+                _hovered = false;
+                _hideSoon();
+              },
+              child: InkResponse(
+                onTap: _finished ? _toggle : null,
+                radius: 14,
+                child: SizedBox.square(
+                  dimension: 18,
+                  child: Center(
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 220),
+                      switchInCurve: Curves.easeOutBack,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, animation) => ScaleTransition(
+                        scale: animation,
+                        child: FadeTransition(opacity: animation, child: child),
+                      ),
+                      child: KeyedSubtree(
+                        key: ValueKey<_ModelTestPhase?>(result?.phase),
+                        child: mark,
                       ),
                     ),
                   ),
@@ -4312,53 +4477,47 @@ class _TestStatusDotState extends State<_TestStatusDot>
     );
   }
 
-  Widget _buildBubble(BuildContext context) {
+  Widget _buildBubble(BuildContext context, OverlayChildLayoutInfo info) {
     final result = widget.result;
     if (result == null || !result.isFinished) {
       return const SizedBox.shrink();
     }
-    final below = _opensBelow;
+    final target = MatrixUtils.transformRect(
+      info.childPaintTransform,
+      Offset.zero & info.childSize,
+    );
+    final direction = Directionality.of(context);
+    final below = target.top + 240 < info.overlaySize.height;
     return Positioned(
-      left: 0,
-      top: 0,
-      child: CompositedTransformFollower(
-        link: _link,
-        showWhenUnlinked: false,
-        targetAnchor: below
-            ? AlignmentDirectional.bottomStart.resolve(
-                Directionality.of(context),
-              )
-            : AlignmentDirectional.topStart.resolve(Directionality.of(context)),
-        followerAnchor: below
-            ? AlignmentDirectional.topStart.resolve(Directionality.of(context))
-            : AlignmentDirectional.bottomStart.resolve(
-                Directionality.of(context),
-              ),
-        offset: Offset(-6, below ? 6 : -6),
-        child: TapRegion(
-          groupId: _tapGroup,
-          child: MouseRegion(
-            onEnter: (_) {
-              _hovered = true;
-              _hideTimer?.cancel();
-            },
-            onExit: (_) {
-              _hovered = false;
-              _hideSoon();
-            },
-            child: FadeTransition(
-              opacity: _curve,
-              child: ScaleTransition(
-                scale: Tween<double>(begin: 0.9, end: 1).animate(_curve),
-                alignment: below
-                    ? AlignmentDirectional.topStart.resolve(
-                        Directionality.of(context),
-                      )
-                    : AlignmentDirectional.bottomStart.resolve(
-                        Directionality.of(context),
-                      ),
-                child: _TestResultBubble(result: result),
-              ),
+      left: direction == TextDirection.ltr ? target.left - 6 : null,
+      right: direction == TextDirection.rtl
+          ? info.overlaySize.width - target.right + 6
+          : null,
+      top: below ? target.bottom + 6 : null,
+      bottom: below ? null : info.overlaySize.height - target.top + 6,
+      child: TapRegion(
+        groupId: _tapGroup,
+        child: MouseRegion(
+          onEnter: (_) {
+            _hovered = true;
+            _hideTimer?.cancel();
+          },
+          onExit: (_) {
+            _hovered = false;
+            _hideSoon();
+          },
+          child: FadeTransition(
+            opacity: _curve,
+            child: ScaleTransition(
+              scale: Tween<double>(begin: 0.9, end: 1).animate(_curve),
+              alignment: below
+                  ? AlignmentDirectional.topStart.resolve(
+                      Directionality.of(context),
+                    )
+                  : AlignmentDirectional.bottomStart.resolve(
+                      Directionality.of(context),
+                    ),
+              child: _TestResultBubble(result: result),
             ),
           ),
         ),
@@ -4414,16 +4573,23 @@ class _TestResultBubbleState extends State<_TestResultBubble> {
     final result = widget.result;
     final report = result.report;
     final passed = result.phase == _ModelTestPhase.passed;
-    final statusColor = passed ? _testPassedColor(isDark) : colorScheme.error;
+    final restricted = result.phase == _ModelTestPhase.restricted;
+    final statusColor = passed
+        ? _testPassedColor(isDark)
+        : restricted
+        ? _testRestrictedColor(isDark)
+        : colorScheme.error;
     final failures = <String>[
-      if (result.error != null) result.error!,
+      if (result.error != null) apiErrorText(result.error!),
       if (report != null)
         for (final item in report.items)
           if (!item.success && item.error != null)
-            '${_connectionTestTypeLabel(l10n, item.type)}: ${item.error}',
+            '${_connectionTestTypeLabel(l10n, item.type)}: ${apiErrorText(item.error!)}',
     ];
     final title = passed
         ? l10n.settingsModelConnectionTestPassed
+        : restricted
+        ? l10n.settingsModelConnectionTestRestricted
         : (report == null
               ? l10n.settingsModelTestCouldNotRun
               : l10n.settingsModelConnectionTestFailed);
@@ -4456,114 +4622,127 @@ class _TestResultBubbleState extends State<_TestResultBubble> {
             ),
           ],
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Row(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 420),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Icon(
-                  passed ? Icons.check_circle_rounded : Icons.error_rounded,
-                  size: 15,
-                  color: statusColor,
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    title,
-                    style: theme.textTheme.labelLarge?.copyWith(
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.w700,
-                      color: colorScheme.onSurface,
+                Row(
+                  children: <Widget>[
+                    Icon(
+                      passed
+                          ? Icons.check_circle_rounded
+                          : restricted
+                          ? Icons.pause_circle_outline_rounded
+                          : Icons.error_rounded,
+                      size: 15,
+                      color: statusColor,
                     ),
-                  ),
-                ),
-                if (failures.isNotEmpty)
-                  IconButton(
-                    tooltip: l10n.settingsModelCopyError,
-                    onPressed: () => unawaited(_copy(failures.join('\n'))),
-                    icon: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 160),
-                      child: Icon(
-                        _copied ? Icons.check_rounded : Icons.copy_rounded,
-                        key: ValueKey<bool>(_copied),
-                        size: 14,
-                        color: _copied
-                            ? _testPassedColor(isDark)
-                            : colorScheme.onSurfaceVariant,
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        title,
+                        style: theme.textTheme.labelLarge?.copyWith(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                          color: colorScheme.onSurface,
+                        ),
                       ),
                     ),
-                    visualDensity: VisualDensity.compact,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(
-                      minWidth: 26,
-                      minHeight: 26,
+                    if (failures.isNotEmpty)
+                      IconButton(
+                        tooltip: l10n.settingsModelCopyError,
+                        onPressed: () => unawaited(_copy(failures.join('\n'))),
+                        icon: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 160),
+                          child: Icon(
+                            _copied ? Icons.check_rounded : Icons.copy_rounded,
+                            key: ValueKey<bool>(_copied),
+                            size: 14,
+                            color: _copied
+                                ? _testPassedColor(isDark)
+                                : colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        visualDensity: VisualDensity.compact,
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(
+                          minWidth: 26,
+                          minHeight: 26,
+                        ),
+                      )
+                    else
+                      const SizedBox(width: 6),
+                  ],
+                ),
+                if (report != null)
+                  for (final item in report.items)
+                    Padding(
+                      padding: const EdgeInsetsDirectional.only(top: 6, end: 6),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Padding(
+                            padding: const EdgeInsets.only(top: 1),
+                            child: Icon(
+                              item.success
+                                  ? Icons.check_rounded
+                                  : connectionTestRestriction(item.error) != null
+                                  ? Icons.pause_rounded
+                                  : Icons.close_rounded,
+                              size: 13,
+                              color: item.success
+                                  ? _testPassedColor(isDark)
+                                  : connectionTestRestriction(item.error) != null
+                                  ? _testRestrictedColor(isDark)
+                                  : colorScheme.error,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: <Widget>[
+                                Text(
+                                  _connectionTestItemLabel(
+                                    l10n,
+                                    item.type,
+                                    item.success ? null : item.error,
+                                  ),
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    fontSize: 11.5,
+                                    color: colorScheme.onSurface,
+                                  ),
+                                ),
+                                if (!item.success && item.error != null)
+                                  SelectableText(
+                                    apiErrorText(item.error!),
+                                    style: detailStyle,
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  )
-                else
-                  const SizedBox(width: 6),
+                if (result.error != null)
+                  Padding(
+                    padding: const EdgeInsetsDirectional.only(top: 6, end: 6),
+                    child: SelectableText(
+                      apiErrorText(result.error!),
+                      style: detailStyle,
+                    ),
+                  ),
+                if (result.note != null)
+                  Padding(
+                    padding: const EdgeInsetsDirectional.only(top: 8, end: 6),
+                    child: Text(result.note!, style: detailStyle),
+                  ),
               ],
             ),
-            if (report != null)
-              for (final item in report.items)
-                Padding(
-                  padding: const EdgeInsetsDirectional.only(top: 6, end: 6),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Padding(
-                        padding: const EdgeInsets.only(top: 1),
-                        child: Icon(
-                          item.success
-                              ? Icons.check_rounded
-                              : Icons.close_rounded,
-                          size: 13,
-                          color: item.success
-                              ? _testPassedColor(isDark)
-                              : colorScheme.error,
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            Text(
-                              _connectionTestTypeLabel(l10n, item.type),
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                fontSize: 11.5,
-                                color: colorScheme.onSurface,
-                              ),
-                            ),
-                            if (!item.success && item.error != null)
-                              Text(
-                                item.error!,
-                                maxLines: 4,
-                                overflow: TextOverflow.ellipsis,
-                                style: detailStyle,
-                              ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-            if (result.error != null)
-              Padding(
-                padding: const EdgeInsetsDirectional.only(top: 6, end: 6),
-                child: Text(
-                  result.error!,
-                  maxLines: 5,
-                  overflow: TextOverflow.ellipsis,
-                  style: detailStyle,
-                ),
-              ),
-            if (result.note != null)
-              Padding(
-                padding: const EdgeInsetsDirectional.only(top: 8, end: 6),
-                child: Text(result.note!, style: detailStyle),
-              ),
-          ],
+          ),
         ),
       ),
     );
@@ -5015,7 +5194,6 @@ class _ModelInlineSettingsFormState extends State<_ModelInlineSettingsForm> {
       _summaryRatio = (value > 1 ? value / 100 : value).clamp(0.01, 1.0);
     }
     _savedSummary = text;
-    final stored = widget.initialConfig.summary;
     final ratio = _summaryRatio;
     _persist(
       () => widget.clients.preferencesModelConfigManager.updateSummaryForModel(
@@ -5024,8 +5202,6 @@ class _ModelInlineSettingsFormState extends State<_ModelInlineSettingsForm> {
         summary: core_proxy.ModelSummarySettings(
           enableSummary: enabled,
           summaryTokenThreshold: ratio,
-          enableSummaryByMessageCount: stored.enableSummaryByMessageCount,
-          summaryMessageCountThreshold: stored.summaryMessageCountThreshold,
         ),
       ),
       undo: () {
@@ -7994,6 +8170,21 @@ core_proxy.ProviderModelSummary? _summaryForModelOrNull(
     }
   }
   return null;
+}
+
+String _connectionTestItemLabel(
+  AppLocalizations l10n,
+  core_proxy.ModelConnectionTestType type,
+  String? error,
+) {
+  final label = _connectionTestTypeLabel(l10n, type);
+  return switch (connectionTestRestriction(error)) {
+    ModelConnectionTestRestriction.credits =>
+      '$label · ${l10n.settingsModelTestCreditRestricted}',
+    ModelConnectionTestRestriction.rateLimit =>
+      '$label · ${l10n.settingsModelTestRateRestricted}',
+    null => label,
+  };
 }
 
 String _connectionTestTypeLabel(

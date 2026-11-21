@@ -1,5 +1,5 @@
 //! Headless Core owner: single-instance lock, daemon lifecycle, and the
-//! local control channel shared by the daemon and a running TUI.
+//! local control channel shared by the daemon, TUI and Link listeners.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -61,7 +61,7 @@ pub(crate) fn owner_is_running() -> bool {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DaemonStatus {
     pub pid: u32,
-    /// `daemon` or `tui`.
+    /// `daemon`, `tui`, `listen`, `session`, `qr`, or a short-lived `cli` owner.
     pub mode: String,
     /// `starting` until Core startup and socket binding complete, then `ready`.
     pub state: String,
@@ -160,7 +160,7 @@ impl OwnerGuard {
                     .unwrap_or_default();
                 return Err(format!(
                     "another Core owner is already running for identity '{}'{detail}; \
-                     stop it with 'operit2 daemon stop' or close the TUI",
+                     stop it with 'operit2 daemon stop' or close its terminal interface",
                     paths.identity_name
                 ));
             }
@@ -298,6 +298,7 @@ impl ControlResponse {
 pub(crate) struct ControlServer {
     listener: ControlListener,
     client: Arc<LocalCoreProxy>,
+    link: crate::cli::link::LinkCommandContext,
     status: Arc<DaemonStatus>,
     commands: Arc<AtomicU64>,
     shutdown: watch::Sender<bool>,
@@ -307,7 +308,7 @@ impl ControlServer {
     /// Binds the host control endpoint before publishing the owner's ready status.
     pub(crate) fn bind(
         owner: &mut OwnerGuard,
-        client: Arc<LocalCoreProxy>,
+        application: &operit_core_application::CoreApplication,
     ) -> Result<Self, String> {
         let path = &owner.paths().socket_path;
         let listener = ControlListener::bind(path)
@@ -316,7 +317,8 @@ impl ControlServer {
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
             listener,
-            client,
+            client: application.localClient(),
+            link: crate::cli::link::LinkCommandContext::new(application),
             status: Arc::new(owner.status().clone()),
             commands: Arc::new(AtomicU64::new(0)),
             shutdown,
@@ -341,6 +343,7 @@ impl ControlServer {
         let Self {
             mut listener,
             client,
+            link,
             status,
             commands,
             shutdown,
@@ -355,11 +358,12 @@ impl ControlServer {
                     match accepted {
                         Ok(stream) => {
                             let client = client.clone();
+                            let link = link.clone();
                             let status = status.clone();
                             let commands = commands.clone();
                             let shutdown = shutdown.clone();
                             connections.spawn_local(async move {
-                                handle_connection(stream, client, status, commands, shutdown).await;
+                                Box::pin(handle_connection(stream, client, link, status, commands, shutdown)).await;
                             });
                         }
                         Err(error) => {
@@ -388,6 +392,7 @@ impl ControlServer {
 async fn handle_connection(
     stream: ControlStream,
     client: Arc<LocalCoreProxy>,
+    link: crate::cli::link::LinkCommandContext,
     status: Arc<DaemonStatus>,
     commands: Arc<AtomicU64>,
     shutdown: watch::Sender<bool>,
@@ -403,7 +408,7 @@ async fn handle_connection(
             ControlResponse::error("control request is too large")
         }
         Ok(Ok(_)) => match serde_json::from_str::<ControlRequest>(&line) {
-            Ok(request) => handle_request(request, client, status, commands, shutdown).await,
+            Ok(request) => Box::pin(handle_request(request, client, link, status, commands, shutdown)).await,
             Err(error) => ControlResponse::error(format!("invalid control request: {error}")),
         },
         Ok(Err(error)) => ControlResponse::error(format!("control request read failed: {error}")),
@@ -429,6 +434,7 @@ async fn handle_connection(
 async fn handle_request(
     request: ControlRequest,
     client: Arc<LocalCoreProxy>,
+    link: crate::cli::link::LinkCommandContext,
     status: Arc<DaemonStatus>,
     commands: Arc<AtomicU64>,
     shutdown: watch::Sender<bool>,
@@ -441,7 +447,7 @@ async fn handle_request(
             ControlResponse::status(status)
         }
         "shutdown" => {
-            if status.mode != "daemon" {
+            if status.mode == "tui" {
                 return ControlResponse::error("the TUI owns this identity; quit it from the TUI");
             }
             shutdown.send_replace(true);
@@ -449,9 +455,20 @@ async fn handle_request(
         }
         "peer-connection-code" => {
             let mut proxy = GeneratedCoreProxy::new(SharedLocalCore(client));
-            match proxy.server_runtime_remote_link_service().peerConnectionCode().await {
+            match Box::pin(proxy.server_runtime_remote_link_service().peerConnectionCode()).await {
                 Ok(code) => ControlResponse::output(code, String::new()),
                 Err(error) => ControlResponse::error(error.to_string()),
+            }
+        }
+        "link" => {
+            commands.fetch_add(1, Ordering::Relaxed);
+            let json = request.argv.iter().any(|arg| arg == "--json");
+            let args = request.argv.into_iter().filter(|arg| arg != "--json").collect::<Vec<_>>();
+            // Management contains large Core state machines. Each connection owns
+            // its heap-pinned command rather than embedding it in the listener future.
+            match Box::pin(crate::cli::link::execute_owned_link_command(&link, &args, json)).await {
+                Ok(output) => ControlResponse::output(output, String::new()),
+                Err(error) => ControlResponse::error(error),
             }
         }
         "run" => {
@@ -460,13 +477,30 @@ async fn handle_request(
             }
             commands.fetch_add(1, Ordering::Relaxed);
             let mut proxy = GeneratedCoreProxy::new(SharedLocalCore(client));
-            match proxy.runCoreCommand(&request.argv).await {
+            match Box::pin(proxy.runCoreCommand(&request.argv)).await {
                 Ok(output) => ControlResponse::output(output.stdout, output.stderr),
                 Err(error) => ControlResponse::error(error.to_string()),
             }
         }
         other => ControlResponse::error(format!("unknown control operation: {other}")),
     }
+}
+
+/// Sends management to the sole Core owner; an unavailable owner never opens a second Core.
+pub(crate) async fn owner_link_command(args: &[String], json: bool) -> Option<Result<String, String>> {
+    let paths = match DaemonPaths::for_active_identity() {
+        Ok(paths) => paths,
+        Err(error) => return Some(Err(error)),
+    };
+    if !owner_lock_held(&paths) { return None; }
+    Some(async {
+        let stream = connect_with_retry(&paths).await.ok_or("The Core owner is unavailable; retry after it is ready")?;
+        let mut argv = args.to_vec();
+        if json { argv.push("--json".into()); }
+        let response = exchange(stream, &ControlRequest { op: "link".into(), argv }).await?;
+        if !response.ok { return Err(response.error.unwrap_or_else(|| "Owner link command failed".into())); }
+        Ok(response.stdout.unwrap_or_default())
+    }.await)
 }
 
 /// Reads the live owner's listener coordinates. A failed owner is never replaced by a second Core.
@@ -526,13 +560,18 @@ pub(crate) async fn try_run_cli_command(args: &[String], json: bool) -> Option<R
 /// Commands that must run in the invoking process: interactive shells, local
 /// storage/OAuth flows, and link operations that own their own listener.
 fn route_supported(args: &[String]) -> bool {
+    let args = if args.first().map(String::as_str) == Some("--cwd") {
+        &args[args.len().min(2)..]
+    } else {
+        args
+    };
     let Some(command) = args.first().map(String::as_str) else {
         return false;
     };
     match command {
         "model" => args.get(1).map(String::as_str) != Some("codex-login"),
         "chat" => args.get(1).map(String::as_str) != Some("shell"),
-        "version" | "storage" | "tts" | "stt" | "export" | "import" | "backup" | "market"
+        "version" | "storage" | "stt" | "export" | "import" | "backup" | "market"
         | "update" | "shell" | "web" | "link" | "identity" | "install" | "uninstall" | "rescue"
         | "host" => false,
         _ => true,
@@ -787,7 +826,7 @@ async fn run_foreground(args: &[String]) -> Result<(), String> {
     let result = async {
         start_listeners(&core_application, &options).await?;
         owner.refresh_log_path()?;
-        let server = ControlServer::bind(&mut owner, core_application.localClient())?;
+        let server = ControlServer::bind(&mut owner, &core_application)?;
         AppLogger::i(
             "Daemon",
             &format!(
@@ -864,7 +903,7 @@ async fn start_listeners(
         }
         transports
     };
-    if transports.is_empty() {
+    if transports.is_empty() && services.localHostConfig()?.is_none_or(|config| config.discovery.is_none()) {
         return Ok(());
     }
     match services.startListening(transports).await {
@@ -1044,7 +1083,7 @@ async fn stop_command(json: bool) -> Result<(), String> {
         }
         return Ok(());
     };
-    if status.mode != "daemon" {
+    if status.mode == "tui" {
         return Err("the TUI owns this identity; quit it from the TUI".to_string());
     }
     let response = request_at_with_timeout(
@@ -1158,6 +1197,9 @@ mod tests {
     fn interactive_commands_stay_in_the_invoking_process() {
         assert!(route_supported(&["package".into(), "list".into()]));
         assert!(route_supported(&["chat".into(), "list".into()]));
+        assert!(route_supported(&["terminal".into(), "profiles".into()]));
+        assert!(route_supported(&["theme".into(), "list".into()]));
+        assert!(route_supported(&["tts".into(), "config".into(), "list".into()]));
         assert!(!route_supported(&["chat".into(), "shell".into()]));
         assert!(!route_supported(&[
             "model".into(),

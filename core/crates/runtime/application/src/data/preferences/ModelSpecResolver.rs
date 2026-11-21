@@ -17,13 +17,14 @@ use std::sync::Arc;
 use operit_model::ModelCatalog::ModelCatalog;
 use operit_model::ModelConfigData::{
     ApiProviderType, AvailableProviderModel, AvailableProviderModelSource, ModelBuiltinTool,
-    ModelCapabilities, ModelCapabilityOverrides, ModelCatalogEntry,
+    ModelCapabilities, ModelCapabilityOverrides, ModelCatalogEntry, ModelConfigDefaults,
     ModelContextSpec, ModelListedSpec, ModelPricing, ModelProfile, ModelRequestOverrides,
     ModelRequestSpec, ProviderProfile,
 };
 use operit_model::ModelThinking::{ModelThinkingSpec, ThinkingSpecSource};
 use operit_model::ModelsDevCatalog::{contextSpec, ModelsDevCatalog};
 
+use super::ModelConfigManager::ModelConfigError;
 use crate::services::ModelCatalogService;
 
 /// What the model catalog says of one model.
@@ -91,11 +92,11 @@ pub(crate) struct ModelSpecResolver {
 }
 
 impl ModelSpecResolver {
-    /// Prepares the catalog lists that describe what this provider serves.
-    pub(crate) fn new(provider: &ProviderProfile) -> Self {
+    /// Prepares a complete catalog before resolving a remote provider's capabilities.
+    pub(crate) fn new(provider: &ProviderProfile) -> Result<Self, ModelConfigError> {
         let recognizesModels = provider.providerType != ApiProviderType::LOCAL_MODEL;
         let catalog = if recognizesModels {
-            ModelCatalogService::currentCatalog()
+            Some(ModelCatalogService::requireCatalog().map_err(ModelConfigError::ModelCatalog)?)
         } else {
             None
         };
@@ -103,12 +104,12 @@ impl ModelSpecResolver {
             .as_ref()
             .map(|catalog| catalog.providerIdsFor(&provider.providerTypeId, &provider.endpoint))
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             recognizesModels,
             fixedModels: ModelCatalog::fixedModels(&provider.providerTypeId),
             catalog,
             catalogProviderIds,
-        }
+        })
     }
 
     /// Returns what the catalog says of the model this id names, `None` when it does not know it.
@@ -155,6 +156,29 @@ impl ModelSpecResolver {
     pub(crate) fn inherited(&self, model: &ModelProfile) -> InheritedSpec {
         let catalog = self.catalogSpec(&model.id);
         Self::inheritedFrom(catalog, model.listed.as_ref())
+    }
+
+    /// Sets addition-time defaults from the context window and known tool capabilities.
+    pub(crate) fn initializeNewModel(&self, model: &mut ModelProfile) {
+        let inherited = self.inherited(model);
+        let context = inherited.effectiveContext().maxContextLength;
+        model.summary.summaryTokenThreshold = if context > 300.0 {
+            (30_000.0 / context).floor() / 100.0
+        } else {
+            ModelConfigDefaults::DEFAULT_SUMMARY_TOKEN_THRESHOLD
+        };
+        if self.recognizesModels && inherited.catalog.is_none() {
+            let toolCall = match &inherited.capabilities {
+                Some(capabilities) => capabilities.toolCall,
+                None => {
+                    model.capabilitiesOverride.toolCall = Some(true);
+                    true
+                }
+            };
+            if inherited.supportsStructuredTools.is_none() {
+                model.requestOverride.supportsStructuredTools = Some(toolCall);
+            }
+        }
     }
 
     /// Returns the thinking controls a configured model runs with.

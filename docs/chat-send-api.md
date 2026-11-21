@@ -19,6 +19,21 @@ The Rust authority is `core/crates/plugin/sdk/src/js_sdk/chat.rs`; TypeScript
 exports are in `plugins/types/chat.d.ts`. Native handles and finalization records
 are internal runtime-support types, not plugin SDK results.
 
+## Functional model response text
+
+`Tools.Chat.call` returns assistant text and parsed assistant/tool-call segments
+after removing `<think>`, `<thinking>` and all `<meta>` blocks, including metadata
+without a `provider` attribute. Removal happens before tool parsing so markup
+inside hidden reasoning cannot become a returned tool call. The shared markup
+parser also excludes unfinished hidden blocks and overlapping nested blocks.
+Provider metadata remains available separately in `metadata.protocolMeta`.
+
+This cleanup applies to every functional caller, including the character group's
+`ROLE_RESPONSE_PLANNER`. Disabling thinking is a request setting; callers still
+receive clean text when a provider emits reasoning. Group planning continues to
+require its exact JSON schema, declared member IDs and explicit rounds. Invalid
+or absent JSON remains an error without another model request or an invented plan.
+
 ## One accepted send
 
 `kind: "submit"` preserves original text, complete attachments and an explicit
@@ -53,6 +68,19 @@ Both modes use one admission and the existing `startUserMessage` pipeline. Nativ
 execution owns the canonical lease, input-hook dispatch, persistence receipt,
 completion publication and lease release. An accepted send is not dependent on
 plugin code eventually calling a separate finish method.
+
+## Hidden automatic user messages
+
+The `send_message` tool accepts `hide_user_message: true`. Core records the user
+message with `HIDDEN_PLACEHOLDER` while retaining its original parts in persisted
+history and model context. This changes transcript presentation only.
+
+Both Flutter transcript styles show a compact placeholder instead of the source,
+attachments, quoted reply, avatar or sender name. Tapping it opens the complete
+stored source as plain text; selection and share-image rendering disable this
+dialog. Hidden user rows omit copy, edit-and-resend and plugin context-menu
+actions, and are excluded from multi-message text copying. Their other history
+management actions remain available.
 
 ## Flutter active-turn guidance
 
@@ -91,6 +119,12 @@ atomically claimed before guidance and restored if its submit hook or Core rejec
 delivery. Withdrawing edits a pending queue item; guidance already accepted by the
 active turn is no longer part of that pending queue. This Flutter/Core control
 route is not a new plugin SDK method.
+
+After a queued message is sent automatically or with **Interrupt and send**, the
+active chat refreshes its composer attachments from Core, matching ordinary send
+cleanup. A submit hook returning `Consume` with `clearInput: true` also refreshes
+the composer after clearing Core attachments, so sent image previews do not remain
+in the input box.
 
 ## Semantic observation
 

@@ -33,17 +33,17 @@ import '../../chat/screens/AIChatScreen.dart';
 import '../utils/PackageDisplayUtils.dart';
 import 'ToolPkgComposeDslWebView.dart';
 import 'compose_dsl/fill_layout.dart';
+import 'compose_dsl/glow_border.dart';
+import 'package:operit2/ui/common/code_editor/CodeEditor.dart';
+import 'package:operit2/ui/common/code_editor/CodeEditorText.dart';
 import 'compose_dsl/lazy_viewport.dart';
 import 'compose_dsl/action_scheduler.dart';
 import 'compose_dsl/execution_owner.dart';
 import '../../../common/components/SwipeActions.dart';
-import '../../chat/components/workspace/file_preview/syntax/WorkspaceSyntaxLanguage.dart';
-import '../../chat/components/workspace/file_preview/syntax/WorkspaceSyntaxLexer.dart';
-import '../../chat/components/workspace/file_preview/syntax/WorkspaceSyntaxPalette.dart';
-import '../../chat/components/workspace/file_preview/syntax/WorkspaceSyntaxToken.dart';
 
 part 'compose_dsl/compose_host.dart';
 part 'compose_dsl/dialog_host.dart';
+part 'compose_dsl/dropdown_menu.dart';
 part 'compose_dsl/lazy_list.dart';
 part 'compose_dsl/gesture_region.dart';
 part 'compose_dsl/text_field.dart';
@@ -97,6 +97,7 @@ class ToolPkgUiLauncherScreen extends StatefulWidget {
     this.initialMemo = const <String, Object?>{},
     this.initialModuleSpec,
     this.onActionResult,
+    this.dismissOnExternalNavigation = false,
   });
 
   final GeneratedCoreProxyClients clients;
@@ -120,6 +121,9 @@ class ToolPkgUiLauncherScreen extends StatefulWidget {
 
   /// Delivers completed plugin actions to the owner of an embedded surface.
   final ValueChanged<Object?>? onActionResult;
+
+  /// Closes a package manager overlay after a destination opens in the shell.
+  final bool dismissOnExternalNavigation;
 
   /// Creates the state that owns the plugin execution and render lifecycle.
   @override
@@ -1156,6 +1160,11 @@ class _ToolPkgUiLauncherScreenState extends State<ToolPkgUiLauncherScreen> {
             args: command.args,
             source: RouteEntrySource.script,
           );
+        }
+        if (widget.dismissOnExternalNavigation &&
+            ModalRoute.of(context)?.isCurrent == true) {
+          Navigator.of(context).pop();
+          return;
         }
       }
     } catch (error, stackTrace) {

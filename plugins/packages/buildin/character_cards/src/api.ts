@@ -128,7 +128,7 @@ export interface CharacterRecord {
   createdAt: number; updatedAt: number;
 }
 /** Defines the complete stored group record. */
-export interface GroupRecord { id: string; name: string; description: string; themeConfigId: string | null; members: { characterCardId: string; orderIndex: number }[]; createdAt: number; updatedAt: number }
+export interface GroupRecord { id: string; name: string; description: string; avatarUri?: string | null; themeConfigId: string | null; members: { characterCardId: string; orderIndex: number }[]; createdAt: number; updatedAt: number }
 /** Defines a stored prompt tag. */
 export interface TagRecord { id: string; name: string; description: string; promptContent: string; tagType: "TONE" | "CHARACTER" | "FUNCTION" | "CUSTOM"; createdAt: number; updatedAt: number }
 /** Defines a shared memory library. */
@@ -179,6 +179,7 @@ export interface MemorySettingsRecord {
   autoSaveIntervalMinutes: number; nextAutoSaveRunAtMs: number; memoryExtractionCustomRules: string;
   profileAutoUpdateEnabled: boolean; profileAutoUpdateLocked: boolean; cloudEmbeddingEnabled: boolean;
   cloudEmbeddingEndpoint: string; cloudEmbeddingApiKey: string; cloudEmbeddingModel: string;
+  cloudEmbeddingBatchSize: number; rebuildWindowMessageCount: number;
 }
 /** Defines the repository's search scoring configuration. */
 export interface MemorySearchConfigRecord { scoreMode: "BALANCED" | "KEYWORD_FIRST" | "SEMANTIC_FIRST"; keywordWeight: number; tagWeight: number; vectorWeight: number; edgeWeight: number }
@@ -315,6 +316,9 @@ function call<K extends DomainOperation>(operation: K, payload: DomainInput<K>):
 }
 /** Exposes typed domain methods to packages declaring a dependency on character cards. */
 export const characterCards = {
+  /** Returns the shared VFS image path for the default Operit avatar. Requires character cards 0.2.8. */
+  defaultAvatar: (): Promise<string> =>
+    ToolPkg.callDependency<EmptyParams, string>("com.operit.character_cards", "avatar.default", {}),
 
   chat: {
     configuration: {

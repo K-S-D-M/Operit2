@@ -1,6 +1,9 @@
 import { MessagePack } from "./operit_messagepack.js";
+import { requireBrowserSharedMemory } from "./browser_system_capabilities.js";
 
 export {};
+
+requireBrowserSharedMemory();
 
 /** Creates a RFC 4122 version 4 identifier with the Web Crypto random byte API. */
 function createRandomUuid(): string {
@@ -1277,5 +1280,5 @@ function postWorkerMessage(
 
 /** Converts one runtime or host exception into a transport-safe message. */
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return error instanceof Error ? `${String(error)}\n${error.stack ?? ""}`.trim() : String(error);
 }

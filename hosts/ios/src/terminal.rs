@@ -345,6 +345,7 @@ impl TerminalHost for IosTerminalHost {
             terminal: SYSTEM_SHELL_TERMINAL.to_string(),
             terminalType: SHELL_TERMINAL_TYPE.to_string(),
             available: self.systemShellAvailable,
+            nameKey: Some("terminalBuiltinIosSystem".into()),
             description: "iOS system /bin/sh; requires a jailbroken or otherwise privileged host"
                 .to_string(),
         };
@@ -352,6 +353,7 @@ impl TerminalHost for IosTerminalHost {
             terminal: ARM64_TERMINAL.to_string(),
             terminalType: SHELL_TERMINAL_TYPE.to_string(),
             available: true,
+            nameKey: Some("terminalBuiltinArm64".into()),
             description: "Operit ARM64 Linux shell using the configured root filesystem"
                 .to_string(),
         };
@@ -526,6 +528,11 @@ impl TerminalHost for IosTerminalHost {
     /// Creates or reuses the Host-selected terminal backend for a plugin session.
     fn createOrGetSession(&self, sessionName: &str) -> HostResult<TerminalSessionInfo> {
         self.createOrGetTypedSession(sessionName, SHELL_TERMINAL_TYPE)
+    }
+
+    /// Honors the user's explicit backend even when both implementations expose shell.
+    fn createOrGetTerminalSession(&self, name: &str, terminal: &str, kind: &str) -> HostResult<TerminalSessionInfo> {
+        self.createOrGetBackendSession(self.requestedBackend(terminal, kind)?, name)
     }
 
     /// Creates or reuses the requested interpreter in the configured iOS terminal backend.

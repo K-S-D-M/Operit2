@@ -26,6 +26,28 @@ import 'package:operit_ui/operit_ui.dart' show buildOperitThemeData;
 /// Verifies the real named-theme selector and generated proxy calls without a platform runtime.
 void main() {
   setUp(ClientLogger.initialize);
+  for (final size in [const Size(390, 844), const Size(1000, 600)]) {
+    testWidgets('initial loading stays a thin top bar at $size', (
+      tester,
+    ) async {
+      final bridge = _ThemeBridge()..publishInitialCatalog = false;
+      await _mount(tester, bridge, size: size, waitForCatalog: false);
+      await tester.pump(const Duration(seconds: 1));
+
+      final progress = find.byType(LinearProgressIndicator);
+      expect(progress, findsOneWidget);
+      expect(tester.getSize(progress), Size(size.width, 4));
+      expect(tester.getTopLeft(progress), Offset.zero);
+      expect(find.byKey(const ValueKey('theme-card:day')), findsNothing);
+
+      bridge._publish();
+      await tester.pumpAndSettle();
+      expect(progress, findsNothing);
+      expect(find.byKey(const ValueKey('theme-card:day')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
+  }
+
   testWidgets(
     'creation exposes grouped sources and changes the explicit selection',
     (tester) async {
@@ -598,12 +620,136 @@ void main() {
       expect(find.byType(TabBar), findsNothing);
       await tester.tap(find.byKey(const ValueKey('theme-edit:day')));
       await tester.pumpAndSettle();
+      expect(bridge.calls.where((call) => call.methodName == 'apply'), isEmpty);
       expect(find.byType(TabBar), findsOneWidget);
       expect(find.widgetWithText(AppBar, 'Day'), findsOneWidget);
+      final firstPreview = tester.state(
+        find.byType(ChatAppearancePreview).first,
+      );
+      final tabContext = tester.element(find.byType(TabBar));
+      final tabs = DefaultTabController.of(tabContext);
+      tabs.animateTo(1);
+      await tester.pumpAndSettle();
+      tabs.animateTo(0);
+      await tester.pumpAndSettle();
+      expect(
+        tester.state(find.byType(ChatAppearancePreview).first),
+        same(firstPreview),
+      );
       await tester.tap(find.byType(BackButton));
       await tester.pumpAndSettle();
       expect(find.byType(TabBar), findsNothing);
       expect(find.byKey(const ValueKey('theme-card:day')), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'mobile editor keeps the live preview pinned while settings scroll',
+    (tester) async {
+      final bridge = _ThemeBridge();
+      await _pumpEditor(tester, bridge);
+      final previewFinder = find.byType(ChatAppearancePreview);
+      expect(previewFinder, findsOneWidget);
+      final previewState = tester.state(previewFinder);
+      final previewTopLeft = tester.getTopLeft(previewFinder);
+      await tester.drag(_settingsList('theme'), const Offset(0, -800));
+      await tester.pumpAndSettle();
+      expect(previewFinder, findsOneWidget);
+      expect(tester.getTopLeft(previewFinder), previewTopLeft);
+      expect(tester.state(previewFinder), same(previewState));
+      expect(
+        _listState(tester, 'theme').position.pixels,
+        greaterThan(0),
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'mobile preview collapses to a pinned bar and expands back',
+    (tester) async {
+      final bridge = _ThemeBridge();
+      await _pumpEditor(tester, bridge);
+      expect(find.byType(ChatAppearancePreview), findsOneWidget);
+      // The expand badge exists only on the collapsed pinned bar.
+      final expandBadge = find.text('Expand');
+      expect(expandBadge, findsNothing);
+      await tester.tap(find.byTooltip('Collapse'));
+      await tester.pumpAndSettle();
+      expect(find.byType(ChatAppearancePreview), findsNothing);
+      expect(expandBadge, findsOneWidget);
+      final barTopLeft = tester.getTopLeft(expandBadge);
+      await tester.drag(_settingsList('theme'), const Offset(0, -800));
+      await tester.pumpAndSettle();
+      expect(tester.getTopLeft(expandBadge), barTopLeft);
+      await tester.tap(expandBadge);
+      await tester.pumpAndSettle();
+      expect(find.byType(ChatAppearancePreview), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'short mobile editor defaults to the collapsed bar without overflowing',
+    (tester) async {
+      final bridge = _ThemeBridge();
+      await _pumpEditor(tester, bridge, size: const Size(700, 420));
+      expect(find.byType(ChatAppearancePreview), findsNothing);
+      final expandBadge = find.text('Expand');
+      expect(expandBadge, findsOneWidget);
+      await tester.tap(expandBadge);
+      await tester.pumpAndSettle();
+      expect(find.byType(ChatAppearancePreview), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'settings scroll position survives the wide and narrow switch',
+    (tester) async {
+      final bridge = _ThemeBridge();
+      await _pumpEditor(tester, bridge, size: const Size(1000, 800));
+      final wideState = _listState(tester, 'theme');
+      final wideOffset = 400.0.clamp(
+        0.0,
+        wideState.position.maxScrollExtent,
+      );
+      wideState.position.jumpTo(wideOffset);
+      await tester.pumpAndSettle();
+      expect(wideState.position.pixels, wideOffset);
+      const narrowSize = Size(390, 844);
+      tester.view.physicalSize = narrowSize;
+      await tester.binding.setSurfaceSize(narrowSize);
+      await tester.pumpAndSettle();
+      final narrowState = _listState(tester, 'theme');
+      expect(narrowState, isNot(same(wideState)));
+      final narrowMax = narrowState.position.maxScrollExtent;
+      final expected = wideOffset < narrowMax ? wideOffset : narrowMax;
+      expect(
+        narrowState.position.pixels,
+        moreOrLessEquals(expected, epsilon: 1.0),
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+
+  testWidgets(
+    'mobile editor stays pinned and overflow-free at large text scale',
+    (tester) async {
+      final bridge = _ThemeBridge();
+      await _pumpEditor(tester, bridge, textScale: 2.0);
+      final previewFinder = find.byType(ChatAppearancePreview);
+      expect(previewFinder, findsOneWidget);
+      final previewState = tester.state(previewFinder);
+      await tester.drag(_settingsList('theme'), const Offset(0, -600));
+      await tester.pumpAndSettle();
+      expect(tester.state(previewFinder), same(previewState));
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
     },
@@ -906,6 +1052,7 @@ Future<void> _mount(
   Future<void> Function(String)? onEdit,
   ThemePreferenceSnapshot? currentSnapshot,
   double textScale = 1,
+  bool waitForCatalog = true,
 }) async {
   tester.view.devicePixelRatio = 1;
   tester.view.physicalSize = size;
@@ -932,17 +1079,74 @@ Future<void> _mount(
       localizationsDelegates: AppLocalizations.localizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
       home: Scaffold(
-        body: StatefulBuilder(
-          builder: (context, update) => ThemeConfigurationControl(
+        body: SizedBox.expand(
+          child: StatefulBuilder(
+            builder: (context, update) => ThemeConfigurationControl(
+              clients: GeneratedCoreProxyClients(bridge),
+              onEdit: onEdit,
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  if (waitForCatalog) await tester.pumpAndSettle();
+  expect(tester.takeException(), isNull);
+}
+
+/// Pumps the appearance route at an explicit window size and opens the editor.
+Future<void> _pumpEditor(
+  WidgetTester tester,
+  _ThemeBridge bridge, {
+  Size size = const Size(390, 844),
+  double textScale = 1,
+}) async {
+  tester.view.devicePixelRatio = 1;
+  tester.view.physicalSize = size;
+  addTearDown(tester.view.resetDevicePixelRatio);
+  addTearDown(tester.view.resetPhysicalSize);
+  await tester.binding.setSurfaceSize(size);
+  addTearDown(() => tester.binding.setSurfaceSize(null));
+  await tester.pumpWidget(
+    OperitTheme(
+      initialThemePreferenceSnapshot:
+          UserPreferencesManager.defaultThemePreferenceSnapshot,
+      initialThemeIsReady: false,
+      unconfiguredChildEnabled: true,
+      hostInteractionHostsEnabled: false,
+      child: MediaQuery(
+        data: MediaQueryData.fromView(tester.view).copyWith(
+          textScaler: TextScaler.linear(textScale),
+        ),
+        child: Scaffold(
+          body: AppearanceSettingsPanel(
             clients: GeneratedCoreProxyClients(bridge),
-            onEdit: onEdit,
           ),
         ),
       ),
     ),
   );
   await tester.pumpAndSettle();
-  expect(tester.takeException(), isNull);
+  await tester.tap(find.byKey(const ValueKey('theme-edit:day')));
+  await tester.pumpAndSettle();
+  expect(find.byType(TabBar), findsOneWidget);
+}
+
+/// Locates one category's settings list by its persistent storage identity.
+Finder _settingsList(String storageId) => find.byKey(
+  PageStorageKey<String>('appearance-settings-list:$storageId'),
+);
+
+/// Reaches the scrollable state inside one category's settings list.
+ScrollableState _listState(WidgetTester tester, String storageId) {
+  return tester.state(
+    find
+        .descendant(
+          of: _settingsList(storageId),
+          matching: find.byType(Scrollable),
+        )
+        .first,
+  );
 }
 
 /// Controls only the external theme-owner boundary while the actual widget and codecs execute.
@@ -958,6 +1162,7 @@ class _ThemeBridge extends OperitRuntimeBridge {
   final Map<CoreWatchRequest, StreamController<CoreEvent>> watches = {};
   String? active = 'day';
   Object? failure;
+  bool publishInitialCatalog = true;
 
   /// Encodes only supported owner operations and publishes committed state after acknowledgements.
   @override
@@ -1046,7 +1251,9 @@ class _ThemeBridge extends OperitRuntimeBridge {
     }
     late StreamController<CoreEvent> controller;
     controller = StreamController<CoreEvent>(
-      onListen: () => controller.add(_event(request)),
+      onListen: () {
+        if (publishInitialCatalog) controller.add(_event(request));
+      },
       onCancel: () => watches.remove(request),
     );
     watches[request] = controller;
@@ -1140,6 +1347,7 @@ Map<String, Object?> _templatePackage() => <String, Object?>{
     'desktopWidgets',
     'appLifecycleHooks',
     'messageProcessingPlugins',
+    'messageTransformHooks',
     'xmlRenderPlugins',
     'inputMenuTogglePlugins',
     'chatInputHooks',

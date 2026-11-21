@@ -14,6 +14,7 @@ import '../../../core/bridge/ProxyCoreRuntimeBridge.dart';
 import '../../common/contributions/ChatSidebarTabHost.dart'
     show ChatSidebarPreparation, ChatSidebarPreparationScope;
 import '../../../core/notifications/NotificationActivationService.dart';
+import '../../../core/host/IncomingAttachmentService.dart';
 import '../../../core/proxy/generated/CoreProxyClients.g.dart';
 import '../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
 import '../../features/chat/components/NewChatIntro.dart';
@@ -84,6 +85,7 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
   bool _isNavigatingBack = false;
   bool _requestedInitialToolPkgNavigationRefresh = false;
   StreamSubscription<void>? _toolPkgCatalogChangeSubscription;
+  StreamSubscription<int>? _coreCatalogRevisionSubscription;
   int _backPressedTime = 0;
 
   /// Initializes navigation services and drawer data subscriptions.
@@ -114,10 +116,19 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
         unawaited(_refreshToolPkgNavigationModel());
       }
     });
+    _coreCatalogRevisionSubscription = _clients.application
+        .extensionCatalogRevisionFlow()
+        .distinct()
+        .listen((_) {
+          ToolPkgCatalogChangeBus.notifyCatalogChanged(reloadPluginCode: false);
+        });
     unawaited(_loadSidebarDockPreferences());
     unawaited(_initializeDrawerData());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
+        IncomingAttachmentService.instance.installNavigation(
+          _activateConversationRoute,
+        );
         unawaited(_initializeDesktopWidgets());
       }
     });
@@ -295,12 +306,14 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
 
   @override
   void dispose() {
+    _coreCatalogRevisionSubscription?.cancel();
     unawaited(DesktopWidgets.setActionHandler(null));
     unawaited(DesktopWidgets.setSnapshotRenderer(null));
     _softwareDesignCatalog.dispose();
     AppRouterGateway.clear();
     AppRouteDiscoveryGateway.clear();
     NotificationActivationService.instance.clearChatHandler();
+    IncomingAttachmentService.instance.clearNavigation();
     _toolPkgCatalogChangeSubscription?.cancel();
     _drawerHistoriesSubscription?.cancel();
     _drawerCurrentChatSubscription?.cancel();
@@ -588,6 +601,7 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
         );
   }
 
+  /// Closes the drawer while retaining an already selected page and its session.
   void _navigateToNavigationEntry(NavigationEntrySpec entry) {
     final action = entry.action;
     if (action != null) {
@@ -604,12 +618,12 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
       );
       return;
     }
+    _drawerOpenState.value = false;
     final currentRouteEntry = _routerState.currentEntry;
     if (currentRouteEntry.routeId == entry.routeId &&
         mapEquals(currentRouteEntry.args, entry.routeArgs)) {
       return;
     }
-    _drawerOpenState.value = false;
     _isNavigatingBack = false;
     _resetToRoute(entry.routeId, entry.routeArgs, RouteEntrySource.drawer);
   }
@@ -718,9 +732,13 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
     }
   }
 
+  /// Dismisses visible shell surfaces before navigating or confirming exit.
   void _handleSystemBack(OperitScreen currentScreen) {
     if (_drawerOpenState.value) {
       _drawerOpenState.value = false;
+      return;
+    }
+    if (_mainLayoutController.handleBack()) {
       return;
     }
     if (_routerState.canPop) {
@@ -794,8 +812,11 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
               controller: _mainLayoutController,
               child: TopBarScope(
                 controller: _topBarController,
-                child: ValueListenableBuilder<bool>(
-                  valueListenable: _drawerOpenState,
+                child: ListenableBuilder(
+                  listenable: Listenable.merge(<Listenable>[
+                    _drawerOpenState,
+                    _mainLayoutController,
+                  ]),
                   child: Scaffold(
                     body: useTabletLayout
                         ? TabletLayout(
@@ -806,7 +827,6 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
                             selectedRouteId: currentRouteEntry.routeId,
                             drawerConversationState: _drawerConversationState,
                             isTabletSidebarExpanded: _isTabletSidebarExpanded,
-                            tabletSidebarWidth: 280,
                             collapsedTabletSidebarWidth: 56,
                             onNavigationEntrySelected:
                                 _navigateToNavigationEntry,
@@ -844,12 +864,14 @@ class _OperitMainScreenState extends State<OperitMainScreen> {
                             ),
                           ),
                   ),
-                  builder: (context, drawerOpen, child) {
-                    final phoneDrawerOpen = !useTabletLayout && drawerOpen;
+                  builder: (context, child) {
+                    final phoneDrawerOpen =
+                        !useTabletLayout && _drawerOpenState.value;
                     return PopScope(
                       canPop:
                           defaultTargetPlatform != TargetPlatform.android &&
                           !phoneDrawerOpen &&
+                          !_mainLayoutController.hasBackAction &&
                           !_routerState.canPop,
                       onPopInvokedWithResult: (didPop, result) {
                         if (didPop) {

@@ -137,6 +137,7 @@ pub fn defaultHostRuntimeTaskSchedulerHost() -> Arc<dyn HostRuntimeTaskScheduler
 /// Bundles host-provided capabilities that the runtime can call through stable traits.
 #[derive(Clone, Default)]
 pub struct HostManager {
+    pub uiAutomationHost: Option<Arc<dyn crate::UiAutomation::UiAutomationHost>>,
     pub serviceDiscoveryHost: Option<Arc<dyn ServiceDiscoveryHost>>,
     pub httpServerHost: Option<Arc<dyn crate::HttpServer::HttpServerHost>>,
     pub tcpHost: Option<Arc<dyn TcpHost>>,
@@ -176,6 +177,18 @@ pub struct HostManager {
 }
 
 impl HostManager {
+    /// Installs the platform-owned accessibility and input provider.
+    pub fn withUiAutomationHost(mut self, host: Arc<dyn crate::UiAutomation::UiAutomationHost>) -> Self {
+        self.uiAutomationHost = Some(host);
+        self
+    }
+    /// Returns this runtime's VFS without exposing path resolution to its consumers.
+    pub fn vfs(&self) -> Result<operit_vfs::VisualFileSystem::VisualFileSystem, String> {
+        let storage = self.runtimeStorageHost.clone().ok_or("RuntimeStorageHost is required for VFS")?;
+        let backend = self.fileSystemHost.clone().ok_or("FileSystemHost is required for VFS")?;
+        operit_vfs::VisualFileSystem::VisualFileSystem::fromStorage(backend, storage)
+    }
+
     /// Installs the host-owned service discovery capability.
     pub fn withServiceDiscoveryHost(mut self, host: Arc<dyn ServiceDiscoveryHost>) -> Self {
         self.serviceDiscoveryHost = Some(host);
@@ -185,6 +198,7 @@ impl HostManager {
     /// Creates a context with no host integrations and the default Android descriptor.
     pub fn new() -> Self {
         Self {
+            uiAutomationHost: None,
             fileSystemHost: None,
             webVisitHost: None,
             browserAutomationHost: None,
@@ -229,6 +243,7 @@ impl HostManager {
     pub fn withFileSystemHost(host: Arc<dyn FileSystemHost>) -> Self {
         let hostEnvironment = host.environmentDescriptor();
         Self {
+            uiAutomationHost: None,
             fileSystemHost: Some(host),
             webVisitHost: None,
             browserAutomationHost: None,
@@ -276,6 +291,7 @@ impl HostManager {
     ) -> Self {
         let hostEnvironment = fileSystemHost.environmentDescriptor();
         Self {
+            uiAutomationHost: None,
             fileSystemHost: Some(fileSystemHost),
             webVisitHost: Some(webVisitHost),
             browserAutomationHost: None,
@@ -324,6 +340,7 @@ impl HostManager {
     ) -> Self {
         let hostEnvironment = fileSystemHost.environmentDescriptor();
         Self {
+            uiAutomationHost: None,
             fileSystemHost: Some(fileSystemHost),
             webVisitHost: Some(webVisitHost),
             browserAutomationHost: None,
@@ -383,6 +400,7 @@ impl HostManager {
     ) -> Self {
         let hostEnvironment = fileSystemHost.environmentDescriptor();
         Self {
+            uiAutomationHost: None,
             fileSystemHost: Some(fileSystemHost),
             webVisitHost: Some(webVisitHost),
             browserAutomationHost: None,

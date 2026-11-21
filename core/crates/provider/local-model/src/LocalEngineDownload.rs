@@ -95,42 +95,27 @@ pub type LocalEngineDownloadProgressCallback =
 #[derive(Clone)]
 pub struct LocalEngineInstaller {
     runtimeRoot: PathBuf,
+    filesystem: operit_vfs::VisualFileSystem::VisualFileSystem,
     registryStore: LocalModelRegistryStore,
     httpHost: Arc<dyn HttpHost>,
     storageHost: Option<Arc<dyn RuntimeStorageHost>>,
 }
 
 impl LocalEngineInstaller {
-    /// Creates a filesystem-backed engine installer for native test coverage.
+    /// Creates an isolated VFS backed by native test storage.
     #[cfg(test)]
-    pub fn forRuntimeRoot(
-        runtimeRoot: PathBuf,
-        httpHost: Arc<dyn HttpHost>,
-    ) -> Result<Self, LocalEngineDownloadError> {
-        let storageHost = testRuntimeStorageHost(runtimeRoot.clone());
-        let registryStore = LocalModelRegistryStore::forRuntimeStorage(storageHost.clone());
-        Ok(Self {
-            runtimeRoot,
-            registryStore,
-            httpHost,
-            storageHost: Some(storageHost),
-        })
+    pub fn forRuntimeRoot(runtimeRoot: PathBuf, httpHost: Arc<dyn HttpHost>) -> Result<Self, LocalEngineDownloadError> {
+        let storage = testRuntimeStorageHost(runtimeRoot.clone());
+        let filesystem = operit_vfs::VisualFileSystem::VisualFileSystem::builtinOnly(Arc::new(operit_host_native_filesystem::PosixFileSystemHost::new()), runtimeRoot.clone(), runtimeRoot.join("workspaces"));
+        Self::withFilesystem(storage, httpHost, filesystem)
     }
 
-    /// Creates an engine installer backed by the runtime storage host.
-    pub fn forRuntimeStorage(
-        storageHost: Arc<dyn RuntimeStorageHost>,
-        httpHost: Arc<dyn HttpHost>,
-    ) -> Result<Self, LocalEngineDownloadError> {
-        let runtimeRoot = storageHost.runtimeRootDir().ok_or_else(|| {
-            LocalEngineDownloadError::Storage(
-                "RuntimeStorageHost runtime root is not configured".to_string(),
-            )
-        })?;
-        let registryStore = LocalModelRegistryStore::forRuntimeStorage(storageHost.clone());
+    /// Creates an installer bound to the owning VFS and registry storage.
+    pub fn withFilesystem(storageHost: Arc<dyn RuntimeStorageHost>, httpHost: Arc<dyn HttpHost>, filesystem: operit_vfs::VisualFileSystem::VisualFileSystem) -> Result<Self, LocalEngineDownloadError> {
         Ok(Self {
-            runtimeRoot,
-            registryStore,
+            runtimeRoot: PathBuf::from("/operitapp/data"),
+            filesystem,
+            registryStore: LocalModelRegistryStore::forRuntimeStorage(storageHost.clone()),
             httpHost,
             storageHost: Some(storageHost),
         })
@@ -189,7 +174,7 @@ impl LocalEngineInstaller {
         ));
         self.removePath(&stagingDir)?;
         let progressCallback = engineDownloadProgressCallback(onProgress.clone());
-        let downloadResult = self.httpHost.downloadFiles(
+        let downloadResult = self.filesystem.downloadFiles(self.httpHost.as_ref(),
             HttpDownloadRequest {
                 downloadId: format!(
                     "local-engine:{}@{}#{}:{}",
@@ -201,7 +186,7 @@ impl LocalEngineInstaller {
                 files: vec![HttpDownloadFileRequest {
                     fileId: request.manifest.id.clone(),
                     url: artifact.url.clone(),
-                    targetPath: nativePathString(&archivePath)?,
+                    targetPath: vfsPathString(&archivePath)?,
                     headers: Vec::new(),
                     expectedBytes: artifact.byteSize,
                 }],
@@ -239,13 +224,8 @@ impl LocalEngineInstaller {
             installedAtMs: request.installedAtMs,
             verifiedAtMs: Some(request.installedAtMs),
         };
-        let mut registry = self
-            .registryStore
-            .read()
-            .map_err(|error| LocalEngineDownloadError::Registry(error.to_string()))?;
-        registry.upsertEngine(installedEngine.clone());
         self.registryStore
-            .write(&registry)
+            .update(|registry| registry.upsertEngine(installedEngine.clone()))
             .map_err(|error| LocalEngineDownloadError::Registry(error.to_string()))?;
         onProgress(LocalEngineDownloadProgress::Completed {
             engineId: installedEngine.manifest.id.clone(),
@@ -277,13 +257,8 @@ impl LocalEngineInstaller {
             installedAtMs: request.installedAtMs,
             verifiedAtMs: Some(request.installedAtMs),
         };
-        let mut registry = self
-            .registryStore
-            .read()
-            .map_err(|error| LocalEngineDownloadError::Registry(error.to_string()))?;
-        registry.upsertEngine(installedEngine.clone());
         self.registryStore
-            .write(&registry)
+            .update(|registry| registry.upsertEngine(installedEngine.clone()))
             .map_err(|error| LocalEngineDownloadError::Registry(error.to_string()))?;
         onProgress(LocalEngineDownloadProgress::Completed {
             engineId: installedEngine.manifest.id.clone(),
@@ -303,41 +278,40 @@ impl LocalEngineInstaller {
         target: &LocalPlatformTarget,
         verifiedAtMs: i64,
     ) -> Result<InstalledLocalEngine, LocalEngineDownloadError> {
-        let mut registry = self
-            .registryStore
-            .read()
-            .map_err(|error| LocalEngineDownloadError::Registry(error.to_string()))?;
-        let index = registry
-            .installedEngines
-            .iter()
-            .position(|engine| {
-                engine.manifest.id == engineId.trim()
-                    && engine.manifest.version == version.trim()
-                    && engine.artifact.target == *target
-            })
-            .ok_or_else(|| {
-                LocalEngineDownloadError::EngineNotInstalled(format!(
-                    "{}@{}#{}",
-                    engineId.trim(),
-                    version.trim(),
-                    target.storageSegment()
-                ))
-            })?;
-        if registry.installedEngines[index].artifact.delivery
-            == LocalEngineDelivery::DownloadArchive
-        {
-            let installDir = runtimeLayoutPath(
-                &self.runtimeRoot,
-                &registry.installedEngines[index].storagePath,
-            )?;
-            self.verifyEngineRuntimeFiles(&installDir, &registry.installedEngines[index].artifact)?;
+        let notInstalled = || {
+            LocalEngineDownloadError::EngineNotInstalled(format!(
+                "{}@{}#{}",
+                engineId.trim(),
+                version.trim(),
+                target.storageSegment()
+            ))
+        };
+        let registry = self.readRegistry()?;
+        let engine = registry
+            .getInstalledEngine(engineId, version, target)
+            .ok_or_else(notInstalled)?;
+        if engine.artifact.delivery == LocalEngineDelivery::DownloadArchive {
+            let installDir = runtimeLayoutPath(&self.runtimeRoot, &engine.storagePath)?;
+            self.verifyEngineRuntimeFiles(&installDir, &engine.artifact)?;
         }
-        registry.installedEngines[index].verifiedAtMs = Some(verifiedAtMs);
-        let installedEngine = registry.installedEngines[index].clone();
         self.registryStore
-            .write(&registry)
-            .map_err(|error| LocalEngineDownloadError::Registry(error.to_string()))?;
-        Ok(installedEngine)
+            .update(|registry| {
+                registry
+                    .installedEngines
+                    .iter_mut()
+                    .find(|current| {
+                        current.manifest == engine.manifest
+                            && current.artifact == engine.artifact
+                            && current.storagePath == engine.storagePath
+                            && current.installedAtMs == engine.installedAtMs
+                    })
+                    .map(|current| {
+                        current.verifiedAtMs = Some(verifiedAtMs);
+                        current.clone()
+                    })
+            })
+            .map_err(|error| LocalEngineDownloadError::Registry(error.to_string()))?
+            .ok_or_else(notInstalled)
     }
 
     /// Deletes one installed engine target and its registry record.
@@ -347,7 +321,7 @@ impl LocalEngineInstaller {
         version: &str,
         target: &LocalPlatformTarget,
     ) -> Result<LocalEngineDeleteResult, LocalEngineDownloadError> {
-        let mut registry = self
+        let registry = self
             .registryStore
             .read()
             .map_err(|error| LocalEngineDownloadError::Registry(error.to_string()))?;
@@ -366,9 +340,8 @@ impl LocalEngineInstaller {
             let installDir = runtimeLayoutPath(&self.runtimeRoot, &installedEngine.storagePath)?;
             self.removePath(&installDir)?;
         }
-        registry.removeEngine(engineId, version, target);
         self.registryStore
-            .write(&registry)
+            .update(|registry| registry.removeEngine(engineId, version, target))
             .map_err(|error| LocalEngineDownloadError::Registry(error.to_string()))?;
         Ok(LocalEngineDeleteResult {
             removedStoragePath: installedEngine.storagePath.clone(),
@@ -411,7 +384,7 @@ impl LocalEngineInstaller {
 
     /// Verifies that the installer has a runtime storage host.
     fn createDirectory(&self, path: &Path) -> Result<(), LocalEngineDownloadError> {
-        let pathString = nativePathString(path)?;
+        let pathString = vfsPathString(path)?;
         self.storageHost
             .as_ref()
             .ok_or_else(|| LocalEngineDownloadError::Storage(pathString))?;
@@ -431,7 +404,7 @@ impl LocalEngineInstaller {
     /// Removes one completed or retained partial HTTP download target.
     fn removeDownloadTarget(&self, target: &Path) -> Result<(), LocalEngineDownloadError> {
         self.removePath(target)?;
-        let partial = PathBuf::from(httpDownloadPartialTargetPath(&nativePathString(target)?));
+        let partial = PathBuf::from(httpDownloadPartialTargetPath(&vfsPathString(target)?));
         self.removePath(&partial)
     }
 
@@ -549,9 +522,9 @@ fn engineDownloadProgressCallback(
 }
 
 /// Converts one native archive path into the host download contract representation.
-fn nativePathString(path: &Path) -> Result<String, LocalEngineDownloadError> {
+fn vfsPathString(path: &Path) -> Result<String, LocalEngineDownloadError> {
     path.to_str()
-        .map(str::to_string)
+        .map(|path| path.replace('\\', "/"))
         .ok_or_else(|| LocalEngineDownloadError::Storage(path.to_string_lossy().to_string()))
 }
 
@@ -742,7 +715,7 @@ fn joinDeclaredRuntimePath(root: &Path, relativePath: &str) -> PathBuf {
     root.join(relativePath)
 }
 
-/// Maps a runtime layout path into one native runtime root.
+/// Maps a runtime-layout key into a portable path under the owning VFS root.
 fn runtimeLayoutPath(
     runtimeRoot: &Path,
     storagePath: &str,
@@ -751,7 +724,9 @@ fn runtimeLayoutPath(
         .trim()
         .strip_prefix(RUNTIME_ROOT_PATH_PREFIX)
         .ok_or_else(|| LocalEngineDownloadError::Storage(storagePath.to_string()))?;
-    Ok(runtimeRoot.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)))
+    operit_vfs::VfsPath::joinVfsPath(&runtimeRoot.to_string_lossy(), relative)
+        .map(PathBuf::from)
+        .map_err(LocalEngineDownloadError::Storage)
 }
 
 /// Maps a native runtime-root path into a virtual runtime storage path.

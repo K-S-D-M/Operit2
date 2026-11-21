@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use crate::LegacyTransactionImport::JournalRecord;
 use crate::SyncOperationStore::{SyncOperation, SyncOperationStoreError as Error, SyncReceipt};
 
-pub(crate) struct Journal(Box<dyn RuntimeSqliteConnection>);
+pub(crate) struct Journal(pub(super) Box<dyn RuntimeSqliteConnection>);
 
 // Direct appends and recoverable preference edits share a durable identity floor.
 const AUTHOR_SEQUENCE_HIGH_WATER_SQL: &str = "SELECT MAX(
@@ -38,6 +38,8 @@ impl Journal {
             CREATE TABLE IF NOT EXISTS journal_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
         connection.executeBatch(super::compaction::SCHEMA)?;
         connection.executeBatch("CREATE TABLE IF NOT EXISTS preference_compaction_policy(path TEXT PRIMARY KEY,format INTEGER NOT NULL,safe INTEGER NOT NULL)")?;
+        #[cfg(feature = "full")]
+        connection.executeBatch(super::file_index::SCHEMA)?;
         Ok(Self(connection))
     }
 
@@ -62,7 +64,7 @@ impl Journal {
         }
         if super::compaction::retired(tx,original)? { return Ok(()); }
         if !tx.query("SELECT 1 FROM _operit_initialization_coverage WHERE id=?1",vec![text(&original.opId)])?.is_empty() { return Ok(()); }
-        let fingerprint = crate::Transaction::digest(original).map_err(Error::Message)?;
+        let fingerprint = crate::Transaction::operation_digest(original).map_err(Error::Message)?;
         let previous = tx.query("SELECT fingerprint FROM originals WHERE id=?1 UNION ALL SELECT fingerprint FROM legacy_fingerprints WHERE id=?1", vec![text(&original.opId)])?;
         for row in &previous {
             if row.valueAt(0)?.asString()? != fingerprint {
@@ -72,14 +74,17 @@ impl Journal {
         // A completed legacy receipt may have no retained payload. A matching redelivery restores it.
         let completed = !pending || !tx.query("SELECT 1 FROM legacy_receipts WHERE origin=?1 AND first<=?2 AND last>=?2", vec![text(&original.originDeviceId), SqliteValue::Integer(original.sequence)])?.is_empty();
         let header = JournalRecord::parse(&serde_json::to_vec(original)?, 0)?;
-        tx.execute("INSERT INTO originals(id,origin,sequence,domain,header,original,fingerprint,pending,business_time,target,format_version)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO NOTHING", vec![
+        let _changed = tx.execute("INSERT INTO originals(id,origin,sequence,domain,header,original,fingerprint,pending,business_time,target,format_version)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET domain=excluded.domain,header=excluded.header,original=excluded.original,
+                business_time=excluded.business_time,target=excluded.target,format_version=excluded.format_version WHERE originals.pending=1 AND originals.original<>excluded.original", vec![
             text(&original.opId), text(&original.originDeviceId), SqliteValue::Integer(original.sequence), text(&original.domain),
             text(&serde_json::to_string(&header)?), text(&serde_json::to_string(stored)?), text(&fingerprint), SqliteValue::Integer(i64::from(!completed)),
             SqliteValue::Integer(crate::Transaction::Revision::fromOperation(original).createdAt),
             text(original.payload.get("storagePath").and_then(serde_json::Value::as_str).unwrap_or(&original.entityId)),
             SqliteValue::Integer(original.payload.get("schemaVersion").and_then(serde_json::Value::as_i64).unwrap_or(0)),
         ])?;
+        #[cfg(feature = "full")]
+        if _changed > 0 { Self::index_blob_references(tx, &original.opId)?; }
         Ok(())
     }
 
@@ -93,17 +98,6 @@ impl Journal {
         self.0.query(
             "SELECT original FROM originals WHERE target=?1 AND pending=0 AND domain='preferences' ORDER BY origin,sequence",
             vec![text(path)],
-        )?.into_iter().map(|row| Ok(serde_json::from_str(&row.valueAt(0)?.asString()?)?)).collect()
-    }
-
-    /// Local edits compare current-format originals only; initialization blobs stay unopened.
-    pub(crate) fn preference_compaction_history(&mut self, path: &str, format: u32) -> Result<Vec<SyncOperation>, Error> {
-        self.0.query(
-            "SELECT o.original FROM originals o JOIN preference_compaction_policy p
-             ON p.path=o.target AND p.format=o.format_version AND p.safe=1
-             WHERE o.target=?1 AND p.format=?2 AND o.pending=0 AND o.domain='preferences'
-             AND json_extract(o.header,'$.operation') NOT IN ('initialize','alias') ORDER BY o.origin,o.sequence",
-            vec![text(path), SqliteValue::Integer(format.into())],
         )?.into_iter().map(|row| Ok(serde_json::from_str(&row.valueAt(0)?.asString()?)?)).collect()
     }
 
@@ -163,7 +157,9 @@ impl Journal {
     pub(crate) fn complete(&mut self, operations: &[SyncOperation]) -> Result<(), Error> {
         self.transaction(|tx| {
             for operation in operations {
-                let fingerprint = crate::Transaction::digest(operation).map_err(Error::Message)?;
+                // Blob-transported operations carry the content hash as their fingerprint,
+                // matching the reception fingerprint instead of the transport envelope bytes.
+                let fingerprint = crate::Transaction::operation_digest(operation).map_err(Error::Message)?;
                 let rows = tx.query("SELECT fingerprint FROM originals WHERE id=?1", vec![text(&operation.opId)])?;
                 if rows.is_empty() && (super::compaction::retired(tx,operation)? || !tx.query("SELECT 1 FROM _operit_initialization_coverage WHERE id=?1",vec![text(&operation.opId)])?.is_empty()) { continue; }
                 let row = rows.first().ok_or_else(|| Error::Message(format!("Unreceived operation {}", operation.opId)))?;
@@ -171,6 +167,8 @@ impl Journal {
                     return Err(Error::Message(format!("Conflicting immutable operation {}", operation.opId)));
                 }
                 tx.execute("UPDATE originals SET pending=0 WHERE id=?1", vec![text(&operation.opId)])?;
+                #[cfg(feature = "full")]
+                Self::compact_file(tx, operation)?;
                 // SQL owners export through their own source; this journal only carries pending reception.
                 if matches!(operation.domain.as_str(), "chat" | "plugin_storage") {
                     Self::retire_ids(tx,std::iter::once(operation.opId.clone()))?;
@@ -182,15 +180,18 @@ impl Journal {
 
     pub(crate) fn receipt(&mut self) -> Result<SyncReceipt, Error> {
         let mut receipt = SyncReceipt::default();
-        for row in self.0.query("SELECT origin,first,last FROM legacy_receipts", vec![])? {
+        self.0.visitRows("SELECT origin,first,last FROM legacy_receipts", vec![], &mut |row| {
             receipt.observeRange(&row.valueAt(0)?.asString()?, row.valueAt(1)?.asI64()?, row.valueAt(2)?.asI64()?);
-        }
-        for row in self.0.query("SELECT origin,sequence FROM originals UNION SELECT origin,sequence FROM _operit_compacted ORDER BY origin,sequence", vec![])? {
+            Ok(())
+        })?;
+        self.0.visitRows("SELECT origin,sequence FROM originals UNION SELECT origin,sequence FROM _operit_compacted ORDER BY origin,sequence", vec![], &mut |row| {
             receipt.observe(&row.valueAt(0)?.asString()?, row.valueAt(1)?.asI64()?);
-        }
-        for row in self.0.query("SELECT id FROM _operit_initialization_coverage",vec![])? {
+            Ok(())
+        })?;
+        self.0.visitRows("SELECT id FROM _operit_initialization_coverage", vec![], &mut |row| {
             super::compaction::observe_id(&mut receipt,&row.valueAt(0)?.asString()?);
-        }
+            Ok(())
+        })?;
         Ok(receipt)
     }
 
@@ -271,6 +272,8 @@ impl Journal {
     pub(crate) fn save_owner(tx: &mut dyn RuntimeSqliteTransaction, state: &super::kernel::OwnerState) -> Result<(), Error> {
         tx.execute("INSERT INTO transaction_owners(path,state) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET state=excluded.state",
             vec![text(&state.current.data.owner.path), text(&serde_json::to_string(state)?)])?;
+        #[cfg(feature = "full")]
+        Self::index_owner_blobs(tx, &state.current.data.owner.path)?;
         Ok(())
     }
 
@@ -314,14 +317,13 @@ impl Journal {
         self.0.query("SELECT path,encrypted FROM transaction_files ORDER BY path", vec![])?.iter()
             .map(|row| Ok((row.valueAt(0)?.asString()?, row.valueAt(1)?.asI64()? != 0))).collect()
     }
+    /// Tracks the latest local write policy; historical operations retain their original format.
     pub(crate) fn register_file(&mut self, path: &str, encrypted: bool) -> Result<(), Error> {
         self.transaction(|tx| {
-            let rows = tx.query("SELECT encrypted FROM transaction_files WHERE path=?1",vec![text(path)])?;
-            if let Some(row) = rows.first() {
-                if (row.valueAt(0)?.asI64()? != 0) != encrypted { return Err(Error::Message("Conflicting preference encryption policy".into())); }
-                return Ok(());
-            }
-            tx.execute("INSERT INTO transaction_files VALUES(?1,?2)",vec![text(path), SqliteValue::Integer(i64::from(encrypted))])?;
+            tx.execute(
+                "INSERT INTO transaction_files VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET encrypted=excluded.encrypted WHERE encrypted<>excluded.encrypted",
+                vec![text(path), SqliteValue::Integer(i64::from(encrypted))],
+            )?;
             Ok(())
         })
     }
@@ -341,9 +343,13 @@ impl Journal {
     /// A coverage decision retires pending and completed copies through the same atomic path.
     pub(crate) fn retire_ids(tx: &mut dyn RuntimeSqliteTransaction, ids: impl IntoIterator<Item=String>) -> Result<(),Error> {
         for id in ids {
+            #[cfg(feature = "full")]
+            Self::queue_file_blob(tx, &id)?;
             for row in tx.query("SELECT origin,sequence,business_time,fingerprint FROM originals WHERE id=?1",vec![text(&id)])? {
                 super::compaction::seal_identity(tx,&id,&row.valueAt(0)?.asString()?,row.valueAt(1)?.asI64()?,row.valueAt(2)?.asI64()?,&row.valueAt(3)?.asString()?)?;
                 tx.execute("DELETE FROM originals WHERE id=?1",vec![text(&id)])?;
+                #[cfg(feature = "full")]
+                tx.execute("DELETE FROM sync_blob_references WHERE operation_id=?1",vec![text(&id)])?;
             }
         }
         Ok(())

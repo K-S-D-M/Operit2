@@ -22,6 +22,9 @@ pub mod chromium_browser;
 pub mod host_runtime_event;
 pub mod registry;
 pub mod tools;
+#[cfg(target_os = "linux")]
+#[path = "../../common/ui_automation.rs"]
+mod ui_automation;
 
 #[cfg(target_os = "linux")]
 pub use host_runtime_event::LinuxHostRuntimeEventHost;
@@ -69,6 +72,10 @@ pub fn createRuntimeHostManager(
         runtimeStorageHost,
         runtimeSqliteHost,
     )
+    .withLocalInferenceHost(Arc::new(operit_host_local_inference::NativeLocalInferenceHost::new()))
+    .withUiAutomationHost(Arc::new(ui_automation::ScriptUiAutomationHost::new(
+        "python3", &["-c", include_str!("ui_automation.py")],
+    )))
     .withHostSecretStore(hostSecretStore)
     .withWebSocketHost(Arc::new(LinuxHttpHost::new()))
     .withHttpServerHost(Arc::new(operit_host_native_common::NativeHttpServerHost))

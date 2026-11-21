@@ -13,6 +13,8 @@ from zipfile import ZipFile
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "tools/build_scripts"))
 import cli_common
+from windows_bash import REQUIRED_FILES as BASH_REQUIRED_FILES
+from windows_powershell import REQUIRED_FILES as POWERSHELL_REQUIRED_FILES
 
 
 class WindowsRuntimePackagingTests(unittest.TestCase):
@@ -32,6 +34,22 @@ class WindowsRuntimePackagingTests(unittest.TestCase):
         for name in ("require_command", "prepare_plugin_assets", "run", "verify_cli_plugin_assets"):
             self.patches.enter_context(patch.object(cli_common, name))
         self.patches.enter_context(patch.object(cli_common, "windows_aarch64_env", return_value={}))
+        self.patches.enter_context(patch.object(cli_common, "prepare_windows_bash", side_effect=self.stage_bash))
+        self.patches.enter_context(patch.object(cli_common, "prepare_windows_powershell", side_effect=self.stage_powershell))
+
+    def stage_powershell(self, destination, arch):
+        """Model the matching PowerShell distribution while checking actual package contents."""
+        for relative in POWERSHELL_REQUIRED_FILES:
+            path = destination / "powershell" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"bundled PowerShell {arch}".encode())
+
+    # Model the downloaded runtime while exercising actual package staging and ZIP contents.
+    def stage_bash(self, destination, arch):
+        for relative in BASH_REQUIRED_FILES:
+            path = destination / "bash" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"bundled Bash {arch}".encode())
 
     # Exercise actual file staging and ZIP creation for both Cargo output layouts.
     def test_windows_archives_include_the_native_runtime(self):
@@ -48,6 +66,10 @@ class WindowsRuntimePackagingTests(unittest.TestCase):
                     self.assertEqual(archive.read("operit2.exe"), b"cli executable")
                     self.assertEqual(archive.read("operit_local_llm.dll"), b"native inference runtime")
                     self.assertIn("install.bat", archive.namelist())
+                    for relative in BASH_REQUIRED_FILES:
+                        self.assertEqual(archive.read(f"bash/{relative}"), f"bundled Bash {arch}".encode())
+                    for relative in POWERSHELL_REQUIRED_FILES:
+                        self.assertEqual(archive.read(f"powershell/{relative}"), f"bundled PowerShell {arch}".encode())
 
     # A missing native dependency must prevent publication of an unusable package.
     def test_windows_package_rejects_a_missing_runtime(self):

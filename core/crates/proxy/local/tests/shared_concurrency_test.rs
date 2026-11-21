@@ -27,7 +27,7 @@ use operit_runtime::services::RuntimeHostInteractionService::{
 };
 use operit_util::MarkdownRenderStream::MarkdownStreamEvent;
 use operit_util::RuntimeStorageLayout::{RUNTIME_ROOT_DIR_PATH, WORKSPACE_DIR_PATH};
-use operit_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
+
 use serde_json::{json, Value};
 
 struct OwnerInteractionBrowserHost;
@@ -249,10 +249,7 @@ fn register_test_runtime_roots() -> Arc<TestRuntimeStorageHost> {
     let workspace_root = root.join(WORKSPACE_DIR_PATH);
     std::fs::create_dir_all(&runtime_root).expect("test runtime root must be created");
     std::fs::create_dir_all(&workspace_root).expect("test workspace root must be created");
-    setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(
-        runtime_root.clone(),
-        workspace_root.clone(),
-    ));
+
     Arc::new(TestRuntimeStorageHost::new(runtime_root, workspace_root))
 }
 
@@ -1227,6 +1224,7 @@ async fn owned_core_command_releases_application_while_registry_is_loading() {
     hosts.hostSecretStore = Some(Arc::new(TestSecretStore::default()));
     hosts.hostJavaScriptRuntimeHost = Some(Arc::new(NativeHostJavaScriptRuntimeHost::new()));
     hosts.hostRuntimeTaskSchedulerHost = Some(Arc::new(NativeHostRuntimeTaskSchedulerHost::new()));
+    ui_resource_tests::configure_package_hosts(&mut hosts);
     let application = OperitApplication::newWithContext(hosts);
     let readiness = application.packageManager().lock().unwrap().packageRegistryReadiness();
     assert!(readiness.claim_initial_load().unwrap());
@@ -1243,6 +1241,12 @@ async fn owned_core_command_releases_application_while_registry_is_loading() {
     let command = tokio::time::timeout(Duration::from_secs(2), pending).await.unwrap();
     assert!(response.expect("Core command must release the application lock").result.is_ok());
     assert_eq!(command.result.unwrap_err().message, "core command startup error");
+    for method in ["getExtensionCatalogSnapshot", "checkExtensionCatalogUpdates"] {
+        let response = tokio::time::timeout(Duration::from_secs(2), CoreLinkSharedClient::call(
+            &proxy, CoreCallRequest::new(method, app_target, method, toCoreValue(json!({})).unwrap()),
+        )).await.expect("catalog I/O must complete through its detached host task");
+        assert!(response.result.is_ok(), "{method}: {response:?}");
+    }
 }
 
 /// Covers the local-proxy to annotation-route boundary used by Flutter chat pages.
@@ -1480,3 +1484,9 @@ mod failed_package_tests;
 
 #[path = "support/relative_terminal_tests.rs"]
 mod relative_terminal_tests;
+
+#[path = "support/market_update_tests.rs"]
+mod market_update_tests;
+
+#[path = "support/font_storage_stream_tests.rs"]
+mod font_storage_stream_tests;

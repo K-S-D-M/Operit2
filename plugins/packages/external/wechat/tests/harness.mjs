@@ -8,6 +8,7 @@ import {
 } from "node:crypto";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { objectStorage } from "../../qqbot/tests/storage.mjs";
 import { provider } from "../../waifu/tests/harness.mjs";
 import { clock, plain, settle } from "../../qqbot/tests/harness.mjs";
 
@@ -30,21 +31,35 @@ export function load(name, globals = {}) {
   });
   const module = { exports: {} };
   const errors = [];
-  vm.runInNewContext(
-    output.outputFiles[0].text,
-    {
+  const context = vm.createContext({
       module,
       exports: module.exports,
       console: {
         log() {},
+        warn() {},
         error(...args) {
           errors.push(args);
         },
       },
       ...globals,
-    },
-    { filename: file },
-  );
+  });
+  if (globals.ToolPkg?.wasm === "test-bundled-wasm") {
+    const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
+    context.__testWasmEntry = id => {
+      const module = manifest.wasm_modules.find(entry => entry.id === id);
+      return { bytes: readFileSync(new URL(`../${module.path}`, import.meta.url)), metadata: module };
+    };
+    const bridge = readFileSync(new URL("../../../../../core/crates/plugin/sdk/src/toolpkg/ToolPkgWasmApi.js", import.meta.url), "utf8");
+    vm.runInContext(bridge, context);
+    vm.runInContext(`
+      globalThis.__operitNativeLoadToolPkgWasm = (_target, id) => {
+        const entry = __testWasmEntry(id);
+        return { bytes: new Uint8Array(entry.bytes), metadata: entry.metadata };
+      };
+      ToolPkg = { ...ToolPkg, wasm: __operitCreateToolPkgWasmApi(() => "com.operit.wechat_bot", false) };
+    `, context);
+  }
+  vm.runInContext(output.outputFiles[0].text, context, { filename: file });
   return { ...module.exports, errors };
 }
 
@@ -120,7 +135,7 @@ export function response(data = { ret: 0 }, extra = {}) {
 
 /** Runs the actual service, dependency client and Waifu provider against controlled host boundaries. */
 export async function fixture(options = {}) {
-  const sourceClock = clock();
+  const sourceClock = clock(), storage = options.storage ?? objectStorage();
   const time = {
     ...sourceClock,
     /** Advances real asynchronous chains between timer ticks instead of jumping past their continuations. */
@@ -131,7 +146,7 @@ export async function fixture(options = {}) {
       }
     },
   };
-  const config = options.config ?? load("model").defaultConfig();
+  let config = options.config ?? load("model").defaultConfig();
   if (!options.config) {
     config.account = options.loggedOut
       ? null
@@ -142,6 +157,13 @@ export async function fixture(options = {}) {
           baseUrl: "https://ilinkai.weixin.qq.com",
         };
     config.autoReply.enabled = options.auto === true;
+    config.autoReply.waifuProfile = options.native ? "native" : "default";
+  }
+  const existingChatCount = Object.keys(config.bindings).length;
+  // Model PluginConfig's top-level-only dirty tracking when requested.
+  let configDirty = false;
+  if (options.trackTopLevel) {
+    config = new Proxy(config, { set(target, key, value) { target[key] = value; configDirty = true; return true; } });
   }
   const requests = [],
     snapshots = [],
@@ -163,11 +185,12 @@ export async function fixture(options = {}) {
   });
   let pendingPoll = null,
     pendingQR = null,
-    pendingReply = null,
     sent = 0;
+  const pendingReplies = new Map();
   const batches = [],
     qrStates = [];
   const Tools = {
+    Storage: { objects: storage },
     Net: {
       async http(request) {
         requests.push(plain(request));
@@ -233,18 +256,16 @@ export async function fixture(options = {}) {
     Chat: {
       async createNew(input) {
         created.push(plain(input));
-        return { chatId: `chat-${created.length}` };
+        return { chatId: `chat-${existingChatCount + created.length}` };
       },
       async updateTitle() {},
       async updateGroup() {},
       async cancel(chatId) {
         cancelled.push(chatId);
-        if (pendingReply !== null) {
-          pendingReply({
-            chatId,
-            outcome: { type: "committed", status: "cancelled" },
-          });
-          pendingReply = null;
+        const resolve = pendingReplies.get(chatId);
+        if (resolve) {
+          pendingReplies.delete(chatId);
+          resolve({ chatId, outcome: { type: "committed", status: options.lateOnCancel ? "completed" : "cancelled" }, aiResponse: "迟到的答复" });
         }
         return { chatId, cancelRequested: true };
       },
@@ -258,7 +279,7 @@ export async function fixture(options = {}) {
               parts: [{ kind: "markdown", content: options.firstPart }],
             };
           const result = await new Promise((resolve) => {
-            pendingReply = resolve;
+            pendingReplies.set(input.chatId, resolve);
           });
           yield { type: "completed", result };
           return;
@@ -274,6 +295,7 @@ export async function fixture(options = {}) {
           type: "completed",
           result: {
             chatId: input.chatId,
+            aiResponse: content,
             outcome: { type: "committed", status: "completed" },
           },
         };
@@ -345,10 +367,16 @@ export async function fixture(options = {}) {
         return config;
       },
       async flush() {
-        snapshots.push(plain(config));
+        if (options.failFlush?.(plain(config), sent)) throw new Error("injected config write failure");
+        if (!options.trackTopLevel || configDirty) {
+          snapshots.push(plain(config));
+          configDirty = false;
+        }
       },
     },
     ToolPkg: {
+      getLocalDataDir: () => "/plugin",
+      wasm: options.wasm,
       ipc: { on() {} },
       async callDependency(owner, method, input) {
         if (owner === "com.operit.character_cards")
@@ -361,13 +389,13 @@ export async function fixture(options = {}) {
   };
   const service = load("service", globals);
   /** Delivers one exact getUpdates response to the active host request. */
-  async function batch(messages, cursor = "cursor-1", extra = {}) {
+  async function batch(messages, cursor = "cursor-1", extra = {}, statusCode = 200) {
     const result = response({
       ret: 0,
       msgs: messages,
       get_updates_buf: cursor,
       ...extra,
-    });
+    }, { statusCode });
     if (pendingPoll === null) batches.push(result);
     else {
       const resolve = pendingPoll;
@@ -375,6 +403,7 @@ export async function fixture(options = {}) {
       resolve(result);
     }
     await settle();
+    await new Promise(resolve => setImmediate(resolve));
   }
   /** Delivers one QR status without inventing account confirmation. */
   async function qr(result) {
@@ -403,9 +432,16 @@ export async function fixture(options = {}) {
     created,
     submitted,
     cancelled,
+    completeReply(chatId) {
+      const resolve = pendingReplies.get(chatId);
+      if (!resolve) throw new Error(`No pending reply: ${chatId}`);
+      pendingReplies.delete(chatId);
+      resolve({ chatId, outcome: { type: "committed", status: "completed" } });
+    },
     uploads,
     files,
     crypto,
+    storage,
     globals,
     service,
     batch,

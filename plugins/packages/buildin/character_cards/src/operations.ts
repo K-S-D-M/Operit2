@@ -1,4 +1,5 @@
 import { readCharacter, createCharacterDraft, createGroupDraft, createTagDraft } from "./drafts";
+import { groupAvatarUri } from "./group-avatar-image";
 import { characterModelBindingMode, sameCharacterModelBinding } from "./model-binding";
 import type { DomainInput, DomainOperation, DomainOutput } from "./api";
 import type { ChatConfigurationService } from "./domain";
@@ -18,6 +19,7 @@ import { independentConfigurations } from "./selection-settings";
 import { uuid } from "./identity";
 import { autoCategorizeMemory, updateChatMemory } from "./memory-jobs/analysis";
 import { rebuildMemoryEmbeddings } from "./memory-jobs/embeddings";
+import { MEMORY_SEARCH_THRESHOLD } from "./memory-search";
 import { decodeCharacterBackup, decodeGroupBackup, decodeMemoryBackup, exportCharacterBackup, exportGroupBackup, exportMemoryBackup } from "./backup";
 
 interface TagPlan {
@@ -213,15 +215,6 @@ function normalizedCharacter(card: Card): Card {
     throw new Error("记忆绑定模式无效");
   if (card.ttsConfigId !== null) requireId(card.ttsConfigId, "TTS 配置");
   if (card.themeConfigId !== null) requireId(card.themeConfigId, "主题配置");
-  const policy = card.toolAccessConfig;
-  if (
-    policy.enabled &&
-    (policy.allowedPackages.length !== 0 ||
-      policy.allowedSkills.length !== 0 ||
-      policy.allowedMcpServers.length !== 0) &&
-    !new Set(normalizeNames(policy.allowedBuiltinTools)).has("use_package")
-  )
-    throw new Error("选择外部工具来源时必须允许 use_package");
   const mounts = [];
   const mountIds = new Set<string>();
   for (const mount of card.sharedMemoryMounts) {
@@ -339,6 +332,7 @@ export async function saveGroup(
       id: "",
       name,
       description: group.description.trim(),
+      avatarUri: group.avatarUri ?? null,
       members,
       themeConfigId: group.themeConfigId,
       createdAt: 0,
@@ -351,6 +345,7 @@ export async function saveGroup(
       ...original,
       name,
       description: group.description.trim(),
+      avatarUri: group.avatarUri ?? null,
       members,
       themeConfigId: group.themeConfigId,
     };
@@ -601,6 +596,14 @@ export async function dispatch(
       return host.readMemoryRecallSettings();
     case "writeMemoryRecallSettings":
       return host.writeMemoryRecallSettings(request.settings);
+    case "previewMemorySearch": {
+      await requireOwner(request.ownerKey, host);
+      const [config, recall] = await Promise.all([host.readMemorySearchConfig(request.ownerKey), host.readMemoryRecallSettings()]);
+      const result = await host.searchMemoryDebug({ ownerKey: request.ownerKey, query: request.query,
+        folderPath: request.folderPath, relevanceThreshold: MEMORY_SEARCH_THRESHOLD,
+        createdAtStartMs: null, createdAtEndMs: null, limit: recall.limit }, config, false);
+      return { ...result, candidates: result.candidates.filter(hit => hit.passedThreshold) };
+    }
     case "searchMemoryDebug": {
       await requireOwner(request.ownerKey, host);
       assertSearchConfig(request.config);
@@ -948,6 +951,7 @@ const handlers: DomainHandlers = {
   "memory.candidates.clearFailed": async (input, repository) => ({ cleared: await repository.recoverFailedCandidates(input.ownerKey, null) }),
   /** Resolves chat configuration using this operation's existing repository snapshot. */
   "chat.configuration.resolve": (input, repository) => resolveConfiguration(input, {
+    groupAvatar: groupAvatarUri,
     /** Reads only the requested character. */
     getCharacter: (id) => repository.getCharacter(id),
     /** Reads only the requested group. */

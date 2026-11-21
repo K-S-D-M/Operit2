@@ -1,12 +1,12 @@
 //! Direct Dart transport with one connection-owned Push/Watch session.
-//! ABI v3 delivers batches through a single VM port with shared binary ownership.
+//! ABI v4 adds synchronous failure reporting independent of the VM delivery session.
 
 use crate::BridgeCodec::*;
 use crate::BridgeExports;
 use crate::BridgeTransport::{BridgeStreams, StreamAction, StreamSubmission, WATCH_BATCH_CAPACITY};
 use crate::OperitFlutterBridge;
 use futures_util::FutureExt;
-use operit_host_native_common::DartPort::{DartPort, PostCObject};
+use operit_host_native_common::DartPort::{recent_post_diagnostics, DartPort, PostCObject};
 use operit_host_native_common::SharedBuffer::{
     shared_allocate, shared_data, shared_release, shared_retain, shared_seal, SharedBuffer,
 };
@@ -35,8 +35,16 @@ impl FfiSession {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
+        let frame_count = frames.len();
         if !self.target.get().expect("FFI session must be connected")(frames) {
             drop(delivery);
+            operit_util::AppLogger::AppLogger::w(
+                "CoreFfiTransport",
+                &format!(
+                    "Dart rejected native FFI delivery; closing session pid={} frames={frame_count}",
+                    std::process::id(),
+                ),
+            );
             self.close();
         }
     }
@@ -70,7 +78,13 @@ impl FfiSession {
         let (streams, mut events) =
             match BridgeStreams::start(self.bridge.localCore.clone(), scheduler.as_ref()) {
                 Ok(connection) => connection,
-                Err(_) => return false,
+                Err(error) => {
+                    operit_util::AppLogger::AppLogger::e(
+                        "CoreFfiTransport",
+                        &format!("Unable to start FFI streams: {error}"),
+                    );
+                    return false;
+                }
             };
         if self.streams.set(streams).is_err() {
             return false;
@@ -104,7 +118,11 @@ impl FfiSession {
                 })
             }),
         );
-        if result.is_err() {
+        if let Err(error) = result {
+            operit_util::AppLogger::AppLogger::e(
+                "CoreFfiTransport",
+                &format!("Unable to schedule FFI delivery: {error}"),
+            );
             self.close();
             return false;
         }
@@ -283,7 +301,7 @@ impl Drop for FfiSession {
     }
 }
 
-/// Creates a retained ABI-v3 connection from the live runtime owned by the platform host.
+/// Creates a retained ABI-v4 connection from the live runtime owned by the platform host.
 #[no_mangle]
 pub unsafe extern "C" fn operit_flutter_bridge_ffi_connect(
     handle: *const OperitFlutterBridge,
@@ -307,7 +325,7 @@ pub(crate) fn connectionDescriptor(
     release: usize,
 ) -> *mut c_char {
     let descriptor = serde_json::json!({
-        "version": 3,
+        "version": 4,
         // Pointer addresses must remain strings across JSON's numeric precision boundary.
         "session": session.to_string(),
         "attach": attach.to_string(),
@@ -320,10 +338,35 @@ pub(crate) fn connectionDescriptor(
         "bufferRetain": (shared_retain as *const () as usize).to_string(),
         "free": (ffi_free as *const () as usize).to_string(),
         "release": release.to_string(),
+        "reportFailure": (ffi_report_failure as *const () as usize).to_string(),
     });
     CString::new(descriptor.to_string())
         .expect("FFI descriptor JSON")
         .into_raw()
+}
+
+/// Records the original Dart receiver failure without scheduling work on the failed session.
+unsafe extern "C" fn ffi_report_failure(bytes: *const u8, length: usize) {
+    let message = String::from_utf8_lossy(std::slice::from_raw_parts(bytes, length));
+    let port = message.split_whitespace().find_map(|field| {
+        field
+            .strip_prefix("nativePort=")
+            .and_then(|value| value.parse().ok())
+    });
+    let history = recent_post_diagnostics(port);
+    // Separate records keep the malformed frame and its neighbors visible in Android logcat.
+    for line in message.lines() {
+        operit_util::AppLogger::AppLogger::e(
+            "CoreFfiTransport",
+            &format!("pid={} {line}", std::process::id()),
+        );
+    }
+    for line in history {
+        operit_util::AppLogger::AppLogger::e(
+            "CoreFfiTransport",
+            &format!("pid={} {line}", std::process::id()),
+        );
+    }
 }
 
 /// Installs the VM port and initializes this connection's shared stream owner exactly once.

@@ -27,13 +27,15 @@ class WebviewDownloadEvent {
   final String resultFilePath;
   final int bytesReceived;
   final int totalBytesToReceive;
+  final String? error;
   const WebviewDownloadEvent(
     this.kind,
     this.url,
     this.resultFilePath,
     this.bytesReceived,
-    this.totalBytesToReceive,
-  );
+    this.totalBytesToReceive, [
+    this.error,
+  ]);
 }
 
 class WebviewHttpResponseError {
@@ -176,6 +178,7 @@ class WebviewController extends ValueNotifier<WebviewValue> {
   late Completer<void> _creatingCompleter;
   int _viewId = 0;
   bool _isDisposed = false;
+  Future<void>? _disposeFuture;
 
   Future<void> get ready => _creatingCompleter.future;
 
@@ -253,6 +256,14 @@ class WebviewController extends ValueNotifier<WebviewValue> {
   JavaScriptDialogRequestedDelegate? _javaScriptDialogRequested;
   HttpAuthRequestedDelegate? _httpAuthRequested;
   SslAuthErrorRequestedDelegate? _sslAuthErrorRequested;
+  Future<void> Function(String url)? _externalNavigationRequested;
+
+  /// Registers browser-owned handling for native application-link navigations.
+  void setExternalNavigationRequestedDelegate(
+    Future<void> Function(String url) callback,
+  ) {
+    _externalNavigationRequested = callback;
+  }
 
   void setPermissionRequestedDelegate(
     PermissionRequestedDelegate? permissionRequested,
@@ -279,6 +290,14 @@ class WebviewController extends ValueNotifier<WebviewValue> {
   }
 
   late MethodChannel _methodChannel;
+
+  /// Stops an engine transfer using its unique destination as its identifier.
+  Future<void> cancelDownload(String id) =>
+      _methodChannel.invokeMethod<void>('cancelDownload', id);
+
+  /// Releases engine event registrations after importing a terminal transfer.
+  Future<void> releaseDownload(String id) =>
+      _methodChannel.invokeMethod<void>('releaseDownload', id);
   late EventChannel _eventChannel;
   StreamSubscription? _eventStreamSubscription;
 
@@ -406,6 +425,7 @@ class WebviewController extends ValueNotifier<WebviewValue> {
               map['value']['resultFilePath'],
               map['value']['bytesReceived'],
               map['value']['totalBytesToReceive'],
+              map['value']['error'] as String?,
             );
             _downloadEventStreamController.add(value);
             break;
@@ -440,6 +460,13 @@ class WebviewController extends ValueNotifier<WebviewValue> {
       });
 
       _methodChannel.setMethodCallHandler((call) {
+        if (call.method == 'externalNavigationRequested') {
+          final callback = _externalNavigationRequested;
+          if (callback == null) {
+            throw StateError('External navigation has no browser owner');
+          }
+          return callback(call.arguments as String);
+        }
         if (call.method == 'permissionRequested') {
           return _onPermissionRequested(
             call.arguments as Map<dynamic, dynamic>,
@@ -462,8 +489,8 @@ class WebviewController extends ValueNotifier<WebviewValue> {
 
       value = value.copyWith(isInitialized: true);
       _creatingCompleter.complete();
-    } on PlatformException catch (e) {
-      _creatingCompleter.completeError(e);
+    } catch (error, stackTrace) {
+      _creatingCompleter.completeError(error, stackTrace);
     }
 
     return _creatingCompleter.future;
@@ -562,15 +589,24 @@ class WebviewController extends ValueNotifier<WebviewValue> {
     return callback(url, errorStatus);
   }
 
+  /// Closes the native view and unregisters its Dart channels exactly once.
   @override
-  Future<void> dispose() async {
-    await _creatingCompleter.future;
-    if (!_isDisposed) {
+  Future<void> dispose() => _disposeFuture ??= _dispose();
+
+  /// Keeps the notifier teardown paired with the native view lifecycle.
+  Future<void> _dispose() async {
+    try {
+      await ready;
       _isDisposed = true;
-      await _eventStreamSubscription?.cancel();
-      await _hostApi.disposeWebView(_viewId);
+      _methodChannel.setMethodCallHandler(null);
+      try {
+        await _eventStreamSubscription?.cancel();
+      } finally {
+        await _hostApi.disposeWebView(_viewId);
+      }
+    } finally {
+      super.dispose();
     }
-    super.dispose();
   }
 
   /// Loads the given [url].
@@ -1357,10 +1393,12 @@ class _WebviewState extends State<Webview> {
     );
   }
 
+  /// Reports the surface size only while this widget owns its layout.
   void _reportSurfaceSize() async {
     final box = _key.currentContext?.findRenderObject() as RenderBox?;
     if (box != null) {
       await _controller.ready;
+      if (!mounted) return;
       unawaited(
         _controller._setSize(
           box.size,

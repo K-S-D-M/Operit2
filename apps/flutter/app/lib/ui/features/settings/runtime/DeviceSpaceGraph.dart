@@ -426,6 +426,7 @@ class _DeviceSpaceGraphState extends State<DeviceSpaceGraph>
       motion: motion,
       frame: () => layout.frameAt(index, _mode.value, _orbit.value),
       current: current,
+      incompatible: deviceSpaceVersionMismatch(widget.topology, device),
       selected: _selectedId == id,
       topologyMode: _topologyMode,
       reduceMotion: _reduceMotion,
@@ -504,6 +505,7 @@ class _GraphDeviceNode extends StatefulWidget {
     required this.motion,
     required this.frame,
     required this.current,
+    required this.incompatible,
     required this.selected,
     required this.topologyMode,
     required this.reduceMotion,
@@ -517,6 +519,7 @@ class _GraphDeviceNode extends StatefulWidget {
   final Listenable motion;
   final ValueGetter<_GraphNodeFrame> frame;
   final bool current;
+  final bool incompatible;
   final bool selected;
   final bool topologyMode;
   final bool reduceMotion;
@@ -575,7 +578,11 @@ class _GraphDeviceNodeState extends State<_GraphDeviceNode>
     final metrics = widget.metrics;
     final highlighted = _hovered || _focused || widget.selected;
     final active = current || widget.device.online;
-    final accent = active ? scheme.primary : scheme.outline;
+    final accent = widget.incompatible
+        ? deviceCompatibilityColor(scheme)
+        : active
+        ? scheme.primary
+        : scheme.outline;
     final duration = widget.reduceMotion
         ? Duration.zero
         : const Duration(milliseconds: 200);
@@ -585,7 +592,9 @@ class _GraphDeviceNodeState extends State<_GraphDeviceNode>
     final action = widget.topologyMode
         ? copy.showRelationships
         : copy.showTopology;
-    final status = widget.device.online
+    final status = widget.incompatible
+        ? deviceCompatibilityLabel(context)
+        : widget.device.online
         ? l10n.settingsRuntimePairedOnline
         : l10n.settingsRuntimePairedOffline;
     final diameter = current ? metrics.currentDiameter : metrics.remoteDiameter;
@@ -643,6 +652,7 @@ class _GraphDeviceNodeState extends State<_GraphDeviceNode>
                           : metrics.remoteIcon,
                       current: current,
                       online: widget.device.online,
+                      incompatible: widget.incompatible,
                       motion: widget.motion,
                       elevation: _elevation,
                       pose: widget.frame,
@@ -882,7 +892,9 @@ class _GraphDeviceDetails extends StatelessWidget {
                     ),
                     Text(
                       [
-                        device.online
+                        deviceSpaceVersionMismatch(topology, device)
+                            ? deviceCompatibilityLabel(context)
+                            : device.online
                             ? l10n.settingsRuntimePairedOnline
                             : l10n.settingsRuntimePairedOffline,
                         if (!current && device.online)
@@ -1008,12 +1020,36 @@ class _GraphCopy {
     generated.RuntimeDeviceSpaceConnectionStatus.offline =>
       zh ? '离线' : 'Offline',
     generated.RuntimeDeviceSpaceConnectionStatus.versionMismatch =>
-      zh ? '通信协议不匹配' : 'Peer protocol mismatch',
+      zh ? '版本不兼容 · 连接不可用' : 'Version incompatible · Connection unavailable',
     generated.RuntimeDeviceSpaceConnectionStatus.announced =>
       zh ? '已宣告' : 'Announced',
     generated.RuntimeDeviceSpaceConnectionStatus.unknown =>
       zh ? '状态未知' : 'Unknown',
   };
+}
+
+/// Shares negotiated connection failures and advertised compatibility across device views.
+bool deviceSpaceVersionMismatch(
+  generated.RuntimeDeviceSpaceTopology? topology,
+  generated.RuntimeDeviceSpaceDevice? device,
+) {
+  if (topology == null || device == null) return false;
+  return topology.connections.any(
+        (connection) =>
+            connection.status ==
+                generated.RuntimeDeviceSpaceConnectionStatus.versionMismatch &&
+            ((connection.firstDeviceId == topology.currentDeviceId &&
+                    connection.secondDeviceId == device.deviceId) ||
+                (connection.secondDeviceId == topology.currentDeviceId &&
+                    connection.firstDeviceId == device.deviceId)),
+      ) ||
+      topology.devices.any(
+        (local) =>
+            local.deviceId == topology.currentDeviceId &&
+            local.protocolVersion != null &&
+            device.protocolVersion != null &&
+            local.protocolVersion != device.protocolVersion,
+      );
 }
 
 Color _connectionColor(
@@ -1022,7 +1058,8 @@ Color _connectionColor(
 ) => switch (status) {
   generated.RuntimeDeviceSpaceConnectionStatus.online => scheme.primary,
   generated.RuntimeDeviceSpaceConnectionStatus.offline => scheme.outline,
-  generated.RuntimeDeviceSpaceConnectionStatus.versionMismatch => scheme.error,
+  generated.RuntimeDeviceSpaceConnectionStatus.versionMismatch =>
+    deviceCompatibilityColor(scheme),
   generated.RuntimeDeviceSpaceConnectionStatus.announced => scheme.secondary,
   generated.RuntimeDeviceSpaceConnectionStatus.unknown => scheme.tertiary,
 };

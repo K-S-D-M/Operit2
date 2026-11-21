@@ -16,12 +16,20 @@ class WorkspaceFileBrowserContent extends StatefulWidget {
     required this.rootRelativePath,
     required this.onListWorkspaceFiles,
     required this.onOpenFile,
+    this.rootLabelRelativePath = '',
+    this.protectWorkspaceRoots = false,
+    this.onMutateWorkspaceFile,
+    this.fileClipboard,
     this.onSelectCurrentDirectory,
     this.onPickLocalDirectory,
   });
 
+  final WorkspaceFileMutation? onMutateWorkspaceFile;
+  final WorkspaceFileClipboard? fileClipboard;
+  final bool protectWorkspaceRoots;
   final String rootLabel;
   final String rootRelativePath;
+  final String rootLabelRelativePath;
   final Future<List<WorkspaceFileEntry>> Function(String path)
   onListWorkspaceFiles;
   final Future<void> Function(WorkspaceFileEntry entry) onOpenFile;
@@ -64,6 +72,7 @@ class _WorkspaceFileBrowserContentState
   void didUpdateWidget(WorkspaceFileBrowserContent oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.rootLabel != widget.rootLabel ||
+        oldWidget.rootLabelRelativePath != widget.rootLabelRelativePath ||
         oldWidget.rootRelativePath != widget.rootRelativePath) {
       _history.clear();
       _currentPath = widget.rootRelativePath;
@@ -119,6 +128,10 @@ class _WorkspaceFileBrowserContentState
                     rootEntries: _entriesFuture!,
                     onListDirectory: _listTreeDirectory,
                     onOpenFile: widget.onOpenFile,
+                    onMutate: widget.onMutateWorkspaceFile,
+                    clipboard: widget.fileClipboard,
+                    protectWorkspaceRoots: widget.protectWorkspaceRoots,
+                    onFilesChanged: () => setState(_loadCurrentPath),
                   )
                 : FutureBuilder<List<WorkspaceFileEntry>>(
                     future: _entriesFuture,
@@ -227,14 +240,18 @@ class _WorkspaceFileBrowserContentState
 
   /// Requests entries for the current path only after validating its namespace.
   void _loadCurrentPath() {
-    if (!_directorySelectionEnabled &&
-        !_isWorkspaceRelativePath(_currentPath)) {
-      _entriesFuture = Future<List<WorkspaceFileEntry>>.error(
-        StateError('工作区目录路径必须是相对路径'),
-      );
-      return;
-    }
-    _entriesFuture = widget.onListWorkspaceFiles(_currentPath);
+    final entries = Future<List<WorkspaceFileEntry>>.sync(() {
+      if (!_directorySelectionEnabled &&
+          !_isWorkspaceRelativePath(_currentPath)) {
+        throw StateError('工作区目录路径必须是相对路径');
+      }
+      return widget.onListWorkspaceFiles(_currentPath);
+    });
+    // A refresh can fail before the next frame attaches the tree/FutureBuilder,
+    // or be replaced before it is rendered. Observe errors immediately while
+    // keeping the original result available to the listing's error and retry UI.
+    entries.ignore();
+    _entriesFuture = entries;
   }
 
   Future<List<WorkspaceFileEntry>> _listTreeDirectory(String path) {
@@ -323,7 +340,12 @@ class _WorkspaceFileBrowserContentState
     if (_currentPath.isEmpty) {
       return widget.rootLabel;
     }
-    return '${widget.rootLabel}/$_currentPath';
+    final anchor = widget.rootLabelRelativePath;
+    if (_currentPath == anchor) return widget.rootLabel;
+    final suffix = anchor.isEmpty
+        ? _currentPath
+        : _currentPath.substring(anchor.length + 1);
+    return '${widget.rootLabel}/$suffix';
   }
 
   /// Converts a displayed workspace path into its relative API path.
@@ -337,11 +359,13 @@ class _WorkspaceFileBrowserContentState
         .replaceAll('\\', '/')
         .replaceFirst(RegExp(r'/+$'), '');
     if (normalizedValue == normalizedRoot) {
-      return '';
+      return widget.rootLabelRelativePath;
     }
     if (normalizedValue.startsWith('$normalizedRoot/')) {
       final relativePath = normalizedValue.substring(normalizedRoot.length + 1);
-      return _isWorkspaceRelativePath(relativePath) ? relativePath : null;
+      if (!_isWorkspaceRelativePath(relativePath)) return null;
+      final anchor = widget.rootLabelRelativePath;
+      return anchor.isEmpty ? relativePath : '$anchor/$relativePath';
     }
     return null;
   }

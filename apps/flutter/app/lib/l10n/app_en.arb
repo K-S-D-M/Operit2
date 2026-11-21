@@ -1,4 +1,59 @@
 {
+  "terminalProfileSelect": "Choose terminal profile",
+  "terminalProfilesUnavailable": "No terminals are available on this device.",
+  "terminalImplementationNative": "Native terminal",
+  "terminalImplementationProot": "PRoot Linux terminal",
+  "terminalImplementationAndroidSystem": "Android system terminal",
+  "terminalImplementationQemu": "QEMU Linux emulated terminal",
+  "terminalImplementationArm64": "Linux ARM64 emulated terminal",
+  "terminalImplementationSystem": "System terminal",
+  "terminalImplementationBrowser": "Browser Linux VM",
+  "terminalInterpreterShell": "Shell",
+  "terminalBuiltinMacNative": "macOS native {interpreter} terminal",
+  "@terminalBuiltinMacNative": {
+    "placeholders": {
+      "interpreter": {
+        "type": "String"
+      }
+    }
+  },
+  "terminalBuiltinMacSandbox": "macOS sandbox {interpreter} terminal",
+  "@terminalBuiltinMacSandbox": {
+    "placeholders": {
+      "interpreter": {
+        "type": "String"
+      }
+    }
+  },
+  "terminalBuiltinAndroidLinux": "Android PRoot Linux Bash terminal",
+  "terminalBuiltinAndroidSystem": "Android system Shell terminal",
+  "terminalBuiltinLinux": "Linux native Bash terminal",
+  "terminalBuiltinPosix": "POSIX native Bash terminal",
+  "terminalBuiltinPrivileged": "System privileged sh terminal",
+  "terminalBuiltinPowerShellDownload": "PowerShell 7 terminal",
+  "terminalBuiltinPowerShell": "Windows bundled PowerShell 7 terminal",
+  "terminalBuiltinWindowsBash": "Windows bundled Bash terminal",
+  "terminalBuiltinArm64": "Linux ARM64 emulated terminal",
+  "terminalBuiltinIosSystem": "iOS system sh terminal",
+  "terminalBuiltinOhosLinux": "OpenHarmony QEMU Linux emulated terminal",
+  "terminalBuiltinOhosSystem": "OpenHarmony system sh terminal",
+  "terminalBuiltinBrowser": "Browser Linux VM terminal",
+  "terminalProfilesTitle": "Terminal profiles",
+  "terminalProfilesDescription": "Add terminal profiles for this device and choose a default. New workspace and AI terminal sessions share this setting; existing sessions keep their original environment.",
+  "terminalProfileAdd": "Add terminal profile",
+  "terminalProfileEdit": "Edit terminal profile",
+  "terminalProfileDelete": "Delete terminal profile",
+  "terminalProfileDeleteDescription": "This profile will no longer be available for new terminals. Running sessions stay open. Select another default before deleting the default profile.",
+  "terminalProfileName": "Profile name",
+  "terminalProfileNameRequired": "Enter a profile name",
+  "terminalProfileImplementation": "Terminal implementation and interpreter",
+  "terminalProfileRootfs": "Root filesystem directory",
+  "terminalProfileRootfsHelp": "Enter an accessible absolute path to an extracted Linux root filesystem matching this device's architecture, such as Ubuntu. Android requires /bin/bash; OpenHarmony requires /bin/sh. Leave blank to use the built-in environment.",
+  "terminalProfileExecutable": "Interpreter executable path",
+  "terminalProfileArguments": "Launcher arguments (JSON array)",
+  "terminalProfileArgumentsHelp": "For example [\"--login\"]. Arguments precede the managed interactive-shell arguments. Enter an executable path when specifying launch options. PowerShell 5 and 7 can be added as separate profiles.",
+  "terminalProfileArgumentsError": "Enter a JSON array of strings, for example [\"--login\"]",
+  "terminalProfileNoOptions": "This terminal is managed by the platform and can be selected as the default. The host does not expose additional launch options.",
   "@@locale": "en",
   "chatPromoteToRoot": "Promote to main conversation",
   "workspaceUnsavedChangesTitle": "Unsaved changes",
@@ -110,6 +165,10 @@
   },
   "close": "Close",
   "workspaceCloseOtherTabs": "Close Others",
+  "workspaceDockDropTarget": "Drop into workspace",
+  "workspaceOpenWith": "Open with",
+  "workspaceBuiltInPreview": "Built-in preview",
+  "workspacePluginUnsavedChanges": "Save in the editor first, or discard the unsaved changes.",
   "workspaceCloseTabsToRight": "Close to the Right",
   "workspaceCloseAllTabs": "Close All",
   "commonExpand": "Expand",
@@ -173,6 +232,14 @@
   "messageLocatorFavorites": "Favorites",
   "messageLocatorNoFavorites": "No favorite messages yet",
   "messageLocatorLoadFailed": "Could not load messages. Please try again.",
+  "messageTransformFailed": "Failed to process message display: {error}",
+  "@messageTransformFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "messageLocatorFavoriteFailed": "Could not update favorite. Please try again.",
   "messageLocatorAddFavorite": "Favorite message",
   "messageLocatorRemoveFavorite": "Remove favorite",
@@ -214,6 +281,7 @@
   },
   "messageSenderOther": "Other",
   "hiddenUserMessage": "Hidden user message",
+  "autoTriggeredUserMessage": "AUTO",
   "workspaceSetupTitle": "Set up workspace",
   "workspaceSetupSubtitle": "Provide a dedicated file environment for your AI projects",
   "workspaceCreateTitle": "Create workspace",
@@ -389,6 +457,11 @@
   "history": "History",
   "bookmarks": "Bookmarks",
   "downloads": "Downloads",
+  "browserDownloadsAll": "All",
+  "browserDownloadStorageHint": "Files are kept in the browser's download folder on the browser device. Open copies the file into this workspace first. You can also save it to the workspace directly.",
+  "browserDownloadWorkspaceTarget": "Save to this workspace:",
+  "browserDownloadSaveToWorkspace": "Save to workspace",
+  "browserDownloadInterrupted": "Interrupted · download again",
   "scripts": "Scripts",
   "zoom": "Zoom",
   "zoomIn": "Zoom in",
@@ -398,6 +471,8 @@
   "searchHistory": "Search history",
   "noDownloadTasks": "No download tasks yet",
   "openFile": "Open file",
+  "workspaceFileOpening": "Opening file…",
+  "workspaceFileOpenTimedOut": "Opening the file timed out. Please try again.",
   "openLocation": "Open location",
   "retry": "Retry",
   "removeRecord": "Remove record",
@@ -411,6 +486,7 @@
   "home": "Home",
   "newTab": "New tab",
   "openExternalApplication": "Open external application",
+  "browserExternalNavigationFailed": "Unable to open the link. No compatible application is installed, the link is invalid, or the system rejected the request.",
   "open": "Open",
   "ok": "OK",
   "webPage": "Web page",
@@ -489,8 +565,10 @@
   "settingsCategoryAppearanceSubtitle": "Theme, bubbles, and interaction",
   "settingsCategoryAppearanceDescription": "Customize global theme, background media, message bubbles, and chat interaction.",
   "settingsCategoryDataTitle": "Data & Backup",
-  "settingsCategoryDataSubtitle": "Backup, restore, stats",
-  "settingsCategoryDataDescription": "Back up chats, plugin data, and model settings, restore backup content, and view data statistics.",
+  "settingsCategoryDataSubtitle": "Backup, restore, storage",
+  "settingsCategoryDataDescription": "Back up and restore chats, plugin data, and model settings, and manage storage.",
+  "settingsUsageReportTitle": "Token Usage Report",
+  "settingsUsageReportSubtitle": "Model usage, cache, and cost",
   "settingsCategoryAccessLinksTitle": "Device Space",
   "settingsCategoryAccessLinksSubtitle": "Connect, sync, collaborate",
   "settingsCategoryAccessLinksDescription": "Manage this device space, connect devices, and share data and routes.",
@@ -499,6 +577,8 @@
   "settingsCategoryGroupExperience": "Display & Interaction",
   "settingsCategoryGroupSystem": "Data & System",
   "settingsGlobalBehaviorChatInputSection": "Chat input",
+  "settingsGlobalBehaviorEnterSendsMessage": "Press Enter to send",
+  "settingsGlobalBehaviorEnterSendsMessageDescription": "When off, Enter inserts a newline. Ctrl+Enter and Enter in the expanded editor always insert a newline.",
   "settingsGlobalBehaviorLongPastedTextAsAttachment": "Convert long pasted text to a file",
   "settingsGlobalBehaviorLongPastedTextThreshold": "Conversion threshold",
   "settingsGlobalBehaviorLongPastedTextThresholdValue": "{count} characters",
@@ -651,6 +731,8 @@
   "settingsModelApiEndpoint": "API endpoint",
   "settingsModelModelNames": "Model names",
   "settingsModelApiKey": "API key",
+  "settingsModelShowApiKey": "Show API key",
+  "settingsModelHideApiKey": "Hide API key",
   "settingsModelCodexLogin": "ChatGPT login",
   "settingsModelCodexLoginTitle": "Sign in to ChatGPT Codex",
   "settingsModelCodexLoginDescription": "OpenAI Codex uses a ChatGPT subscription sign-in instead of an API key.",
@@ -678,7 +760,7 @@
     }
   },
   "settingsModelApiKeyPool": "API key pool",
-  "settingsModelApiKeyPoolDescription": "Prepare multiple keys for one model profile so runtime can rotate between them.",
+  "settingsModelApiKeyPoolDescription": "Keep using a healthy key. Switch on authentication, quota, rate limit, or temporary failures; cooling keys are skipped.",
   "settingsModelApiKeyPoolCount": "{count} keys",
   "@settingsModelApiKeyPoolCount": {
     "placeholders": {
@@ -687,11 +769,20 @@
       }
     }
   },
-  "settingsModelApiKeyPoolEmpty": "No keys yet. Add keys and this profile will use the key pool.",
+  "settingsModelApiKeyPoolEmpty": "No keys yet. Add a key before enabling this pool.",
   "settingsModelAddApiKey": "Add key",
   "settingsModelEditApiKey": "Edit key",
   "settingsModelApiKeyName": "Key name",
   "settingsModelApiKeyEnabled": "Enable this key",
+  "settingsModelPoolAddSingle": "Add current single key",
+  "settingsModelPoolPaste": "Paste one key per line to add several at once.",
+  "settingsModelPoolNoEligible": "Enable at least one nonempty key that is not marked unavailable.",
+  "settingsModelPoolUntested": "Untested",
+  "settingsModelPoolAvailable": "Available",
+  "settingsModelPoolUnavailable": "Unavailable",
+  "settingsModelPoolClearMarks": "Reset key health",
+  "settingsModelPoolTest": "Test untested keys",
+  "settingsModelPoolNeedsModel": "Save the provider and add a model before testing keys.",
   "settingsModelProviderId": "Provider ID",
   "settingsModelProvidersSection": "LLM providers",
   "settingsModelProviderType": "Provider type",
@@ -750,7 +841,28 @@
       "error": {}
     }
   },
-  "localModelsAddModel": "Add model",
+  "localModelsAddModel": "Browse online",
+  "localModelsImportFromDevice": "Import from device",
+  "localModelsImportGgufHint": "Choose one complete GGUF chat model for llama.cpp.",
+  "localModelsImportMnnHint": "Select the extracted MNN model files together, including config.json and the weights.",
+  "localModelsImportInvalidGguf": "Select a single .gguf file.",
+  "localModelsImportMissingConfig": "The selected files are missing config.json.",
+  "localModelsImportFileSizeRequired": "Each selected file must be non-empty and report its size.",
+  "localModelsImportChangeFiles": "Choose again",
+  "localModelsImportFileCount": "{count} files selected",
+  "@localModelsImportFileCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "localModelsImportName": "Model name",
+  "localModelsImportCopyNotice": "The files are copied into app storage and stay on this device.",
+  "localModelsImportCopying": "Copying model files…",
+  "localModelsImportFinishing": "Checking and registering model…",
+  "localModelsImportComplete": "Model imported. Open Run and configure to try it.",
+  "localModelsImportedFile": "Device import",
   "localModelsFilterDownloads": "Downloads",
   "localModelsAllTypes": "All types",
   "localModelsNoMatches": "No matching models",
@@ -760,8 +872,12 @@
   "localModelsResultCount": "Showing {count} of {total} models",
   "@localModelsResultCount": {
     "placeholders": {
-      "count": {"type": "int"},
-      "total": {"type": "int"}
+      "count": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
     }
   },
   "localModelsHubRepositoryTab": "Repository",
@@ -892,8 +1008,8 @@
       }
     }
   },
-  "settingsModelCatalogNotDownloaded": "Model details have not been downloaded yet",
-  "settingsModelCatalogRetry": "Retry",
+  "settingsModelCatalogBundled": "Using bundled model details; online updates replace them automatically",
+  "settingsModelCatalogRetry": "Update",
   "settingsModelCustomModel": "Custom model",
   "settingsModelModelId": "Model ID",
   "settingsModelDuplicateModelId": "This model has already been added to this provider.",
@@ -918,8 +1034,6 @@
   "settingsModelMaxContextLength": "Max context length",
   "settingsModelMaxContextLengthInvalid": "Enter a max context length greater than 0",
   "settingsModelSummaryThreshold": "Summarize at",
-  "settingsModelSummaryByMessageCount": "Summarize by message count",
-  "settingsModelSummaryMessageCount": "Summary message threshold",
   "settingsModelCustomHeaders": "Custom headers",
   "settingsModelCustomParameters": "Custom parameters JSON",
   "settingsModelToolCall": "Tool calling",
@@ -1004,6 +1118,20 @@
       }
     }
   },
+  "settingsModelTestSummaryWithRestricted": "{passed} passed, {failed} failed, {restricted} restricted",
+  "@settingsModelTestSummaryWithRestricted": {
+    "placeholders": {
+      "passed": {
+        "type": "int"
+      },
+      "failed": {
+        "type": "int"
+      },
+      "restricted": {
+        "type": "int"
+      }
+    }
+  },
   "settingsModelTestAllPassed": "All {count} passed",
   "@settingsModelTestAllPassed": {
     "placeholders": {
@@ -1064,6 +1192,9 @@
   "settingsModelTestedModel": "Tested model",
   "settingsModelConnectionTestPassed": "All checks passed",
   "settingsModelConnectionTestFailed": "Some checks failed",
+  "settingsModelConnectionTestRestricted": "Test restricted",
+  "settingsModelTestCreditRestricted": "Credit or output budget limit",
+  "settingsModelTestRateRestricted": "Upstream rate limit or cooldown",
   "settingsModelCapabilitiesApplied": "Model capability switches were updated from the test result.",
   "settingsModelCapabilitiesNeedChat": "Chat test did not pass, so model capability switches were not updated.",
   "settingsModelConnectionTestError": "Connection test failed: {error}",
@@ -1553,8 +1684,13 @@
   "settingsAppearanceBubbleImageNinePatch": "Stretch 9-patch",
   "settingsAppearanceBubbleImageAdjustUser": "Adjust user bubble image",
   "settingsAppearanceBubbleImageAdjustAi": "Adjust AI bubble image",
-  "settingsAppearanceBubbleImagePreview": "Preview",
-  "settingsAppearanceBubbleImagePreviewText": "Bubble preview with 9-slice guides",
+  "settingsAppearanceBubbleImagePreview": "Live preview",
+  "settingsAppearanceBubbleImagePreviewText": "This is a bubble preview message.\nCheck the corners, edges, and center at their rendered size.",
+  "settingsAppearanceBubbleImageSource": "Original",
+  "settingsAppearanceBubbleImageSourceHint": "Original · White: crop boundary. Blue: nine-slice grid. Pinch to zoom and drag to inspect.",
+  "settingsAppearanceBubbleImageFitSource": "Fit original image",
+  "settingsAppearanceBubbleImageGrid": "9-slice",
+  "settingsAppearanceBubbleImageGridHint": "Two horizontal and two vertical cuts form nine regions. Corners stay fixed; edges tile along one axis and the center tiles along both. Stretch mode stretches those regions instead. Boundaries are relative to the cropped image.",
   "settingsAppearanceBubbleImageImportFailed": "Bubble image was not applied: {error}",
   "@settingsAppearanceBubbleImageImportFailed": {
     "placeholders": {
@@ -1665,14 +1801,10 @@
       }
     }
   },
-  "settingsDataTokenSection": "Usage statistics",
   "settingsDataInputTokens": "Input",
   "settingsDataOutputTokens": "Output",
-  "settingsDataOpenDetailedStats": "View detailed statistics",
-  "settingsDataOpenDetailedStatsDescription": "View the usage heatmap and model usage timeline with minute-level zoom.",
-  "settingsDataRefreshTokenStats": "Refresh statistics",
   "settingsDataResetTokenStats": "Reset statistics",
-  "settingsDataDetailedStatsTitle": "Detailed statistics",
+  "settingsUsageReportResetConfirmation": "This permanently deletes all saved model usage records. Your conversations are kept.",
   "settingsDataDetailedStatsDescription": "Statistics are calculated from dedicated model request records.",
   "settingsDataDetailedStatsEmpty": "No detailed usage records yet",
   "settingsDataDetailedStatsDateRange": "{start} to {end}",
@@ -1828,9 +1960,41 @@
     }
   },
   "settingsDataSnapshotBackupTitle": "Full snapshot",
-  "settingsDataExportRawSnapshot": "Export snapshot",
-  "settingsDataImportRawSnapshot": "Restore snapshot",
-  "settingsDataExportRawSnapshotDescription": "Pack chats, plugin data, model settings, and local files into one backup file. Restoring replaces current data with the backup.",
+  "settingsDataExportRawSnapshot": "Export full snapshot",
+  "settingsDataImportRawSnapshot": "Restore a full snapshot",
+  "settingsDataExportRawSnapshotDescription": "Package chats, plugin data, model settings, and local files as an .opsnapshot file.",
+  "settingsDataDatabaseBackup": "Database backup",
+  "settingsDataDatabaseBackupDescription": "Save a copy of the database daily and keep the 10 most recent automatic backups. Attachments and workspace files are stored separately.",
+  "settingsDataBackupScheduled": "Daily backup is on",
+  "settingsDataBackupUnavailable": "Choose an accessible folder to turn on daily backups",
+  "settingsDataBackupNow": "Back up now",
+  "settingsDataBackupSaved": "Database backup saved.",
+  "settingsDataRecoverySection": "Restore data",
+  "settingsDataRestoreDatabaseDescription": "Choose a dated database backup. The restored data becomes the source of truth for sync with other devices.",
+  "settingsDataRestoreArchiveDescription": "Replace current runtime data with an Operit2 full snapshot and restart the app.",
+  "settingsDataImportSection": "Import data",
+  "settingsDataImportOperit1Description": "Preview an Operit1 snapshot before migrating chats, model settings, and files.",
+  "settingsDataImportChatJson": "Import chat JSON",
+  "settingsDataImportChatJsonDescription": "Add chats and update existing chats with matching IDs.",
+  "settingsDataImportModelJson": "Import model settings JSON",
+  "settingsDataImportModelJsonDescription": "Add model provider settings and update existing providers with matching IDs.",
+  "settingsDataImportAction": "Import",
+  "settingsDataReadingSnapshot": "Reading snapshot",
+  "settingsDataPreparingPreview": "Preparing preview",
+  "settingsDataOperit1ImportResult": "Imported {chatCount} chats and {messageCount} messages.",
+  "@settingsDataOperit1ImportResult": {
+    "placeholders": {
+      "chatCount": {
+        "type": "int"
+      },
+      "messageCount": {
+        "type": "int"
+      }
+    }
+  },
+  "settingsDataExportSection": "Export files",
+  "settingsDataExportChatJson": "Export chat JSON",
+  "settingsDataExportModelJson": "Export model settings JSON",
   "settingsDataSnapshotBytes": "Snapshot size: {bytes} bytes",
   "@settingsDataSnapshotBytes": {
     "placeholders": {
@@ -2223,6 +2387,14 @@
   "settingsPeerPortMode": "Port allocation",
   "settingsPeerPortModeFixed": "Fixed listen address and port",
   "settingsPeerPortModeAutomatic": "Automatic port",
+  "settingsPeerNetworkDiscoveryHelp": "For discovery across routed networks, configure a shared directory and group key. To host the directory, leave the address empty and set a group key.",
+  "settingsPeerDiscoveryDirectory": "Discovery directory (optional)",
+  "settingsPeerDiscoveryGroup": "Discovery group key",
+  "settingsPeerDiscoveryGenerateKey": "Generate new group key",
+  "settingsPeerDiscoveryCopyKey": "Copy group key",
+  "settingsPeerDiscoveryPort": "Directory listener port",
+  "settingsPeerDiscoveryPortHelp": "Only used on the directory host. Other devices use the port in the directory URL.",
+  "settingsPeerNetworkDiscoveryInvalid": "Check the discovery settings: use an HTTP(S) origin without a path, a shared key of 16–128 bytes, and a nonzero port when hosting the directory.",
   "settingsPeerAdvanced": "Advanced options",
   "settingsPeerDiscoveryUnavailable": "This Host cannot advertise listeners on the local network. Direct connections remain available for supported transports.",
   "settingsPeerTransportUnavailable": "{transport} listening is not supported by this Host.",
@@ -2332,7 +2504,13 @@
   "deviceSpaceViewRequest": "View request",
   "devicePickerNearby": "Nearby devices",
   "devicePickerDiscoveryFailed": "Nearby device discovery failed: {error}",
-  "@devicePickerDiscoveryFailed": {"placeholders": {"error": {"type": "String"}}},
+  "@devicePickerDiscoveryFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
   "devicePickerEmpty": "No nearby devices found",
   "devicePickerHint": "Connect both devices to the same network and enable discovery on the other device.",
   "devicePickerManual": "Connect using an address",
@@ -2403,6 +2581,48 @@
   "settingsAppearanceThemeConfigSourceHint": "Templates come from installed plugins. New configurations can be edited independently and use existing appearance sync.",
   "settingsAppearanceLoadFailed": "Unable to load appearance",
   "settingsAppearanceRepairHint": "Your saved appearance has not been replaced. Retry after repairing its resources, or reset appearance explicitly. Reset keeps your avatar and saved configurations and selects custom appearance.",
+  "settingsAppearanceAssetBackgroundFailed": "The background image could not be loaded. Using the default background ({reference}).",
+  "@settingsAppearanceAssetBackgroundFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetVideoFailed": "The background video could not be played. Using the default background ({reference}).",
+  "@settingsAppearanceAssetVideoFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetBubbleFailed": "The bubble image could not be loaded. Using the default bubble color ({reference}).",
+  "@settingsAppearanceAssetBubbleFailed": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetPreviousRetained": "This theme resource could not be loaded. Keeping the previous image or media ({reference}); your other theme settings still apply.",
+  "@settingsAppearanceAssetPreviousRetained": {
+    "placeholders": {
+      "reference": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceAssetRetry": "Retry",
+  "settingsAppearanceAssetReimportHint": "If retrying does not help, choose and import a readable image or playable video again.",
+  "settingsAppearanceAssetImportFailed": "The background resource was not applied: {reason}. Please choose a readable image or playable video.",
+  "@settingsAppearanceAssetImportFailed": {
+    "placeholders": {
+      "reason": {
+        "type": "String"
+      }
+    }
+  },
   "settingsAppearanceRetry": "Retry",
   "settingsAppearanceResetAfterError": "Reset appearance",
   "backgroundWorkIdle": "No work is running",
@@ -2460,14 +2680,38 @@
   "deviceSpaceSyncChecking": "Checking for changes",
   "deviceSpaceSyncRecords": "Exchanging records",
   "deviceSpaceSyncRecordProgress": "{completed} / {total} records · {percent}%",
-  "@deviceSpaceSyncRecordProgress": {"placeholders": {"completed": {"type": "int"}, "total": {"type": "int"}, "percent": {"type": "int"}}},
+  "@deviceSpaceSyncRecordProgress": {
+    "placeholders": {
+      "completed": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      },
+      "percent": {
+        "type": "int"
+      }
+    }
+  },
   "deviceSpaceSyncPendingCount": "{count} records pending application",
-  "@deviceSpaceSyncPendingCount": {"placeholders": {"count": {"type": "int"}}},
+  "@deviceSpaceSyncPendingCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "deviceSpaceSyncCounting": "Counting total · {count} records processed",
-  "@deviceSpaceSyncCounting": {"placeholders": {"count": {"type": "int"}}},
+  "@deviceSpaceSyncCounting": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "deviceSpaceSyncFiles": "Transferring and verifying files",
   "deviceSpaceSyncRetrying": "Sync interrupted. Retrying automatically.",
-  "deviceSpaceSyncPending": "Some data is still pending. Retrying automatically.",
+  "deviceSpaceSyncPending": "Some data is still pending.",
   "deviceSpaceSyncCurrentFile": "Current file: {done} / {total}",
   "@deviceSpaceSyncCurrentFile": {
     "placeholders": {
@@ -2512,6 +2756,7 @@
   "peerQrPaste": "Or paste connection info",
   "peerQrRead": "Read connection info",
   "peerQrWrongDevice": "This code belongs to a different device. Scan the code for the selected device.",
+  "peerPairTimeoutHint": "Connection timed out: could not reach the other device. A common cause is the other device’s firewall blocking incoming connections. Try initiating the connection from the other device, or allow Operit through the other device’s firewall (especially on public networks).",
   "peerQrImageInvalid": "No QR code could be read. Choose a clear QR image smaller than 16 MB.",
   "peerQrCameraUnavailable": "Camera scanning is unavailable. Import a QR image or paste connection info instead.",
   "peerQrCameraPermission": "Camera access is required. Allow it in system settings, or import a QR image.",
@@ -2526,13 +2771,43 @@
   "toolEditedFileCount": "{count, plural, one{Edited {count} file} other{Edited {count} files}}",
   "toolViewChanges": "View changes",
   "toolViewFileDiff": "View diff for {fileName}",
-  "@toolEditedFileCount": {"placeholders": {"count": {"type": "int"}}},
-  "@toolViewFileDiff": {"placeholders": {"fileName": {"type": "String"}}},
+  "@toolEditedFileCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "@toolViewFileDiff": {
+    "placeholders": {
+      "fileName": {
+        "type": "String"
+      }
+    }
+  },
   "toolGroupCompleted": "Completed",
   "toolGroupExecuting": "Executing",
-  "@toolGroupThinkingCount": {"placeholders": {"count": {"type": "int"}}},
-  "@toolGroupCallCount": {"placeholders": {"count": {"type": "int"}}},
-  "@toolGroupSearchCount": {"placeholders": {"count": {"type": "int"}}},
+  "@toolGroupThinkingCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "@toolGroupCallCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "@toolGroupSearchCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "settingsDataTimelineTitle": "Model usage over time",
   "settingsDataTimelineHint": "One line per model. Pinch or scroll to zoom, drag to move, and tap to inspect a time bucket.",
   "settingsDataTimelineHours": "{hours}h",
@@ -2613,6 +2888,103 @@
   "settingsAppearanceThemeDeleteConfirm": "Delete “{name}”? This cannot be undone.",
   "settingsAppearancePreviewCollapse": "Collapse",
   "settingsAppearancePreviewExpand": "Expand",
-  "@settingsAppearanceThemeDeleteConfirm": {"placeholders": {"name": {"type": "String"}}},
-  "settingsAppearanceThemeNew": "New theme"
+  "@settingsAppearanceThemeDeleteConfirm": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsAppearanceThemeNew": "New theme",
+  "settingsAppearanceDeviceFonts": "Device fonts",
+  "settingsAppearanceChooseDeviceFont": "Choose device font",
+  "settingsAppearanceNoDeviceFonts": "No matching device fonts",
+  "settingsAppearanceDeviceFontPreview": "The quick brown fox · 0123456789\n字体预览：你好，世界",
+  "workspaceFileRename": "Rename",
+  "workspaceFileCopy": "Copy",
+  "workspaceFileCut": "Cut",
+  "workspaceFilePaste": "Paste",
+  "workspaceFileName": "Name",
+  "workspaceFileInvalidName": "Enter a valid name without path separators.",
+  "workspaceDeleteFolderTitle": "Delete folder?",
+  "workspaceDeleteFolderMessage": "Delete “{name}” and all its contents? This cannot be undone.",
+  "@workspaceDeleteFolderMessage": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileOperationFailed": "File operation failed: {error}",
+  "@workspaceFileOperationFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "workspaceFileCopyName": "{name} (copy {index})",
+  "@workspaceFileCopyName": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "index": {
+        "type": "int"
+      }
+    }
+  },
+  "workspaceFileSaving": "This file is being saved. Please try again when saving finishes.",
+  "chatBackupChooseTitle": "Choose your backup directory",
+  "chatBackupTitle": "Daily chat backup",
+  "chatBackupDescription": "Copy the complete SQLite database file daily while the app is running and keep the latest 10 automatic backups. Includes all data stored in this database. External attachments, workspaces and separate configuration files are not copied.",
+  "chatRestoreTitle": "Restore from a database backup",
+  "chatRestoreDescription": "Open the folder containing your backups and choose the date you want to restore from.",
+  "chatRestoreChooseFolder": "Choose backup source",
+  "chatRestoreRefresh": "Refresh list",
+  "chatRestoreSelected": "Restore selected backup",
+  "chatRestoreAction": "Restore",
+  "chatRestoreCancel": "Cancel",
+  "chatRestoreEmpty": "This folder contains no database backups.",
+  "chatRestoreConfirmTitle": "Restore this database backup?",
+  "chatRestoreConfirmDescription": "Replace the current database file with {name}. This replaces all data stored in this database. Stop running conversations first. Restoring establishes a new synchronization baseline that replaces older data on other devices.",
+  "@chatRestoreConfirmDescription": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "chatRestoreSuccess": "Database restored. The next sync will use this copy as the source of truth.",
+  "chatRestoreOnboardingTitle": "Restore from a previous backup",
+  "chatRestoreOnboardingDescription": "Recover chats saved in an external folder before reinstalling or uninstalling",
+  "chatBackupExternalDescription": "Choose a folder outside the app so backups remain after uninstall. On iPhone and iPad, choose iCloud Drive or another external file provider.",
+  "chatBackupChoose": "Choose backup directory",
+  "chatBackupLater": "Set up later",
+  "chatBackupChange": "Change backup directory",
+  "chatBackupMissing": "The backup directory is not configured, no longer exists or cannot be accessed. Select a directory to enable daily chat backups.",
+  "chatBackupDirectoryUnavailable": "The selected folder cannot be used. Create a new directory inside an accessible folder, such as Documents or Downloads, and select that directory.",
+  "chatBackupReady": "The backup directory is ready. Daily backups are checked at startup, on resume and while the app is running.",
+  "chatBackupNow": "Back up chats now",
+  "chatBackupNever": "No successful backup yet",
+  "chatBackupLastSuccess": "Last successful backup: {time}",
+  "@chatBackupLastSuccess": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      }
+    }
+  },
+  "terminalDistributionsTitle": "Download Linux distributions",
+  "terminalDistributionsDescription": "Only Alpine is bundled. Download an ARM64 root filesystem to add a separate instance, then choose it as the default. You can install the same distribution multiple times.",
+  "terminalDistributionDownload": "Download and install",
+  "terminalInstallQueued": "Waiting to install",
+  "terminalInstallDownloading": "Downloading root filesystem",
+  "terminalInstallVerifying": "Verifying SHA-256",
+  "terminalInstallExtracting": "Installing root filesystem",
+  "terminalInstallCompleted": "Installed · available in terminal profiles",
+  "terminalInstallCancelled": "Installation cancelled",
+  "terminalInstallFailed": "Installation failed",
+  "terminalProfileWslDistribution": "WSL distribution (optional)",
+  "terminalProfileWslHelp": "For WSL, select Bash, enter the absolute path to wsl.exe and a distribution name from wsl --list --quiet, such as Ubuntu-24.04. Leave this field blank for a native Bash executable."
 }

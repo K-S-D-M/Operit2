@@ -6,6 +6,40 @@
 
 ## 打开与控制
 
+### 声明窗口内容
+
+多数插件只需 `set(id, content | null)`。它声明窗口现在应显示的内容：同一 ID
+首次创建，后续更新原会话并恢复显示；传 `null` 关闭，窗口不存在时也成功。
+创建、更新、显示和关闭在宿主同一队列中串行执行，创作者不需要查询窗口列表、
+维护句柄缓存或协调开窗期间到达的下一次调用。
+
+```ts
+await ToolPkg.ui.floatingWindows.set("status", {
+  route: "toolpkg:com.example.status:ui:status",
+  state: { message: "正在处理" },
+  options: { width: 240, height: 120 },
+});
+await ToolPkg.ui.floatingWindows.set("status", {
+  route: "toolpkg:com.example.status:ui:status",
+  state: { message: "处理完成" },
+});
+await ToolPkg.ui.floatingWindows.set("status", null);
+```
+
+`set` 返回 `"shown"`、`"closed"`、`"permission_required"` 或 `"unsupported"`。
+后两项明确表示未显示，并关闭该 ID 已有的窗口；不会自动申请系统授权或更换呈现方式。
+路由、参数、引擎创建或原生窗口操作错误会拒绝 Promise。需要展示授权入口时，
+在设置页查询 `capabilities()`，由用户点击调用 `requestPermission()`。
+取得授权后再次调用 `set` 即可显示；`set` 不保存未显示的请求，也不自动重试。
+
+`route` 必须属于当前启用插件。窗口存在期间 `route` 和 `fill` 模式不能改变，
+要更换时先传 `null` 关闭。省略 `fill` 保留现有模式，新窗口默认为 `false`。
+提供的 `options` 和 `state` 按顶层键合并，省略的字段保持不变，UI 会话不重建。
+`state` 接受普通 JSON 对象，可直接传入 SDK 返回的类型化对象；宿主桥接会拒绝
+非 JSON 值、循环引用、非有限数字和特殊对象，避免序列化时丢失数据。
+
+### 分步控制窗口
+
 先在 `registerToolPkg()` 中注册普通 UI 路由。注册期间不能调用任何窗口方法。
 
 ```ts
@@ -45,6 +79,8 @@ await ToolPkg.ui.floatingWindows.close("pet");
 
 - `id` 是插件内的窗口 ID，长度为 1–128，不能有首尾空白。同一插件重复打开同一个 ID 会报错；不同插件可以使用相同 ID。每个插件最多同时拥有 16 个窗口。
 - `route` 必须是当前启用插件注册的完整 Compose UI 路由，不是注册项的短 `id`。`state` 是该 UI 会话的初始状态对象。
+- `open` 的 `fill: true` 让窗口覆盖当前范围的完整区域。系统范围覆盖主显示器，应用范围覆盖应用视图。该模式在打开时选定，跟随显示器或视图尺寸变化，不接受手动宽高、坐标或拖动。`list()` 返回当前测量尺寸，可能超过普通窗口的尺寸上限。
+- 系统范围还可传入 `options.screenBounds: {left, top, right, bottom}`，直接使用原生无障碍提供的屏幕边界；Windows、Android 使用物理像素，macOS 使用屏幕点坐标，X11 使用 AT-SPI 桌面坐标，由原生端适配。它优先于逻辑坐标和宽高，不受普通窗口的 4096 逻辑像素上限约束，不能与 `fill` 合用。`update` 可更新该边界以跟随目标窗口；应用范围不接受外部屏幕坐标。
 - 默认大小为 `240 × 240`，透明、无边框、置顶、不抢键盘焦点。宽高范围为 16–4096 逻辑像素。`x/y` 在系统范围使用主屏幕左上角坐标，允许负数；应用范围使用应用视图左上角坐标，显示时约束在当前视图内，随视图尺寸变化重新约束。
 - `update(id, options, state?)` 只更新提供的窗口选项；可选的第三个参数按顶层键合并 UI 状态，并在原有 UI 会话中重新渲染。隐藏、显示和更新窗口不重建 UI 会话。
 - `draggable: true` 由宿主处理整窗拖动：按下时记录指针屏幕坐标和窗口位置，移动时使用「窗口起点 + 当前屏幕坐标 − 按下屏幕坐标」，松手结束。系统窗口在原生输入线程移动，应用内窗口在 Flutter 宿主直接移动，中途不经过 JS/Rust，也不累加局部 delta。默认不启用。
@@ -56,11 +92,35 @@ await ToolPkg.ui.floatingWindows.close("pet");
 - 插件身份由 Rust 执行宿主提供。插件只能操作自己的窗口，传入其他插件名不能改变窗口归属。
 - 停用或卸载插件后，宿主关闭对应窗口。应用内目录变更立即触发检查；其他来源的变更最多每 5 秒检查一次。窗口不跨应用退出恢复。
 
+## 麦克风录音
+
+插件可以在自己的可见悬浮窗里，从用户点击触发一次有时限的录音。麦克风授权使用宿主的系统权限流程，同一宿主一次只允许一个悬浮窗录音。结束或丢弃录音后才能开始下一段。隐藏、关闭窗口或卸载插件会丢弃录音并释放麦克风。
+
+```ts
+const windows = ToolPkg.ui.floatingWindows;
+const recording = await windows.record('call', {
+    maxDurationMs: 15000,
+    silenceMs: 900,
+});
+if (recording !== null) {
+    const { text } = await Tools.Stt.transcribe(recording);
+    console.log(text);
+}
+```
+
+- `record(id, options?)` 等待完成并返回 `{audio, fileName, contentType}`，音频为 16 kHz、单声道、16 位 PCM WAV。
+- 录音期间可调用 `recordingLevel(id)` 获取当前窗口的归一化音量（`0` 到 `1`），用于绘制波纹或音量计。不采集时返回 `0`。
+- `maxDurationMs` 可设为 1000–20000 毫秒，默认 15000。`silenceMs` 可设为 300–3000 毫秒，设置后检测到一段声音才开始判断尾部静音，整段没有达到发声阈值时返回 `null`。
+- 从另一个界面事件调用 `finishRecording(id)` 可提前结束采集，WAV 由原来的 `record` 调用返回。`cancelRecording(id)` 丢弃采集，`record` 返回 `null`。权限或音频设备错误会拒绝 Promise。
+- 真实可用范围取决于宿主麦克风权限和系统的后台录音规则。系统悬浮窗权限只决定窗口能否显示。
+
+连续录音和播报的用法见 [语音通话插件](../packages/external/voice_call/README.md)。
+
 ## 宿主实现
 
-调用路径：`ToolPkg.ui.floatingWindows` → 专用异步原生绑定 → 认证后的 `JsExecutionHost` → `FloatingWindowHost` → Flutter 主引擎 → `floating_windows` → 原生窗口。
+调用通过 `ToolPkg.ui.floatingWindows`、异步原生绑定、认证后的 `JsExecutionHost` 和 `FloatingWindowHost`，由 Flutter 主引擎经 `floating_windows` 驱动当前窗口范围。
 
-窗口请求离开 JavaScript 调度线程后执行，创建新 UI 引擎不会阻塞调用者所在的 JS 调度线程。Flutter 主引擎串行管理窗口生命周期。系统悬浮窗各自拥有独立的 Flutter 引擎与插件 UI 会话，子引擎跳过主进程初始化与通知订阅。应用内悬浮层使用同一主引擎的独立 UI 会话，各自保存关闭回调、焦点策略、可见状态和输入穿透状态，隐藏时保留会话并暂停 Flutter ticker。
+窗口请求异步等待 Flutter 主引擎的响应，Web 与原生使用同一个请求和响应协议。Flutter 主引擎串行管理窗口生命周期。系统悬浮窗各自拥有独立的 Flutter 引擎与插件 UI 会话，子引擎跳过主进程初始化与通知订阅。应用内悬浮层使用同一主引擎的独立 UI 会话，各自保存关闭回调、焦点策略、可见状态和输入穿透状态，隐藏时保留会话并暂停 Flutter ticker。
 
 `apps/flutter/thirdparty/floating_windows` 不依赖 Operit、Rust、插件注册模型或 Compose DSL。它只接收不透明的应用数据和窗口选项，提供引擎启动、准备完成确认、窗口控制和失败回收；`FloatingWindowsHost` 提供不依赖原生插件的应用内实现。应用层负责渲染插件 UI 与释放会话。
 

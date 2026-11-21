@@ -1,3 +1,4 @@
+use operit_vfs::VisualFileSystem::VisualFileSystem;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,13 +8,13 @@ use crate::tools::skill::SkillManager::{BundledExternalSkillCandidate, SkillMana
 use crate::tools::skill::SkillPackage::SkillPackage;
 use operit_host_api::HostManager::defaultHttpHost;
 use operit_host_api::HostManager::HostManager;
-use operit_host_api::{FileSystemHost, HttpRequestData};
+use operit_host_api::{HttpRequestData};
 use url::Url;
 
 pub struct SkillRepository {
     context: HostManager,
     skillManager: SkillManager,
-    fileSystemHost: Arc<dyn FileSystemHost>,
+    filesystem: Arc<VisualFileSystem>,
     runtimeSupport: Arc<dyn ToolRuntimeSupport>,
 }
 
@@ -29,14 +30,11 @@ impl SkillRepository {
     /// Creates a repository facade for managing installed and imported skills.
     #[allow(non_snake_case)]
     pub fn getInstance(context: &HostManager, runtimeSupport: Arc<dyn ToolRuntimeSupport>) -> Self {
-        let fileSystemHost = context
-            .fileSystemHost
-            .clone()
-            .expect("SkillRepository requires a FileSystemHost");
+        let filesystem = Arc::new(context.vfs().expect("Plugin installation requires VFS"));
         Self {
             context: context.clone(),
-            skillManager: SkillManager::fromDefaultPaths(fileSystemHost.clone()),
-            fileSystemHost,
+            skillManager: SkillManager::fromDefaultPaths(filesystem.clone()),
+            filesystem,
             runtimeSupport,
         }
     }
@@ -50,7 +48,7 @@ impl SkillRepository {
     /// Returns all valid installed skill packages.
     #[allow(non_snake_case)]
     pub fn getAvailableSkillPackages(&self) -> BTreeMap<String, SkillPackage> {
-        self.skillManager.getAvailableSkills()
+        self.getAvailableSkillPackagesSnapshot().0
     }
 
     /// Returns valid installed skill packages together with scan errors.
@@ -58,13 +56,22 @@ impl SkillRepository {
     pub fn getAvailableSkillPackagesSnapshot(
         &self,
     ) -> (BTreeMap<String, SkillPackage>, BTreeMap<String, String>) {
-        self.skillManager.getAvailableSkillsSnapshot()
+        let mut errors = self.skillManager.ensureBuiltinSkills(self.runtimeSupport.as_ref());
+        let (skills, scanErrors) = self.skillManager.getAvailableSkillsSnapshot();
+        errors.extend(scanErrors);
+        (skills, errors)
+    }
+
+    /// Reads a skill's display label without changing its installation or command identity.
+    #[allow(non_snake_case)]
+    pub fn readSkillDisplayName(&self, skill: &SkillPackage) -> Result<String, String> {
+        self.skillManager.readSkillDisplayName(skill)
     }
 
     /// Returns skill directory scan errors keyed by directory name.
     #[allow(non_snake_case)]
     pub fn getSkillLoadErrors(&self) -> BTreeMap<String, String> {
-        self.skillManager.getSkillLoadErrors()
+        self.getAvailableSkillPackagesSnapshot().1
     }
 
     /// Lists bundled external skills that are available for installation.
@@ -74,7 +81,15 @@ impl SkillRepository {
             .getBundledExternalSkillCandidates(self.runtimeSupport.as_ref())
     }
 
-    /// Installs one bundled external skill.
+    /// Returns whether the installed skill differs from the bundled update source.
+    #[allow(non_snake_case)]
+    #[operit_route_macros::operit_core_internal]
+    pub fn bundledSkillNeedsUpdate(&self, skill: &SkillPackage) -> Result<Option<bool>, String> {
+        self.skillManager
+            .bundledSkillNeedsUpdate(skill, self.runtimeSupport.as_ref())
+    }
+
+    /// Installs or explicitly updates one bundled external skill.
     #[allow(non_snake_case)]
     pub fn importBundledExternalSkill(&self, skillName: &str) -> Result<SkillPackage, String> {
         self.skillManager
@@ -84,8 +99,7 @@ impl SkillRepository {
     /// Returns installed skill packages that are visible to AI package activation.
     #[allow(non_snake_case)]
     pub fn getAiVisibleSkillPackages(&self) -> BTreeMap<String, SkillPackage> {
-        self.skillManager
-            .getAvailableSkills()
+        self.getAvailableSkillPackages()
             .into_iter()
             .filter(|(skillName, _)| self.runtimeSupport.isSkillVisibleToAi(skillName))
             .collect()
@@ -94,6 +108,7 @@ impl SkillRepository {
     /// Reads the SKILL.md content for one installed skill.
     #[allow(non_snake_case)]
     pub fn readSkillContent(&self, skillName: &str) -> Option<String> {
+        self.getAvailableSkillPackages().get(skillName)?;
         self.skillManager.readSkillContent(skillName)
     }
 
@@ -125,13 +140,13 @@ impl SkillRepository {
         Ok(skill)
     }
 
-    /// Imports a skill from a zip archive by searching for SKILL.md.
+    /// Imports all skill packages from a zip archive by searching for SKILL.md.
     #[allow(non_snake_case)]
     pub fn importSkillFromZip(&self, zipFile: &Path) -> String {
         self.importSkillFromZipWithSubDir(zipFile, None)
     }
 
-    /// Imports a skill from a zip archive using an optional subdirectory inside the zip.
+    /// Imports all skill packages under an optional subdirectory inside a zip archive.
     #[allow(non_snake_case)]
     pub fn importSkillFromZipWithSubDir(
         &self,
@@ -142,8 +157,8 @@ impl SkillRepository {
             let storage = self.context.runtimeStorageHost.clone().ok_or("Runtime storage is required for skill import")?;
             let context = crate::ToolExecutionManager::ToolExecutionManager::currentToolRuntimeContext();
             let directory = context.as_ref().map(|context| context.fileDirectory(storage)).transpose()?.flatten();
-            let path = crate::files::PathMapper::PathMapper::resolveFileResourcePath(directory.as_deref(), &zipFile.to_string_lossy())?;
-            let vfs = crate::files::VisualFileSystem::VisualFileSystem::fromContext(&self.context)?;
+            let vfs = (&self.context).vfs()?;
+            let path = vfs.resolveResourcePath(directory.as_deref(), &zipFile.to_string_lossy())?;
             vfs.readFileBytes(&path)
         })();
         match archive {
@@ -223,7 +238,7 @@ impl SkillRepository {
         }
         let skillsRootDir = PathBuf::from(self.getSkillsDirectoryPath());
         let skillsRootPath = hostPath(&skillsRootDir);
-        if let Err(error) = self.fileSystemHost.makeDirectory(&skillsRootPath, true) {
+        if let Err(error) = self.filesystem.makeDirectory(&skillsRootPath, true) {
             return format!(
                 "Failed to create skills directory {}: {}",
                 skillsRootDir.to_string_lossy(),
@@ -233,14 +248,14 @@ impl SkillRepository {
 
         let finalDir = skillsRootDir.join(trimmedId);
         let finalDirPath = hostPath(&finalDir);
-        let finalDirInfo = match self.fileSystemHost.fileExists(&finalDirPath) {
+        let finalDirInfo = match self.filesystem.fileExists(&finalDirPath) {
             Ok(info) => info,
             Err(error) => return format!("Failed to inspect skill directory: {}", error),
         };
         if finalDirInfo.exists {
             return format!("Skill '{}' already exists", trimmedId);
         }
-        if let Err(error) = self.fileSystemHost.makeDirectory(&finalDirPath, true) {
+        if let Err(error) = self.filesystem.makeDirectory(&finalDirPath, true) {
             return format!(
                 "Failed to create skills directory {}: {}",
                 finalDir.to_string_lossy(),
@@ -256,7 +271,7 @@ impl SkillRepository {
             attachmentPaths,
         );
         if let Err(error) = result {
-            let _ = self.fileSystemHost.deleteFile(&finalDirPath, true);
+            let _ = self.filesystem.deleteFile(&finalDirPath, true);
             return format!("Failed to import skill: {}", error);
         }
 
@@ -276,7 +291,7 @@ impl SkillRepository {
         content: &str,
         attachmentPaths: &[PathBuf],
     ) -> Result<(), String> {
-        self.fileSystemHost
+        self.filesystem
             .writeFile(
                 &hostPath(&finalDir.join("SKILL.md")),
                 &buildDirectSkillMarkdown(skillId, description, content),
@@ -286,7 +301,7 @@ impl SkillRepository {
 
         if !attachmentPaths.is_empty() {
             let assetsDir = finalDir.join("assets");
-            self.fileSystemHost
+            self.filesystem
                 .makeDirectory(&hostPath(&assetsDir), true)
                 .map_err(|error| error.to_string())?;
             let mut usedFileNames = Vec::<String>::new();
@@ -300,10 +315,10 @@ impl SkillRepository {
                 let storage = self.context.runtimeStorageHost.clone().ok_or("Runtime storage is required for skill attachments")?;
                 let context = crate::ToolExecutionManager::ToolExecutionManager::currentToolRuntimeContext();
                 let directory = context.as_ref().map(|context| context.fileDirectory(storage)).transpose()?.flatten();
-                let source = crate::files::PathMapper::PathMapper::resolveFileResourcePath(directory.as_deref(), &hostPath(path))?;
-                let destination = crate::files::PathMapper::PathMapper::resolveFileResourcePath(None, &hostPath(&assetsDir.join(safeName)))?;
-                crate::files::VisualFileSystem::VisualFileSystem::fromContext(&self.context)?
-                    .copyFile(&source, &destination, false)?;
+                let vfs = (&self.context).vfs()?;
+                let source = vfs.resolveResourcePath(directory.as_deref(), &hostPath(path))?;
+                let destination = vfs.resolveResourcePath(None, &hostPath(&assetsDir.join(safeName)))?;
+                vfs.copyFile(&source, &destination, false)?;
             }
         }
 

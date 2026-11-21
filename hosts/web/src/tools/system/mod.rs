@@ -90,8 +90,11 @@ impl SystemOperationHost for WebSystemOperationHost {
         system_setting_data(value)
     }
 
-    fn installApp(&self, path: &str) -> HostResult<AppOperationData> {
-        app_operation_data(call_system("installApp", &[JsValue::from_str(path)])?)
+    /// Installs a VFS file reference using the requested platform execution timing.
+    fn installApp(&self, source: &dyn operit_host_api::FileSource, timing: operit_host_api::AppInstallTiming) -> HostResult<AppOperationData> {
+        timing.requireImmediate()?;
+        let path = source.nativePath()?;
+        app_operation_data(call_system("installApp", &[JsValue::from_str(&path)])?)
     }
 
     fn uninstallApp(&self, packageName: &str) -> HostResult<AppOperationData> {
@@ -262,11 +265,11 @@ impl SystemOperationHost for WebSystemOperationHost {
     /// Sends runtime-owned image bytes to the browser UI OCR host.
     fn recognizeText(
         &self,
-        imagePath: &str,
+        imagePath: &dyn operit_host_api::FileSource,
         language: OCRLanguage,
         quality: OCRQuality,
     ) -> HostResult<String> {
-        let bytes = WebFileSystemHost::new().readFileBytes(imagePath)?;
+        let bytes = imagePath.readBytes()?;
         read_string_property(
             &call_system(
                 "recognizeText",

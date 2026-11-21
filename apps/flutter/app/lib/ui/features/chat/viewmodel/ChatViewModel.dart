@@ -471,31 +471,6 @@ class ChatViewModel {
     return _chat.clearAttachments();
   }
 
-  String createAttachmentReference(AttachmentInfo attachment) {
-    final buffer = StringBuffer('<attachment ');
-    const escape = HtmlEscape(HtmlEscapeMode.attribute);
-    final toolPath = attachment.vfsPath ?? attachment.filePath;
-    buffer.write('id="${escape.convert(toolPath)}" ');
-    buffer.write('filename="${escape.convert(attachment.fileName)}" ');
-    buffer.write('type="${escape.convert(attachment.mimeType)}" ');
-    final nodeId = attachment.nodeId;
-    if (nodeId != null && nodeId.isNotEmpty) {
-      buffer.write('node_id="${escape.convert(nodeId)}" ');
-    }
-    if (['/app/', '/operitapp/', '/mnt/', '/virtual/']
-        .any(toolPath.startsWith)) {
-      buffer.write('path="${escape.convert(toolPath)}" ');
-    }
-    if (attachment.fileSize > 0) {
-      buffer.write('size="${attachment.fileSize}" ');
-    }
-    if (attachment.content.isNotEmpty) {
-      buffer.write('content="${escape.convert(attachment.content)}" ');
-    }
-    buffer.write('/>');
-    return buffer.toString();
-  }
-
   /// Splits Markdown with the runtime surface that owns this chat.
   Future<List<ChatResponseStreamEvent>> splitMarkdownContent(String content) {
     return _chat.splitMarkdownContent(content: content);
@@ -509,6 +484,7 @@ class ChatViewModel {
     return _chat.clearToastEvent();
   }
 
+  /// Reads global message positions and bounded previews through the dedicated index API.
   Future<List<ChatMessageLocatorPreview>> loadChatMessageLocatorPreviews(
     String chatId,
     String query,
@@ -658,11 +634,24 @@ class ChatViewModel {
     String relativePath,
   ) async {
     final chatId = await _requiredCurrentChatId();
-    final entries = await clients.servicesWorkspaceService.listWorkspaceFiles(
-      chatId: chatId,
-      relativePath: relativePath,
-    );
+    final entries = await clients.application
+        .workspaceService()
+        .listWorkspaceFiles(chatId: chatId, relativePath: relativePath);
     return entries;
+  }
+
+  Future<void> mutateWorkspaceFile(
+    WorkspaceFileOperation operation,
+    String path,
+    String? destinationPath,
+  ) async {
+    final chatId = await _requiredCurrentChatId();
+    await clients.application.workspaceService().mutateWorkspaceFile(
+      chatId: chatId,
+      operation: operation.name,
+      relativePath: path,
+      destinationPath: destinationPath,
+    );
   }
 
   /// Lists workspace entries ranked for the active @ mention query.
@@ -670,7 +659,8 @@ class ChatViewModel {
     String searchQuery,
   ) async {
     final chatId = await _requiredCurrentChatId();
-    final entries = await clients.servicesWorkspaceService
+    final entries = await clients.application
+        .workspaceService()
         .listMentionWorkspaceSuggestions(
           chatId: chatId,
           searchQuery: searchQuery,
@@ -681,14 +671,15 @@ class ChatViewModel {
   Future<List<WorkspaceFileEntry>> listWorkspaceBindingDirectories(
     String path,
   ) async {
-    final entries = await clients.servicesWorkspaceService
+    final entries = await clients.application
+        .workspaceService()
         .listWorkspaceBindingDirectories(path: path);
     return entries;
   }
 
   Future<String> readWorkspaceTextFile(String relativePath) async {
     final chatId = await _requiredCurrentChatId();
-    return clients.servicesWorkspaceService.readWorkspaceTextFile(
+    return clients.application.workspaceService().readWorkspaceTextFile(
       chatId: chatId,
       relativePath: relativePath,
     );
@@ -696,10 +687,9 @@ class ChatViewModel {
 
   Future<Uint8List> readWorkspaceFileBytes(String relativePath) async {
     final chatId = await _requiredCurrentChatId();
-    final bytes = await clients.servicesWorkspaceService.readWorkspaceFileBytes(
-      chatId: chatId,
-      relativePath: relativePath,
-    );
+    final bytes = await clients.application
+        .workspaceService()
+        .readWorkspaceFileBytes(chatId: chatId, relativePath: relativePath);
     return base64Decode(bytes.base64Content);
   }
 
@@ -708,7 +698,7 @@ class ChatViewModel {
     Uint8List bytes,
   ) async {
     final chatId = await _requiredCurrentChatId();
-    await clients.servicesWorkspaceService.writeWorkspaceFileBytes(
+    await clients.application.workspaceService().writeWorkspaceFileBytes(
       chatId: chatId,
       relativePath: relativePath,
       base64Content: base64Encode(bytes),
@@ -717,7 +707,7 @@ class ChatViewModel {
 
   Future<void> openWorkspaceFile(String relativePath) async {
     final chatId = await _requiredCurrentChatId();
-    await clients.servicesWorkspaceService.openWorkspaceFile(
+    await clients.application.workspaceService().openWorkspaceFile(
       chatId: chatId,
       relativePath: relativePath,
     );
@@ -738,6 +728,11 @@ typedef ChatUiMessage = core_proxy.ChatMessage;
 
 /// Exposes chat presentation helpers directly on the generated Core message state.
 extension ChatMessagePresentation on core_proxy.ChatMessage {
+  /// Identifies automatic user turns whose source is only shown on request.
+  bool get isHiddenUserPlaceholder =>
+      sender == 'user' &&
+      displayMode == core_proxy.ChatMessageDisplayMode.hiddenPlaceholder;
+
   /// Returns the legacy variant-preview flag for a normal Core message.
   bool get isVariantPreview => false;
 

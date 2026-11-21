@@ -275,15 +275,13 @@ test("expanded native text is staged and native page swipes update the selected 
   assert.equal((await plugin.api("character.get", { id: card.id })).characterSetting, "确认展开正文");
 });
 
+/** Opens the real native list actions rather than a retired browser bridge. */
 function management(plugin) {
-  const commands = []; let methods;
-  const ui = mountRegisteredComposeRoute(plugin, null, "main", {}, command => {
-    commands.push(plain(command));
-    if (command.command === "addJavascriptInterface") methods = command.payload.object;
-    return null;
-  });
+  const commands = [];
+  const ui = mountRegisteredComposeRoute(plugin, null, "main", {}, command => { commands.push(plain(command)); });
   return { ...ui, commands, async open(mode, entity, id) {
-    assert.ok(methods.openEntity); return ui.dispatch(methods.openEntity, [mode, entity, id]);
+    await click(ui, "management-root", "onLoad");
+    return mode === "create" ? click(ui, "add-" + entity, "onSelect", 0) : click(ui, entity + ":" + id + "-open");
   } };
 }
 async function loadManagementModal(ui) {
@@ -293,21 +291,21 @@ async function loadManagementModal(ui) {
   return nodes[0];
 }
 
-test("management reuses the sole native entity surface for edit preview and reopen without replacing its WebView", async t => {
+test("management reuses the sole native entity surface for edit and reopen without any WebView", async t => {
   const plugin = await environment(t), card = await plugin.api("character.create", { values: { name: "管理页原生入口", description: "原始描述" } });
   const ui = management(plugin); await ui.load();
-  const firstWeb = composeNodes(ui.render().tree, node => node.type === "WebView")[0];
+
   await ui.open("edit", "card", card.id); await loadManagementModal(ui);
-  assert.equal(composeNodes(ui.render().tree, node => node.type === "WebView").length, 1);
-  assert.equal(composeNodes(ui.render().tree, node => node.type === "WebView")[0].props.key, firstWeb.props.key);
+  assert.equal(composeNodes(ui.render().tree, node => node.type === "WebView").length, 0);
+
   await click(ui, "entity-field-description", "onValueChange", "管理页保存到真实数据库");
   const saved = await click(ui, "entity-primary"); assert.equal(saved.actionResult, null, "Local management must not invent a host terminal event");
   assert.equal(composeNodes(ui.render().tree, node => node.type === "Dialog").length, 0);
   assert.equal((await plugin.api("character.get", { id: card.id })).description, "管理页保存到真实数据库");
-  assert.match(ui.commands.at(-1).payload.script, /character-entity-closed/);
-  assert.match(ui.commands.at(-1).payload.script, /saved/);
-  await ui.open("preview", "card", card.id); await loadManagementModal(ui);
-  assert.ok(composeNodes(ui.render().tree, node => node.props.text === "管理页保存到真实数据库").length);
+  assert.equal(ui.commands.length, 0);
+  assert.equal(ui.commands.length, 0);
+  await ui.open("edit", "card", card.id); await loadManagementModal(ui);
+  assert.equal(keyedNode(ui.render().tree, "entity-field-description").props.value, "管理页保存到真实数据库");
   await click(ui, "entity-close");
   await ui.open("edit", "card", card.id); await loadManagementModal(ui);
   await click(ui, "entity-field-name", "onValueChange", "取消的草稿"); await click(ui, "entity-cancel");
@@ -328,7 +326,7 @@ test("management creation is a native unsaved draft and commits only on save for
     assert.equal(composeNodes(ui.render().tree, node => node.type === "Dialog").length, 0);
     const after = plain(await plugin.api(api + ".list", {})); assert.equal(after.length, before.length + 1);
     assert.ok(after.find(value => value.name.startsWith("原生新")).id);
-    assert.match(ui.commands.at(-1).payload.script, /saved/);
+  assert.equal(ui.commands.length, 0);
   }
 });
 
@@ -352,7 +350,7 @@ test("native export saves canonical Operit and Tavern data through the host sele
   await click(ui, "entity-field-characterSetting", "onValueChange", "不能导出未保存的草稿");
   for (const format of ["json", "tavern"]) {
     await click(ui, "entity-export"); await click(ui, "entity-export-" + format);
-    assert.equal(composeNodes(ui.render().tree, node => node.type === "TextField").length, 0);
+    assert.equal(composeNodes(keyedNode(ui.render().tree, "character-presentation"), node => node.type === "TextField").length, 0);
     saveOutcome = "cancel";
     await click(ui, "entity-export-save");
     assert.ok(keyedNode(ui.render().tree, "entity-export-save"));
@@ -386,10 +384,6 @@ test("native export saves canonical Operit and Tavern data through the host sele
 
 test("the sole native editor retains model TTS shared-memory and four-category tool bindings on the real save transaction", async t => {
   const plugin = await environment(t), card = await plugin.api("character.create", { values: { name: "原生全部绑定" } });
-  const readCatalog = plugin.tools.Catalog.readToolSources;
-  plugin.tools.Catalog.readToolSources = async () => {
-    const catalog = await readCatalog(); catalog.builtinTools.push({ name: "use_package", displayName: "启用外部工具", description: "真实工具策略必需的显式能力" }); return catalog;
-  };
   const store = await plugin.api("memory.shared.create", { name: "原生共享库" });
   const ui = management(plugin); await ui.load(); await ui.open("edit", "card", card.id); await loadManagementModal(ui);
   await click(ui, "entity-model-switch", "onCheckedChange", true); await click(ui, "entity-model-picker"); await click(ui, "entity-picker-" + JSON.stringify(["dashscope", "qwen-plus"]));
@@ -402,9 +396,6 @@ test("the sole native editor retains model TTS shared-memory and four-category t
     const row = keyedNode(ui.render().tree, "entity-tool-" + keys[tab] + "-" + names[tab]);
     await ui.dispatch(composeNodes(row, node => node.type === "Checkbox")[0].props.onCheckedChange, true);
   }
-  await click(ui, "entity-tool-tabs-0");
-  const activation = keyedNode(ui.render().tree, "entity-tool-allowedBuiltinTools-use_package");
-  await ui.dispatch(composeNodes(activation, node => node.type === "Checkbox")[0].props.onCheckedChange, true);
   await click(ui, "entity-primary");
   assert.equal((await plugin.api("character.get", { id: card.id })).ttsConfigId, null);
   await click(ui, "entity-primary");
@@ -412,7 +403,43 @@ test("the sole native editor retains model TTS shared-memory and four-category t
   const saved = plain(await plugin.api("character.get", { id: card.id }));
   assert.equal(saved.chatModelBindingMode, "FIXED_MODEL"); assert.equal(saved.chatModelId, "qwen-plus"); assert.equal(saved.chatProviderId, "dashscope"); assert.equal(saved.ttsConfigId, "tts-one");
   assert.equal(saved.memoryBindingMode, "SHARED"); assert.equal(saved.sharedMemoryId, store.id); assert.equal(saved.toolAccessConfig.enabled, true);
-  for (let tab = 0; tab < 4; tab++) assert.deepEqual(saved.toolAccessConfig[keys[tab]], tab === 0 ? [names[tab], "use_package"] : [names[tab]]);
+  for (let tab = 0; tab < 4; tab++) assert.deepEqual(saved.toolAccessConfig[keys[tab]], [names[tab]]);
+});
+
+/** Stored permissions remain editable even when sources disappeared or activation was never allowed. */
+test("installed tool policies open preserve content edits and allow removing unavailable sources", async t => {
+  const plugin = await environment(t);
+  const keys = ["allowedBuiltinTools", "allowedPackages", "allowedSkills", "allowedMcpServers"];
+  const policy = { enabled: true, ...Object.fromEntries(keys.map(key => [key, ["unavailable-" + key]])) };
+  plugin.disk.storage.inspectPreferences("cards", values => { values.record_default.toolAccessConfig = policy; });
+  const before = plugin.disk.stateBytes(), ui = mount(plugin, "preview", "card", "default");
+  await ui.load(); await click(ui, "entity-preview-config-toggle");
+  assert.deepEqual(plugin.disk.stateBytes(), before);
+  await click(ui, "entity-primary");
+  await click(ui, "entity-field-description", "onValueChange", "白名单不应阻止编辑正文");
+  await click(ui, "entity-primary");
+  const saved = await plugin.api("character.get", { id: "default" });
+  assert.equal(saved.description, "白名单不应阻止编辑正文");
+  assert.deepEqual(plain(saved.toolAccessConfig), policy);
+  await click(ui, "entity-primary"); await click(ui, "entity-tool-configure");
+  for (let tab = 0; tab < keys.length; tab++) {
+    await click(ui, "entity-tool-tabs-" + tab);
+    const row = keyedNode(ui.render().tree, "entity-tool-" + keys[tab] + "-unavailable-" + keys[tab]);
+    const checkbox = composeNodes(row, node => node.type === "Checkbox")[0];
+    assert.equal(checkbox.props.checked, true);
+    await ui.dispatch(checkbox.props.onCheckedChange, false);
+  }
+  await click(ui, "entity-cancel");
+  assert.deepEqual(plain((await plugin.api("character.get", { id: "default" })).toolAccessConfig), policy);
+  await click(ui, "entity-tool-configure");
+  for (let tab = 0; tab < keys.length; tab++) {
+    await click(ui, "entity-tool-tabs-" + tab);
+    const row = keyedNode(ui.render().tree, "entity-tool-" + keys[tab] + "-unavailable-" + keys[tab]);
+    await ui.dispatch(composeNodes(row, node => node.type === "Checkbox")[0].props.onCheckedChange, false);
+  }
+  await click(ui, "entity-primary"); await click(ui, "entity-primary");
+  assert.deepEqual(plain((await plugin.api("character.get", { id: "default" })).toolAccessConfig),
+    { enabled: true, ...Object.fromEntries(keys.map(key => [key, []])) });
 });
 
 test("native entity content and cancellation are available while its default avatar is pending", async t => {
@@ -539,7 +566,7 @@ test("native memory binding can explicitly switch to character memory with no sh
 });
 
 
-test("native avatar selection copies picker bytes into getConfigDir and saves only the plugin file", async t => {
+test("native avatar selection copies picker bytes into shared data independently of the installation config directory", async t => {
   const image = await readFile(new URL("../resources/operit-avatar.png", import.meta.url));
   const picked = { path: "/private/var/mobile/tmp/selector/avatar.png", uri: "file:///private/var/mobile/tmp/selector/avatar.png", name: "avatar.png", size: image.length, contentBase64: image.toString("base64") };
   const requests = [];
@@ -557,6 +584,7 @@ test("native avatar selection copies picker bytes into getConfigDir and saves on
   assert.deepEqual(requests[0].options, { picker: "image", allowMultiple: false, mimeTypes: ["image/*"], maxContentBytes: 8 * 1024 * 1024 });
   const uri = keyedNode(ui.render().tree, "entity-edit-avatar").props.uri;
   assert.equal(path.dirname(path.resolve(uri)), path.join(plugin.disk.directory, "avatars"));
+  assert.notEqual(path.dirname(path.resolve(uri)), path.join(plugin.disk.globals.ToolPkg.getConfigDir(), "avatars"));
   assert.notEqual(uri, picked.path);
   assert.deepEqual(await readFile(uri), image);
   assert.equal(plugin.disk.calls.filter(call => call.method === "readBinary").length, 0);
@@ -583,4 +611,42 @@ test("cancelled or invalid avatar selections preserve the saved avatar and do no
     assert.equal(keyedNode(ui.render().tree, "entity-edit-avatar").props.uri, card.avatarUri);
   }
   assert.equal(plugin.disk.calls.filter(call => call.method === "writeBinary").length, 0);
+});
+
+/** Keeps live member composition in new drafts and persists only an explicitly selected custom image. */
+test("group creation and editing share live member portraits and durable custom avatar controls", async t => {
+  const image = await readFile(new URL("../resources/operit-avatar.png", import.meta.url));
+  const plugin = await environment(t, [], {
+    async __operitNativeComposeFilePickerCommand() { return { cancelled: false, files: [{ name: "group.png", size: image.length, contentBase64: image.toString("base64") }] }; },
+    async __operitInvokeHostAsync(command, args) { return command(...args); },
+  });
+  const first = await plugin.api("character.create", { values: { name: "成员一", avatarUri: "first.png" } });
+  const second = await plugin.api("character.create", { values: { name: "成员二", avatarUri: "second.png" } });
+  const ui = management(plugin); await ui.load(); await ui.open("create", "group", ""); await loadManagementModal(ui);
+  await click(ui, "entity-field-name", "onValueChange", "头像群组");
+  await click(ui, "entity-member-" + first.id); await click(ui, "entity-member-" + second.id);
+  const portrait = keyedNode(ui.render().tree, "entity-edit-avatar");
+  assert.deepEqual(composeNodes(portrait, node => node.type === "Image").map(node => node.props.uri), [first.avatarUri, second.avatarUri]);
+  await click(ui, "entity-primary");
+  const group = (await plugin.api("group.list", {})).find(group => group.name === "头像群组");
+  assert.equal(group.avatarUri, null);
+  await ui.open("edit", "group", group.id); await loadManagementModal(ui);
+  await click(ui, "entity-choose-avatar");
+  const uri = keyedNode(ui.render().tree, "entity-edit-avatar").props.uri;
+  assert.equal(path.dirname(path.resolve(uri)), path.join(plugin.disk.directory, "avatars"));
+  await click(ui, "entity-primary");
+  assert.equal((await plugin.api("group.get", { id: group.id })).avatarUri, uri);
+  assert.deepEqual(await readFile(uri), image);
+  await plugin.api("activePrompt.setGroup", { id: group.id });
+  assert.equal((await plugin.api("chat.context.actions", { chatId: null })).identity.avatarUri, uri);
+  const preview = mount(plugin, "preview", "group", group.id, "group-avatar-preview"); await preview.load();
+  assert.equal(keyedNode(preview.render().tree, "entity-avatar").props.uri, uri);
+  await ui.open("edit", "group", group.id); await loadManagementModal(ui);
+  await click(ui, "entity-clear-avatar"); await click(ui, "entity-member-" + first.id);
+  assert.deepEqual(composeNodes(keyedNode(ui.render().tree, "entity-edit-avatar"), node => node.type === "Image").map(node => node.props.uri), [second.avatarUri]);
+  await click(ui, "entity-cancel");
+  assert.equal((await plugin.api("group.get", { id: group.id })).avatarUri, uri);
+  await ui.open("edit", "group", group.id); await loadManagementModal(ui);
+  await click(ui, "entity-clear-avatar"); await click(ui, "entity-primary");
+  assert.equal((await plugin.api("group.get", { id: group.id })).avatarUri, null);
 });
