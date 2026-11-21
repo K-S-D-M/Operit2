@@ -331,6 +331,30 @@ jobs:
           }
           Write-Host "TypeScript and pnpm dependencies prepared"
 
+      # character_cards 插件的 USearch WASM 由 vendor/usearch/build.py 从源码编译，
+      # 需要仓库内 .ci-tools/emsdk（被 .gitignore 忽略）或 EMXX。托管 runner 上没有，
+      # 这里在同步插件包之前装好 Emscripten，避免 pack:toolpkg 因缺 em++ 失败。
+      - name: Install Emscripten SDK for USearch WASM
+        shell: pwsh
+        run: |
+          $emsdk = Join-Path $PWD ".ci-tools/emsdk"
+          $compiler = Join-Path $emsdk "upstream/emscripten/em++.py"
+          if (-not (Test-Path -LiteralPath $compiler)) {
+            git clone --depth 1 https://github.com/emscripten-core/emsdk $emsdk
+            if ($LASTEXITCODE -ne 0) { throw "git clone emsdk failed" }
+            Push-Location $emsdk
+            try {
+              .\emsdk.bat install latest
+              if ($LASTEXITCODE -ne 0) { throw "emsdk install latest failed" }
+              .\emsdk.bat activate latest
+              if ($LASTEXITCODE -ne 0) { throw "emsdk activate latest failed" }
+            } finally {
+              Pop-Location
+            }
+          }
+          if (-not (Test-Path -LiteralPath $compiler)) { throw "Emscripten compiler missing: $compiler" }
+          Write-Host "Emscripten ready: $compiler"
+
       # build.rs 读取 assets/plugins/{buildin,external} 来生成内嵌 ToolPkg 归档；
       # 这两个目录被 .gitignore 忽略，必须由 sync_plugin_packages.py 在构建前生成。
       # 缺少时 build.rs 会 panic：package example has no embedded archive。
