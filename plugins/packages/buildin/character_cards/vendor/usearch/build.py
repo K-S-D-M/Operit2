@@ -52,7 +52,7 @@ def build(source: Path | None = None) -> None:
             raise FileNotFoundError('USearch requires Emscripten: install .ci-tools/emsdk or set EMXX to em++.')
         command = [sys.executable, str(managed_compiler)]
     output.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([*command, str(source / 'c/lib.cpp'), str(HERE / 'index.cpp'), '-I' + str(source / 'include'), '-I' + str(source / 'c'), '-DUSEARCH_USE_NUMKONG=0', '-DUSEARCH_USE_OPENMP=0', '-DNDEBUG', '-std=c++17', '-O3', '-flto', '-msimd128', '--no-entry', '-sSTANDALONE_WASM=1', '-sALLOW_MEMORY_GROWTH=1', '-sFILESYSTEM=0', '-sEXPORTED_FUNCTIONS=' + json.dumps(['_' + name for name in EXPORTS]), '-o', str(output)], check=True)
+    subprocess.run([*command, str(source / 'c/lib.cpp'), str(HERE / 'index.cpp'), '-I' + str(source / 'include'), '-I' + str(source / 'c'), '-DUSEARCH_USE_NUMKONG=0', '-DUSEARCH_USE_OPENMP=0', '-DNDEBUG', '-std=c++17', '-O3', '-flto', '-include type_traits -include exception -msimd128', '--no-entry', '-sSTANDALONE_WASM=1', '-sALLOW_MEMORY_GROWTH=1', '-sFILESYSTEM=0', '-sEXPORTED_FUNCTIONS=' + json.dumps(['_' + name for name in EXPORTS]), '-o', str(output)], check=True)
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(json.dumps({'inputs': signature, 'output': hashlib.sha256(output.read_bytes()).hexdigest()}))
     _publish_example(output)
