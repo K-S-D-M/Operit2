@@ -32,7 +32,7 @@ jobs:
         with:
           run-id: 44963063116
           repository: K-S-D-M/Operit2-ci
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GH_ARTIFACT_TOKEN }}
           name: operit2-android-runtime-99156ebad0192f4c28a570eb59fb1372507ccb34
           path: apps/flutter/app/android/app/src/main
 
@@ -119,7 +119,7 @@ jobs:
         with:
           run-id: 44963063116
           repository: K-S-D-M/Operit2-ci
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GH_ARTIFACT_TOKEN }}
           name: operit2-android-v8-99156ebad0192f4c28a570eb59fb1372507ccb34
           path: .v8-artifact
 
