@@ -38,15 +38,48 @@ $items = @(
     }
 )
 
+function Download-WithRetry {
+    param(
+        [string]$Uri,
+        [string]$OutFile,
+        [string]$ExpectedSha256,
+        [int]$MaxAttempts = 5
+    )
+    # Resolve a real curl binary (curl.exe on Windows, curl on Linux/macOS).
+    # Avoid PowerShell's legacy 'curl' alias which maps to Invoke-WebRequest.
+    $curlPath = $null
+    foreach ($candidate in @('curl.exe', 'curl')) {
+        $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.CommandType -eq 'Application') { $curlPath = $cmd.Source; break }
+    }
+    if (-not $curlPath) { throw 'curl binary not found on PATH' }
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Write-Host "  attempt $attempt/$MaxAttempts : $Uri"
+        if (Test-Path $OutFile) { Remove-Item -LiteralPath $OutFile -Force }
+        # curl handles transient connection timeouts; --retry covers errors,
+        # --connect-timeout / --max-time bound a single stalled transfer.
+        & $curlPath -fL --connect-timeout 30 --max-time 300 --retry 4 --retry-delay 5 -o $OutFile $Uri 2>&1 | Write-Host
+        $curlExit = $LASTEXITCODE
+        if ($curlExit -eq 0 -and (Test-Path $OutFile)) {
+            $actual = (Get-FileHash -Algorithm SHA256 -Path $OutFile).Hash.ToUpperInvariant()
+            if ($actual -eq $ExpectedSha256) {
+                Write-Host "  download OK (sha256 verified)"
+                return
+            }
+            Write-Warning "  sha256 mismatch: $actual"
+        } else {
+            Write-Warning "  curl exit code: $curlExit"
+        }
+        if ($attempt -lt $MaxAttempts) { Start-Sleep -Seconds 10 }
+    }
+    throw "Failed to download $Uri after $MaxAttempts attempts"
+}
+
 foreach ($item in $items) {
     $archivePath = Join-Path $downloadsDir $item.Archive
     Write-Host "Downloading $($item.Name)"
-    Invoke-WebRequest -Uri $item.Url -OutFile $archivePath
-
-    $actualSha256 = (Get-FileHash -Algorithm SHA256 -Path $archivePath).Hash.ToUpperInvariant()
-    if ($actualSha256 -ne $item.Sha256) {
-        throw "$($item.Archive) SHA256 mismatch: $actualSha256"
-    }
+    Download-WithRetry -Uri $item.Url -OutFile $archivePath -ExpectedSha256 $item.Sha256
 
     $extractPath = Join-Path $sourcesDir $item.Extracted
     if (Test-Path $extractPath) {
