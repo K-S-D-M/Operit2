@@ -65,18 +65,138 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # V8 只允许在 Linux 主机上交叉编译 Android 目标：
+  # v8 crate 内置的 Chromium 构建配置在 build/config/BUILDCONFIG.gn 中断言
+  # host_os == "linux"（"Android builds are only supported on Linux."），
+  # 因此在 windows-2025 上执行 V8 源码构建必然在 `gn gen` 阶段失败。
+  # 这里用 Linux 先构建并验证 librusty_v8.a / src_binding.rs，再交给
+  # build-android（Windows）打包 APK；详细说明见
+  # docs/android-v8-linux-host-build.md。
+  build-android-v8:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      RUST_TOOLCHAIN_VERSION: 1.95.0
+      # V8 缓存清单记录 android_ndk_version。runner 镜像会不断新增 NDK 目录
+      # （Gradle 还会额外装 Flutter SDK 的版本），只靠目录探测会让两个 job
+      # 取到不同版本、缓存互相失效，因此这里显式钉死声明值。
+      OPERIT_ANDROID_V8_NDK_VERSION: 27.3.13750724
+      OPERIT_ANDROID_V8_NDK: /usr/local/lib/android/sdk/ndk/27.3.13750724
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/system-images \
+            /opt/ghc /usr/local/share/boost
+          docker image prune -af || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install Android NDK
+        run: |
+          if [ ! -d "$OPERIT_ANDROID_V8_NDK" ]; then
+            yes | "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools/latest/bin/sdkmanager" \
+              --install "ndk;27.3.13750724" > /dev/null
+          fi
+          test -x "$OPERIT_ANDROID_V8_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: aarch64-linux-android
+
+      # prepare_android_v8.py 用 bindgen 生成 Rust 绑定（要求 libclang 21.1+），
+      # Chromium 的主机工具链还会使用 ld.lld。
+      - name: Install LLVM 21 for bindgen and the host linker
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/apt.llvm.org.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-21-dev lld-21
+          # Debian 的 libclang 实际文件名是 libclang-21.so.1，而脚本按
+          # libclang.so.<major> 探测版本号；补一条指向开发用符号链接的别名。
+          if [ ! -e /usr/lib/llvm-21/lib/libclang.so.21 ]; then
+            sudo ln -sfn /usr/lib/llvm-21/lib/libclang.so /usr/lib/llvm-21/lib/libclang.so.21
+          fi
+
+      - name: Cache source-built Android V8
+        uses: actions/cache@v4
+        with:
+          path: tools/release/work/android-v8
+          key: android-v8-linux-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+
+      - name: Build V8 for Android
+        run: |
+          python3 tools/build_scripts/prepare_android_v8.py \
+            --target aarch64-linux-android \
+            --env-file "$RUNNER_TEMP/android-v8.env"
+
+      - name: Stage V8 artifacts
+        run: |
+          version=$(python3 - <<'PY'
+          import pathlib, tomllib
+          lock = pathlib.Path("apps/flutter/native/operit-flutter-bridge/Cargo.lock")
+          packages = tomllib.loads(lock.read_text())["package"]
+          print(next(p["version"] for p in packages if p["name"] == "v8"))
+          PY
+          )
+          mkdir -p v8-artifact
+          cp -R "tools/release/work/android-v8/$version/aarch64-linux-android" v8-artifact/
+          # 文件名不能以 "." 开头：upload-artifact v4 默认跳过隐藏文件。
+          printf '%s\n' "$version" > v8-artifact/v8-version.txt
+          du -sh v8-artifact
+
+      - name: Upload V8 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-v8-${{ github.sha }}
+          path: v8-artifact
+          if-no-files-found: error
+          retention-days: 1
+
   build-android:
-    needs: build-android-runtime
+    needs: [build-android-runtime, build-android-v8]
     runs-on: windows-2025
     timeout-minutes: 180
     env:
       RUSTFLAGS: -Awarnings
       RUST_TOOLCHAIN_VERSION: 1.95.0
       FVM_VERSION: 4.3.0
+      # crates.io / pub.dev 偶发连接重置时多试几次，不要让整轮构建白跑。
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_TIMEOUT: "120"
+      # 与 build-android-v8 保持一致：这是写进 V8 缓存清单的声明版本，
+      # 与实际参与链接的 NDK（flutter.ndkVersion）无关。
+      OPERIT_ANDROID_V8_NDK_VERSION: 27.3.13750724
+      OPERIT_ANDROID_V8_NDK: C:\Program Files (x86)\Android\android-sdk\ndk\27.3.13750724
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Rust 编译 (cargoBuildOperitFlutterBridge) 是最耗时的步骤 (~34min)。
+      # 缓存 bridge crate 的 target 目录：源码/Cargo.lock 未变时可直接复用，
+      # 把重复的 Rust 编译从 34min 降到 ~1-2min。失败重跑时尤其省时。
+      # 注意：V8 产物由单独 job 提供，其 env 变化通过 Cargo.lock/ndk 版本键覆盖。
+      - name: Cache Rust bridge build
+        uses: actions/cache@v4
+        with:
+          path: apps/flutter/native/operit-flutter-bridge/target
+          key: ${{ runner.os }}-android-rust-bridge-${{ hashFiles('apps/flutter/native/operit-flutter-bridge/Cargo.lock', 'apps/flutter/native/operit-flutter-bridge/Cargo.toml', 'core/Cargo.lock', 'core/crates/**/*.rs', 'apps/flutter/native/operit-flutter-bridge/src/**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-android-rust-bridge-
 
       - name: Download Android terminal runtime
         uses: actions/download-artifact@v4
@@ -98,7 +218,9 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          # embeddedShizuku 模块 (tools/android-shizuku) 要求 source/targetCompatibility=21，
+          # Java 17 会报 "invalid source release: 21"。Java 21 向下兼容主 app 的 VERSION_17。
+          java-version: "21"
 
       - name: Install FVM
         shell: pwsh
@@ -162,12 +284,103 @@ jobs:
           RELEASE_KEY_PASSWORD=$env:ANDROID_RELEASE_KEY_PASSWORD
           "@ | Set-Content -Path (Join-Path $secretsDir "android-signing.properties") -Encoding utf8
 
-      - name: Cache source-built Android V8
-        uses: actions/cache@v4
+      - name: Download prebuilt Android V8
+        uses: actions/download-artifact@v4
         with:
-          path: tools/release/work/android-v8
-          key: ${{ runner.os }}-${{ runner.arch }}-android-v8-${{ hashFiles('tools/build_scripts/prepare_android_v8.py', 'apps/flutter/native/operit-flutter-bridge/Cargo.lock') }}
+          name: operit2-android-v8-${{ github.sha }}
+          path: .v8-artifact
 
+      # 把 Linux 构建出的 V8 产物写入 prepare_android_v8.py 的缓存目录：
+      # manifest.json 的配置与 SHA-256 校验通过后，Gradle 的
+      # prepareOperitAndroidV8* 任务只会重写 env 文件，不再在 Windows 上
+      # 触发 V8 源码构建（那会撞上 BUILDCONFIG.gn 的 Linux 主机断言）。
+      - name: Install prebuilt Android V8 into the source-build cache
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath $env:OPERIT_ANDROID_V8_NDK)) {
+            $sdkmanager = (Get-Command sdkmanager -ErrorAction SilentlyContinue).Source
+            if (-not $sdkmanager) {
+              $sdkmanager = Join-Path $env:ANDROID_HOME "cmdline-tools/latest/bin/sdkmanager.bat"
+            }
+            & $sdkmanager --install "ndk;27.3.13750724"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install Android NDK 27.3.13750724" }
+          }
+          $version = (Get-Content .v8-artifact/v8-version.txt -Raw).Trim()
+          $destination = "tools/release/work/android-v8/$version/aarch64-linux-android"
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          Copy-Item -Path ".v8-artifact/aarch64-linux-android/*" -Destination $destination -Recurse -Force
+          Get-ChildItem $destination | Select-Object Name, Length
+
+      - name: Check build environment
+        shell: pwsh
+        run: python tools/build_scripts/check_build_environment.py --products app --github-runner
+
+      # hook/build.dart 硬编码 .venv/Scripts/python.exe，CI runner 没有现成 venv，先补齐。
+      - name: Prepare Python virtualenv
+        shell: pwsh
+        run: |
+          $repoRoot = (Resolve-Path '.').Path
+          $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
+          New-Item -ItemType Directory -Force -Path (Split-Path $venvPython) | Out-Null
+          $python = (Get-Command python).Source
+          Copy-Item $python $venvPython -Force
+          & $venvPython --version
+          Write-Host "Prepared .venv Python at $venvPython"
+      # sync_plugin_packages.py 需要 .ci-tools 下的 tsc 和 corepack pnpm。
+      - name: Prepare TypeScript and pnpm dependencies
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          if ($LASTEXITCODE -ne 0) { throw "npm install typescript failed" }
+          corepack enable pnpm
+          if ($LASTEXITCODE -ne 0) { throw "corepack enable pnpm failed" }
+          corepack prepare pnpm@10.7.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw "corepack prepare pnpm failed" }
+          Push-Location plugins/packages/buildin/workflow
+          try {
+            corepack pnpm install --frozen-lockfile
+            if ($LASTEXITCODE -ne 0) { throw "corepack pnpm install failed" }
+          } finally {
+            Pop-Location
+          }
+          Write-Host "TypeScript and pnpm dependencies prepared"
+
+      # character_cards 插件的 USearch WASM 由 vendor/usearch/build.py 从源码编译，
+      # 需要仓库内 .ci-tools/emsdk（被 .gitignore 忽略）或 EMXX。托管 runner 上没有，
+      # 这里在同步插件包之前装好 Emscripten，避免 pack:toolpkg 因缺 em++ 失败。
+      - name: Install Emscripten SDK for USearch WASM
+        shell: pwsh
+        run: |
+          $emsdk = Join-Path $PWD ".ci-tools/emsdk"
+          $compiler = Join-Path $emsdk "upstream/emscripten/em++.py"
+          if (-not (Test-Path -LiteralPath $compiler)) {
+            git clone --depth 1 https://github.com/emscripten-core/emsdk $emsdk
+            if ($LASTEXITCODE -ne 0) { throw "git clone emsdk failed" }
+            Push-Location $emsdk
+            try {
+              .\emsdk.bat install latest
+              if ($LASTEXITCODE -ne 0) { throw "emsdk install latest failed" }
+              .\emsdk.bat activate latest
+              if ($LASTEXITCODE -ne 0) { throw "emsdk activate latest failed" }
+            } finally {
+              Pop-Location
+            }
+          }
+          if (-not (Test-Path -LiteralPath $compiler)) { throw "Emscripten compiler missing: $compiler" }
+          Write-Host "Emscripten ready: $compiler"
+
+      # build.rs 读取 assets/plugins/{buildin,external} 来生成内嵌 ToolPkg 归档；
+      # 这两个目录被 .gitignore 忽略，必须由 sync_plugin_packages.py 在构建前生成。
+      # 缺少时 build.rs 会 panic：package example has no embedded archive。
+      - name: Sync plugin package assets
+        shell: pwsh
+        run: |
+          python plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload
+          if ($LASTEXITCODE -ne 0) { throw "sync_plugin_packages.py failed" }
+
+      # 仓库不带 gradlew.bat（wrapper 由 Flutter 构建时生成），无法单独预取
+      # Gradle 分发包。GitHub Releases 偶发 HTTP 504 时直接重试整轮打包，
+      # 已下载成功的 Flutter/Gradle 缓存会保留，重试代价很小。
       - name: Build and package Android app
         shell: pwsh
         run: |
@@ -175,7 +388,14 @@ jobs:
           if ($version.Count -ne 1) {
             throw "apps/flutter/app/pubspec.yaml must contain exactly one release version line"
           }
-          python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Android app build attempt $attempt/3"
+            python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($attempt -eq 3) { throw "Android app build failed after 3 attempts" }
+            Write-Warning "Android app build failed, retrying in 20s..."
+            Start-Sleep -Seconds 20
+          }
 
       - name: Build and package Android module
         shell: pwsh

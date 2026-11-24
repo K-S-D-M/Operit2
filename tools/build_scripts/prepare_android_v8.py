@@ -81,6 +81,10 @@ ARTIFACTS = ("librusty_v8.a", "src_binding.rs", "args.gn")
 def run(command, **kwargs):
     print("+ " + shlex.join(map(str, command)), file=sys.stderr, flush=True)
     kwargs.setdefault("check", True)
+    # Windows runners default to a legacy ANSI codepage; tool output can contain
+    # UTF-8 bytes that crash the text-mode reader thread (stdout becomes None).
+    kwargs.setdefault("encoding", "utf-8")
+    kwargs.setdefault("errors", "replace")
     return subprocess.run(list(map(str, command)), **kwargs)
 
 
@@ -118,7 +122,17 @@ def configuration(version, target, ndk=None):
 
 
 def ndk_version(ndk):
-    """Derive the android_ndk_version GN value from the NDK directory name."""
+    """Derive the android_ndk_version GN value from the NDK directory name.
+
+    Runner images add newer NDKs over time (and Gradle installs the Flutter SDK's
+    own version), so directory discovery alone makes the cache identity drift
+    between the Linux V8 job and the Windows packaging job even though the
+    compiled artifacts are fine. `OPERIT_ANDROID_V8_NDK_VERSION` pins the value
+    both jobs declare; it must stay in sync with the NDK that builds V8.
+    """
+    pinned = os.environ.get("OPERIT_ANDROID_V8_NDK_VERSION", "").strip()
+    if pinned:
+        return pinned
     if ndk is None:
         return "unknown"
     if re.fullmatch(r"\d+\.\d+\.\d+", ndk.name):
@@ -343,7 +357,8 @@ def brew_prefix(formula):
         (str(p) for p in (Path("/opt/homebrew/bin/brew"), Path("/usr/local/bin/brew")) if p.is_file()), None)
     if not brew:
         return None
-    result = subprocess.run([brew, "--prefix", formula], capture_output=True, text=True)
+    result = subprocess.run([brew, "--prefix", formula], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
     return Path(result.stdout.strip()) if result.returncode == 0 else None
 
 
@@ -542,6 +557,8 @@ def prepare(target, env_file, cache_root=CACHE_ROOT):
             fcntl.flock(lock, fcntl.LOCK_EX)
         ndk = find_ndk(cache)
         config = configuration(version_from_lock(), target, ndk)
+        print(f"Android V8 NDK: {ndk} (android_ndk_version="
+              f"{config['gn']['android_ndk_version']})", file=sys.stderr, flush=True)
         directory = cache / target
         if not cache_valid(directory, config):
             print(f"Building V8 {config['version']} for {target} (first build takes time)",

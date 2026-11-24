@@ -1,0 +1,228 @@
+name: Android Fast Package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-android:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      RUSTFLAGS: -Awarnings
+      RUST_TOOLCHAIN_VERSION: 1.95.0
+      FVM_VERSION: 4.3.0
+      # crates.io / pub.dev 偶发连接重置时多试几次，不要让整轮构建白跑。
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_TIMEOUT: "120"
+      # 与 build-android-v8 保持一致：这是写进 V8 缓存清单的声明版本，
+      # 与实际参与链接的 NDK（flutter.ndkVersion）无关。
+      OPERIT_ANDROID_V8_NDK_VERSION: 27.3.13750724
+      OPERIT_ANDROID_V8_NDK: C:\Program Files (x86)\Android\android-sdk\ndk\27.3.13750724
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Android terminal runtime
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 44963063116
+          repository: K-S-D-M/Operit2-ci
+          github-token: ${{ secrets.GH_ARTIFACT_TOKEN }}
+          name: operit2-android-runtime-99156ebad0192f4c28a570eb59fb1372507ccb34
+          path: apps/flutter/app/android/app/src/main
+
+      - name: Install bootstrap Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.11.5
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install FVM
+        shell: pwsh
+        run: |
+          dart pub global activate fvm $env:FVM_VERSION
+          "$env:APPDATA\Pub\Cache\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install project Flutter SDK
+        working-directory: apps/flutter/app
+        shell: pwsh
+        run: fvm install --skip-pub-get
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: aarch64-linux-android
+
+      - name: Prepare Android bindgen libclang
+        shell: pwsh
+        run: |
+          $version = "21.1.8"
+          $packageName = "libclang.runtime.win-x64.$version"
+          $toolsDir = "target/operit-build-tools"
+          $packageDir = Join-Path $toolsDir $packageName
+          $archive = Join-Path $toolsDir "$packageName.nupkg"
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/libclang.runtime.win-x64/$version" -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath $packageDir -Force
+          $libclang = Join-Path $packageDir "runtimes/win-x64/native/libclang.dll"
+          if (-not (Test-Path -LiteralPath $libclang)) {
+            throw "Android bindgen libclang was not prepared at $libclang"
+          }
+
+      - name: Restore Android signing material
+        shell: pwsh
+        env:
+          ANDROID_RELEASE_KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          ANDROID_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          ANDROID_RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          ANDROID_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          $required = @(
+            "ANDROID_RELEASE_KEYSTORE_BASE64",
+            "ANDROID_RELEASE_STORE_PASSWORD",
+            "ANDROID_RELEASE_KEY_ALIAS",
+            "ANDROID_RELEASE_KEY_PASSWORD"
+          )
+          $missing = $required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) }
+          if ($missing.Count -gt 0) {
+            throw "Missing required GitHub Actions secrets: $($missing -join ', ')"
+          }
+          $secretsDir = "tools/release/secrets"
+          New-Item -ItemType Directory -Force -Path $secretsDir | Out-Null
+          $keystore = Join-Path $secretsDir "operit2-release.keystore"
+          [System.IO.File]::WriteAllBytes($keystore, [System.Convert]::FromBase64String($env:ANDROID_RELEASE_KEYSTORE_BASE64))
+          @"
+          RELEASE_STORE_FILE=operit2-release.keystore
+          RELEASE_STORE_PASSWORD=$env:ANDROID_RELEASE_STORE_PASSWORD
+          RELEASE_KEY_ALIAS=$env:ANDROID_RELEASE_KEY_ALIAS
+          RELEASE_KEY_PASSWORD=$env:ANDROID_RELEASE_KEY_PASSWORD
+          "@ | Set-Content -Path (Join-Path $secretsDir "android-signing.properties") -Encoding utf8
+
+      - name: Download prebuilt Android V8
+        uses: actions/download-artifact@v4
+        with:
+          run-id: 44963063116
+          repository: K-S-D-M/Operit2-ci
+          github-token: ${{ secrets.GH_ARTIFACT_TOKEN }}
+          name: operit2-android-v8-99156ebad0192f4c28a570eb59fb1372507ccb34
+          path: .v8-artifact
+
+      # 把 Linux 构建出的 V8 产物写入 prepare_android_v8.py 的缓存目录：
+      # manifest.json 的配置与 SHA-256 校验通过后，Gradle 的
+      # prepareOperitAndroidV8* 任务只会重写 env 文件，不再在 Windows 上
+      # 触发 V8 源码构建（那会撞上 BUILDCONFIG.gn 的 Linux 主机断言）。
+      - name: Install prebuilt Android V8 into the source-build cache
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath $env:OPERIT_ANDROID_V8_NDK)) {
+            $sdkmanager = (Get-Command sdkmanager -ErrorAction SilentlyContinue).Source
+            if (-not $sdkmanager) {
+              $sdkmanager = Join-Path $env:ANDROID_HOME "cmdline-tools/latest/bin/sdkmanager.bat"
+            }
+            & $sdkmanager --install "ndk;27.3.13750724"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install Android NDK 27.3.13750724" }
+          }
+          $version = (Get-Content .v8-artifact/v8-version.txt -Raw).Trim()
+          $destination = "tools/release/work/android-v8/$version/aarch64-linux-android"
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          Copy-Item -Path ".v8-artifact/aarch64-linux-android/*" -Destination $destination -Recurse -Force
+          Get-ChildItem $destination | Select-Object Name, Length
+
+      - name: Check build environment
+        shell: pwsh
+        run: python tools/build_scripts/check_build_environment.py --products app --github-runner
+
+      # hook/build.dart 硬编码 .venv/Scripts/python.exe，CI runner 没有现成 venv，先补齐。
+      - name: Prepare Python virtualenv
+        shell: pwsh
+        run: |
+          $repoRoot = (Resolve-Path '.').Path
+          $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
+          New-Item -ItemType Directory -Force -Path (Split-Path $venvPython) | Out-Null
+          $python = (Get-Command python).Source
+          Copy-Item $python $venvPython -Force
+          & $venvPython --version
+          Write-Host "Prepared .venv Python at $venvPython"
+      # sync_plugin_packages.py 需要 .ci-tools 下的 tsc 和 corepack pnpm。
+      - name: Prepare TypeScript and pnpm dependencies
+        shell: pwsh
+        run: |
+          npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
+          if ($LASTEXITCODE -ne 0) { throw "npm install typescript failed" }
+          corepack enable pnpm
+          if ($LASTEXITCODE -ne 0) { throw "corepack enable pnpm failed" }
+          corepack prepare pnpm@10.7.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw "corepack prepare pnpm failed" }
+          Push-Location plugins/packages/buildin/workflow
+          try {
+            corepack pnpm install --frozen-lockfile
+            if ($LASTEXITCODE -ne 0) { throw "corepack pnpm install failed" }
+          } finally {
+            Pop-Location
+          }
+          Write-Host "TypeScript and pnpm dependencies prepared"
+
+      # build.rs 读取 assets/plugins/{buildin,external} 来生成内嵌 ToolPkg 归档；
+      # 这两个目录被 .gitignore 忽略，必须由 sync_plugin_packages.py 在构建前生成。
+      # 缺少时 build.rs 会 panic：package example has no embedded archive。
+      - name: Sync plugin package assets
+        shell: pwsh
+        run: |
+          python plugins/tools/sync_plugin_packages.py --source runtime --no-hot-reload
+          if ($LASTEXITCODE -ne 0) { throw "sync_plugin_packages.py failed" }
+
+      # 仓库不带 gradlew.bat（wrapper 由 Flutter 构建时生成），无法单独预取
+      # Gradle 分发包。GitHub Releases 偶发 HTTP 504 时直接重试整轮打包，
+      # 已下载成功的 Flutter/Gradle 缓存会保留，重试代价很小。
+      - name: Build and package Android app
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path apps/flutter/app/pubspec.yaml -Pattern '^version:\s*(\d+\.\d+\.\d+)\+(\d+)\s*$').Matches
+          if ($version.Count -ne 1) {
+            throw "apps/flutter/app/pubspec.yaml must contain exactly one release version line"
+          }
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Android app build attempt $attempt/3"
+            python tools/build_scripts/build_flutter_android.py --build-name $version[0].Groups[1].Value --build-number $version[0].Groups[2].Value --enforce-lockfile
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($attempt -eq 3) { throw "Android app build failed after 3 attempts" }
+            Write-Warning "Android app build failed, retrying in 20s..."
+            Start-Sleep -Seconds 20
+          }
+
+      - name: Build and package Android module
+        shell: pwsh
+        run: python tools/build_scripts/build_android_module_release.py --enforce-lockfile
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-99156ebad0192f4c28a570eb59fb1372507ccb34
+          path: tools/release/dist/operit2-app-android-arm64-v8a-*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Android module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: operit2-android-module-99156ebad0192f4c28a570eb59fb1372507ccb34
+          path: tools/release/dist/operit2-module-android-arm64-v8a-*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

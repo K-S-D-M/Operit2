@@ -25,9 +25,13 @@ def build(source: Path | None = None) -> None:
         REVISION.encode() + Path(__file__).read_bytes() + (HERE / 'index.cpp').read_bytes()
     ).hexdigest()
     state = json.loads(state_file.read_text()) if state_file.is_file() else {}
-    if source is None and output.is_file() and state == {
-        'inputs': signature, 'output': hashlib.sha256(output.read_bytes()).hexdigest(),
-    }:
+    if source is None and output.is_file():
+        # 仓库里已带预编译 wasm 时直接复用：不再用构建状态签名做门槛，
+        # 因为 Windows 检出会把换行改成 CRLF，签名字节必然不一致。
+        digest = hashlib.sha256(output.read_bytes()).hexdigest()
+        if state.get('inputs') != signature or state.get('output') != digest:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({'inputs': signature, 'output': digest}))
         _publish_example(output)
         print('USearch WASM is up to date')
         return
@@ -52,7 +56,7 @@ def build(source: Path | None = None) -> None:
             raise FileNotFoundError('USearch requires Emscripten: install .ci-tools/emsdk or set EMXX to em++.')
         command = [sys.executable, str(managed_compiler)]
     output.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([*command, str(source / 'c/lib.cpp'), str(HERE / 'index.cpp'), '-I' + str(source / 'include'), '-I' + str(source / 'c'), '-DUSEARCH_USE_NUMKONG=0', '-DUSEARCH_USE_OPENMP=0', '-DNDEBUG', '-std=c++17', '-O3', '-flto', '-msimd128', '--no-entry', '-sSTANDALONE_WASM=1', '-sALLOW_MEMORY_GROWTH=1', '-sFILESYSTEM=0', '-sEXPORTED_FUNCTIONS=' + json.dumps(['_' + name for name in EXPORTS]), '-o', str(output)], check=True)
+    subprocess.run([*command, str(source / 'c/lib.cpp'), str(HERE / 'index.cpp'), '-I' + str(source / 'include'), '-I' + str(source / 'c'), '-DUSEARCH_USE_NUMKONG=0', '-DUSEARCH_USE_OPENMP=0', '-DNDEBUG', '-std=c++17', '-O3', '-flto', '-include', 'type_traits', '-include', 'exception', '-msimd128', '--no-entry', '-sSTANDALONE_WASM=1', '-sALLOW_MEMORY_GROWTH=1', '-sFILESYSTEM=0', '-sEXPORTED_FUNCTIONS=' + json.dumps(['_' + name for name in EXPORTS]), '-o', str(output)], check=True)
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(json.dumps({'inputs': signature, 'output': hashlib.sha256(output.read_bytes()).hexdigest()}))
     _publish_example(output)
