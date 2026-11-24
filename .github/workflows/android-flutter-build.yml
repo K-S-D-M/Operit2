@@ -96,6 +96,7 @@ jobs:
 
       - name: Prepare plugin build dependencies
         run: |
+          corepack enable pnpm
           npm install --prefix .ci-tools/typescript --no-audit --no-fund typescript@5.9.3
 
       - name: Install Java
