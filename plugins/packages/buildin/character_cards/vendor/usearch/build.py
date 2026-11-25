@@ -25,9 +25,13 @@ def build(source: Path | None = None) -> None:
         REVISION.encode() + Path(__file__).read_bytes() + (HERE / 'index.cpp').read_bytes()
     ).hexdigest()
     state = json.loads(state_file.read_text()) if state_file.is_file() else {}
-    if source is None and output.is_file() and state == {
-        'inputs': signature, 'output': hashlib.sha256(output.read_bytes()).hexdigest(),
-    }:
+    if source is None and output.is_file():
+        # 仓库里已带预编译 wasm 时直接复用：不再用构建状态签名做门槛，
+        # 因为 Windows 检出会把换行改成 CRLF，签名字节必然不一致。
+        digest = hashlib.sha256(output.read_bytes()).hexdigest()
+        if state.get('inputs') != signature or state.get('output') != digest:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps({'inputs': signature, 'output': digest}))
         _publish_example(output)
         print('USearch WASM is up to date')
         return
